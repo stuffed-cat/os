@@ -6,6 +6,8 @@ use log::{LevelFilter, Log, Metadata, Record};
 use spin::{Mutex, Once};
 use uart_16550::SerialPort;
 
+use super::framebuffer;
+
 /// I/O port base for the primary serial port.
 const SERIAL_IO_PORT: u16 = 0x3F8;
 
@@ -58,6 +60,7 @@ impl<'a> Write for SerialWriter<'a> {
         for byte in s.bytes() {
             self.0.send(byte);
         }
+        framebuffer::write_str(s);
         Ok(())
     }
 }

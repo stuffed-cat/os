@@ -4,7 +4,7 @@ use arrayvec::ArrayVec;
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 use bootloader_api::BootInfo;
 use kernel::{
-    arch::x86_64::serial,
+    arch::x86_64::{framebuffer, serial},
     hal::HalConfig,
     memory::BootFrameAllocator,
     FrameRange, Hal, KernelBuilder,
@@ -22,6 +22,10 @@ pub fn start(boot_info: &'static mut BootInfo, allocator: &'static LockedHeap) -
         .physical_memory_offset
         .into_option()
         .expect("physical memory offset provided");
+
+    if let Some(framebuffer) = boot_info.framebuffer.as_mut() {
+        framebuffer::init(framebuffer);
+    }
 
     let ranges = collect_frame_ranges(&boot_info.memory_regions);
     let hal_config = HalConfig {

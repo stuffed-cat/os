@@ -16,6 +16,19 @@ pub mod idt {
 pub mod interrupts;
 #[cfg(feature = "hardware")]
 pub mod keyboard;
+#[cfg(feature = "hardware")]
+#[doc = "Framebuffer-backed text console for VGA output."]
+pub mod framebuffer;
+#[cfg(not(feature = "hardware"))]
+pub mod framebuffer {
+    use bootloader_api::info::FrameBuffer;
+
+    /// Stub framebuffer init for host testing.
+    pub fn init(_: &'static mut FrameBuffer) {}
+
+    /// Stub framebuffer writer for host testing.
+    pub fn write_str(_: &str) {}
+}
 pub mod serial;
 
 pub use boot::ArchBootstrap;
