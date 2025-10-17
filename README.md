@@ -2,8 +2,6 @@
 
 This repository documents and prototypes a Rust-based hybrid kernel for x86-64 that aims to blend microkernel isolation with monolithic fast-path services while offering a POSIX-friendly, Unix-like surface to userland. The current code focuses on architectural scaffolding, subsystem contracts, and developer documentation.
 
-> ⚠️ The implementation in this repository is **conceptual**. It is not intended for booting on bare metal yet; instead, it establishes a solid foundation for subsequent hardware enablement, bootstrapping, and driver work.
-
 ## 🎯 Project Goals
 
 - **Hybrid Kernel**: Combine the simplicity and performance of monolithic kernels with the modular safety of microkernels.

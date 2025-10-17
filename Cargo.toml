@@ -2,5 +2,10 @@
 resolver = "2"
 members = [
     "kernel",
+    "kernel-bin",
     "userland",
+]
+default-members = [
+    "kernel",
+    "userland"
 ]

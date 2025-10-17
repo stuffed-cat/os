@@ -26,5 +26,11 @@ pub mod syscall;
 pub use crate::core::{Kernel, KernelBuilder, KernelContext, KernelState, Subsystem, SubsystemId};
 pub use crate::error::{KernelError, SubsystemError};
 
+#[cfg(any(feature = "alloc", feature = "std"))]
+pub use crate::hal::{Hal, HalConfig};
+
+#[cfg(any(feature = "alloc", feature = "std"))]
+pub use crate::memory::{BootFrameAllocator, FrameRange, MemoryManager};
+
 #[cfg(test)]
 mod tests;

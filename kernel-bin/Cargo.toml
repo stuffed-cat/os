@@ -1,0 +1,21 @@
+[package]
+name = "kernel-bin"
+version = "0.1.0"
+edition = "2021"
+authors = ["stuffed-cat <dev@stuffedcat.dev>"]
+description = "Bare-metal entrypoint and boot harness for the hybrid kernel"
+license = "MIT"
+
+[features]
+default = []
+boot = []
+
+[dependencies]
+kernel = { path = "../kernel", default-features = false, features = ["baremetal"] }
+x86_64 = { version = "0.15", default-features = false, features = ["instructions"] }
+spin = "0.9"
+uart_16550 = "0.2"
+linked_list_allocator = "0.10"
+bootloader_api = "0.11"
+bootloader = "0.11"
+arrayvec = { version = "0.7", default-features = false }

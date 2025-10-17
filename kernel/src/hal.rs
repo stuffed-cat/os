@@ -1,64 +1,68 @@
 //! Hardware abstraction layer bridging architecture and services.
 
-use alloc::sync::Arc;
-use spin::Mutex;
+use x86_64::structures::paging::PageTableFlags;
+use x86_64::VirtAddr;
 
 use crate::{
-    arch::x86_64::{ArchBootstrap, InterruptController, TrapFrame, XApicController},
-    error::{KernelError, SubsystemError},
+    arch::x86_64::{interrupts::InterruptController, ArchBootstrap, Pic8259Controller},
+    error::KernelError,
+    memory::{BootFrameAllocator, FrameRange, MemoryManager},
 };
 
-/// HAL facade for managing interrupt controllers and early CPU setup.
-pub struct Hal {
-    controller: Arc<dyn InterruptController + Send + Sync>,
+/// Configuration input required to bootstrap the HAL.
+pub struct HalConfig<'a> {
+    /// Virtual address offset where physical memory is mapped.
+    pub physical_memory_offset: u64,
+    /// Physical memory ranges available for allocation.
+    pub frame_ranges: &'a [FrameRange],
 }
 
-impl Default for Hal {
-    fn default() -> Self {
-        Self { controller: Arc::new(XApicController) }
-    }
+/// HAL facade for managing interrupts and paging.
+pub struct Hal {
+    interrupts: Pic8259Controller,
+    memory: MemoryManager,
 }
 
 impl Hal {
-    /// Performs early CPU initialization.
-    pub fn bootstrap() -> Result<Self, KernelError> {
+    /// Performs early CPU initialization and constructs the HAL instance.
+    pub unsafe fn bootstrap(config: HalConfig<'_>) -> Result<Self, KernelError> {
         ArchBootstrap::init_cpu_features()?;
         ArchBootstrap::validate_virtualization()?;
-        Ok(Self::default())
+
+        let allocator = BootFrameAllocator::from_ranges(config.frame_ranges);
+        let memory = MemoryManager::new(VirtAddr::new(config.physical_memory_offset), allocator);
+
+        let controller = Pic8259Controller::new();
+        controller.init();
+        ArchBootstrap::init_interrupts()?;
+
+        Ok(Self { interrupts: controller, memory })
     }
 
     /// Enables interrupts globally.
     pub fn enable_interrupts(&self) {
-        self.controller.enable();
+        self.interrupts.enable();
     }
 
     /// Disables interrupts globally.
     pub fn disable_interrupts(&self) {
-        self.controller.disable();
+        self.interrupts.disable();
+    }
+
+    /// Returns a reference to the interrupt controller.
+    pub fn interrupts(&self) -> &Pic8259Controller {
+        &self.interrupts
+    }
+
+    /// Returns the memory manager.
+    pub fn memory(&self) -> &MemoryManager {
+        &self.memory
+    }
+
+    /// Convenience helper to map and initialize the kernel heap.
+    pub fn map_heap(&self, start: VirtAddr, size: usize, flags: PageTableFlags) -> Result<(), KernelError> {
+        self.memory
+            .map_region(start, size, flags)
+            .map_err(|_| KernelError::Memory("heap mapping failed"))
     }
 }
-
-/// Shared trap frame storage.
-pub struct TrapStore {
-    trap: Mutex<TrapFrame>,
-}
-
-impl TrapStore {
-    /// Creates an empty store.
-    pub fn new() -> Self {
-        Self { trap: Mutex::new(TrapFrame::default()) }
-    }
-
-    /// Saves a trap frame.
-    pub fn save(&self, frame: TrapFrame) {
-        *self.trap.lock() = frame;
-    }
-
-    /// Restores the trap frame.
-    pub fn restore(&self) -> TrapFrame {
-        self.trap.lock().clone()
-    }
-}
-
-/// Result alias for HAL operations.
-pub type HalResult<T> = Result<T, SubsystemError>;

@@ -7,6 +7,8 @@ use crate::{
     services::ServiceRegistry,
 };
 
+use crate::hal::Hal;
+
 /// Identifier for kernel subsystems.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SubsystemId(pub &'static str);
@@ -46,12 +48,13 @@ pub enum KernelState {
 pub struct KernelContext<'a> {
     state: KernelState,
     registry: &'a ServiceRegistry,
+    hal: Option<&'a Hal>,
 }
 
 impl<'a> KernelContext<'a> {
     /// Creates a new kernel context.
-    pub fn new(state: KernelState, registry: &'a ServiceRegistry) -> Self {
-        Self { state, registry }
+    pub fn new(state: KernelState, registry: &'a ServiceRegistry, hal: Option<&'a Hal>) -> Self {
+        Self { state, registry, hal }
     }
 
     /// Returns the current kernel state.
@@ -63,17 +66,23 @@ impl<'a> KernelContext<'a> {
     pub fn services(&self) -> &'a ServiceRegistry {
         self.registry
     }
+
+    /// Returns the HAL instance, if available.
+    pub fn hal(&self) -> Option<&'a Hal> {
+        self.hal
+    }
 }
 
 /// Configures and builds a [`Kernel`].
 pub struct KernelBuilder {
     services: ServiceRegistry,
     subsystems: Vec<Box<dyn Subsystem + Send>>, // hybrid architecture keeps dynamic dispatch manageable
+    hal: Option<Hal>,
 }
 
 impl Default for KernelBuilder {
     fn default() -> Self {
-        Self { services: ServiceRegistry::default(), subsystems: Vec::new() }
+        Self { services: ServiceRegistry::default(), subsystems: Vec::new(), hal: None }
     }
 }
 
@@ -93,9 +102,20 @@ impl KernelBuilder {
         self
     }
 
+    /// Installs a HAL instance.
+    pub fn with_hal(mut self, hal: Hal) -> Self {
+        self.hal = Some(hal);
+        self
+    }
+
     /// Consumes the builder and returns a new kernel.
     pub fn build(self) -> Kernel {
-        Kernel { state: KernelState::Bootstrap, services: self.services, subsystems: self.subsystems }
+        Kernel {
+            state: KernelState::Bootstrap,
+            services: self.services,
+            subsystems: self.subsystems,
+            hal: self.hal,
+        }
     }
 }
 
@@ -104,12 +124,14 @@ pub struct Kernel {
     state: KernelState,
     services: ServiceRegistry,
     subsystems: Vec<Box<dyn Subsystem + Send>>,
+    hal: Option<Hal>,
 }
 
 impl Kernel {
     /// Initializes the kernel and all subsystems.
     pub fn init(&mut self) -> Result<(), KernelError> {
-        let ctx = KernelContext::new(self.state, &self.services);
+        let hal_ref = self.hal.as_ref();
+        let ctx = KernelContext::new(self.state, &self.services, hal_ref);
         for subsystem in self.subsystems.iter_mut() {
             let id = subsystem.id();
             info!("Initializing subsystem: {}", id);
@@ -125,7 +147,8 @@ impl Kernel {
     pub fn run(&mut self) -> Result<(), KernelError> {
         self.state = KernelState::Running;
         loop {
-            let ctx = KernelContext::new(self.state, &self.services);
+            let hal_ref = self.hal.as_ref();
+            let ctx = KernelContext::new(self.state, &self.services, hal_ref);
             for subsystem in self.subsystems.iter_mut() {
                 let id = subsystem.id();
                 subsystem
@@ -143,5 +166,15 @@ impl Kernel {
     pub fn shutdown(&mut self) -> Result<(), KernelError> {
         self.state = KernelState::Shutdown;
         Ok(())
+    }
+
+    /// Provides an immutable reference to the HAL.
+    pub fn hal(&self) -> Option<&Hal> {
+        self.hal.as_ref()
+    }
+
+    /// Provides a mutable reference to the HAL.
+    pub fn hal_mut(&mut self) -> Option<&mut Hal> {
+        self.hal.as_mut()
     }
 }

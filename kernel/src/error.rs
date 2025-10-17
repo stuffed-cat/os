@@ -17,6 +17,10 @@ pub enum KernelError {
     #[error("architecture fault: {0}")]
     Arch(&'static str),
 
+    /// Memory management failure.
+    #[error("memory error: {0}")]
+    Memory(&'static str),
+
     /// Placeholder for unimplemented pieces of the kernel.
     #[error("unimplemented: {0}")]
     Unimplemented(&'static str),
@@ -32,6 +36,10 @@ pub enum SubsystemError {
     /// Runtime failure.
     #[error("runtime failure: {0}")]
     Runtime(&'static str),
+
+    /// Resource exhaustion, including memory scarcity.
+    #[error("resource exhaustion: {0}")]
+    Resource(&'static str),
 }
 
 impl From<SubsystemError> for KernelError {
