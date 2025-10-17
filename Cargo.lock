@@ -454,6 +454,12 @@ name = "os-workspace"
 version = "0.0.0"
 
 [[package]]
+name = "pc-keyboard"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed089a1fbffe3337a1a345501c981f1eb1e47e69de5a40e852433e12953c3174"
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.101"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -679,6 +685,7 @@ version = "0.2.0"
 dependencies = [
  "bincode",
  "libc-lite",
+ "pc-keyboard",
  "serde",
 ]
 
