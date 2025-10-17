@@ -1,6 +1,6 @@
 //! Serial port support for early boot logging.
 
-use core::fmt::{self, Write};
+use core::fmt::{self, Arguments, Write};
 
 use log::{LevelFilter, Log, Metadata, Record};
 use spin::{Mutex, Once};
@@ -82,6 +82,13 @@ pub fn write_bytes(bytes: &[u8]) {
         for byte in bytes {
             serial.send(*byte);
         }
+    });
+}
+
+/// Writes formatted data to the serial port.
+pub fn write_fmt(args: Arguments<'_>) {
+    with_serial(|serial| {
+        let _ = SerialWriter(serial).write_fmt(args);
     });
 }
 

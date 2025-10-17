@@ -52,11 +52,10 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
         serial::write_str(buffer.format(line));
         serial::write_str("\r\n");
     }
-    if let Some(message) = info.payload().downcast_ref::<&str>() {
-        serial::write_str(" message: ");
-        serial::write_str(message);
-        serial::write_str("\r\n");
-    }
+    let message = info.message();
+    serial::write_str(" message: ");
+    serial::write_fmt(format_args!("{}", message));
+    serial::write_str("\r\n");
     loop {
         x86_64::instructions::hlt();
     }

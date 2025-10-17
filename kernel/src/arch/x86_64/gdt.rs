@@ -1,7 +1,7 @@
 //! Global Descriptor Table setup for privileged execution.
 
 use spin::Once;
-use x86_64::instructions::segmentation::{Segment, CS};
+use x86_64::instructions::segmentation::{Segment, CS, DS, ES, SS};
 use x86_64::instructions::tables::load_tss;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::tss::TaskStateSegment;
@@ -14,6 +14,7 @@ static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
 
 struct Selectors {
     code_selector: SegmentSelector,
+    data_selector: SegmentSelector,
     tss_selector: SegmentSelector,
 }
 
@@ -31,11 +32,13 @@ pub fn init() {
     GDT.call_once(|| {
         let mut gdt = GlobalDescriptorTable::new();
         let code_selector = gdt.append(Descriptor::kernel_code_segment());
+        let data_selector = gdt.append(Descriptor::kernel_data_segment());
         let tss_selector = gdt.append(Descriptor::tss_segment(TSS.wait()));
         (
             gdt,
             Selectors {
                 code_selector,
+                data_selector,
                 tss_selector,
             },
         )
@@ -45,6 +48,9 @@ pub fn init() {
     gdt_data.0.load();
     unsafe {
         CS::set_reg(gdt_data.1.code_selector);
+        DS::set_reg(gdt_data.1.data_selector);
+        ES::set_reg(gdt_data.1.data_selector);
+        SS::set_reg(gdt_data.1.data_selector);
         load_tss(gdt_data.1.tss_selector);
     }
 }

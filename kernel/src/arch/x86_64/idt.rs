@@ -2,7 +2,8 @@
 
 use log::trace;
 use spin::Once;
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
+use x86_64::registers::control::Cr2;
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 use super::{
     gdt,
@@ -25,6 +26,9 @@ pub fn init() {
         }
         idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
         idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
+        idt.page_fault.set_handler_fn(page_fault_handler);
+        idt.general_protection_fault
+            .set_handler_fn(general_protection_fault_handler);
         idt
     });
 }
@@ -42,6 +46,29 @@ extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
 
 extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame, _code: u64) -> ! {
     panic!("DOUBLE FAULT: {:?}", stack_frame);
+}
+
+extern "x86-interrupt" fn page_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: PageFaultErrorCode,
+) {
+    panic!(
+        "PAGE FAULT: {:?}\nAccessed Address: {:?}\nError Code: {:?}",
+        stack_frame,
+        Cr2::read(),
+        error_code
+    );
+}
+
+extern "x86-interrupt" fn general_protection_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) {
+    panic!(
+        "GENERAL PROTECTION FAULT: {:?}\nError Code: {:#x}",
+        stack_frame,
+        error_code
+    );
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {

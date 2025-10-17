@@ -1,5 +1,6 @@
 //! Hardware abstraction layer bridging architecture and services.
 
+use x86_64::instructions::interrupts;
 use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
 
@@ -27,6 +28,7 @@ impl Hal {
         config: HalConfig,
         frame_allocator: BootFrameAllocator,
     ) -> Result<Self, KernelError> {
+        interrupts::disable();
         ArchBootstrap::init_cpu_features()?;
         ArchBootstrap::validate_virtualization()?;
 
