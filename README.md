@@ -84,6 +84,15 @@ cargo test
 - [ ] Filesystem service (initially ramfs) exposing POSIX file descriptors.
 - [ ] Expand syscall surface (`fork`, `exec`, `open`, `read`, `wait`, etc.).
 
-## 🔐 Licensing
+## � 文档进一步阅读
+
+更详细的设计、开发流程以及 QEMU 运行指南整理在 [`docs/`](docs/README.md) 目录：
+
+- [`architecture.md`](docs/architecture.md)：混合内核结构与模块拆分。
+- [`development.md`](docs/development.md)：开发环境、命令速查与代码规范。
+- [`qemu.md`](docs/qemu.md)：构建裸机镜像并在 QEMU 中运行的完整流程。
+- [`troubleshooting.md`](docs/troubleshooting.md)：常见问题与排查建议。
+
+## �🔐 Licensing
 
 Licensed under the MIT license. See [`LICENSE`](LICENSE) for details.
