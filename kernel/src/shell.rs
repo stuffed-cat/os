@@ -1,8 +1,72 @@
-//! Stub module retained after removing the in-kernel shell implementation.
+//! Userland shell coordinator running inside the kernel event loop.
 
-#![allow(dead_code)]
+use alloc::collections::VecDeque;
+use log::info;
+use spin::Mutex;
 
-/// Placeholder struct kept only to avoid empty-module warnings during the
-/// transition to a userland-only shell.
-pub struct RemovedShell;
+use crate::core::{KernelContext, Subsystem, SubsystemId};
+use crate::error::SubsystemError;
+use crate::arch::x86_64::serial;
+use userland::{BareShell, ShellIo};
+
+const SCANCODE_QUEUE_CAPACITY: usize = 256;
+
+static SCANCODE_QUEUE: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
+
+/// Shell subsystem bridging keyboard interrupts and the userland shell loop.
+pub struct ShellSubsystem {
+	shell: BareShell<SerialShellIo>,
+}
+
+impl ShellSubsystem {
+	/// Creates a new shell subsystem instance.
+	pub fn new() -> Self {
+		Self {
+			shell: BareShell::new(SerialShellIo),
+		}
+	}
+
+	fn poll_shell(&mut self) {
+		self.shell.poll();
+	}
+}
+
+impl Subsystem for ShellSubsystem {
+	fn id(&self) -> SubsystemId {
+		SubsystemId("shell")
+	}
+
+	fn init(&mut self, _ctx: &KernelContext) -> Result<(), SubsystemError> {
+		info!("userland shell initialized");
+		Ok(())
+	}
+
+	fn tick(&mut self, _ctx: &KernelContext) -> Result<(), SubsystemError> {
+		self.poll_shell();
+		Ok(())
+	}
+}
+
+/// Serial-backed shell IO implementation.
+struct SerialShellIo;
+
+impl ShellIo for SerialShellIo {
+	fn next_scancode(&mut self) -> Option<u8> {
+		let mut queue = SCANCODE_QUEUE.lock();
+		queue.pop_front()
+	}
+
+	fn write_str(&mut self, s: &str) {
+		serial::write_str(s);
+	}
+}
+
+/// Enqueues a raw keyboard scancode for shell processing.
+pub fn enqueue_scancode(scancode: u8) {
+	let mut queue = SCANCODE_QUEUE.lock();
+	if queue.len() >= SCANCODE_QUEUE_CAPACITY {
+		queue.pop_front();
+	}
+	queue.push_back(scancode);
+}
 

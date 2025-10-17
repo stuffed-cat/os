@@ -7,7 +7,9 @@ use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 use super::{
     gdt,
     interrupts::{self, InterruptIndex},
+    keyboard,
 };
+use crate::shell;
 
 static IDT: Once<InterruptDescriptorTable> = Once::new();
 
@@ -47,5 +49,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    let scancode = keyboard::read_scancode();
+    shell::enqueue_scancode(scancode);
     interrupts::notify_end_of_interrupt(InterruptIndex::Keyboard);
 }

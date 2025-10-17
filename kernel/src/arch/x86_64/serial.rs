@@ -34,20 +34,20 @@ impl Log for SerialLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
-        if let Some(serial) = SERIAL.lock().as_mut() {
+        with_serial(|serial| {
             let _ = writeln!(
                 SerialWriter(serial),
                 "[{}] {}",
                 record.level(),
                 record.args()
             );
-        }
+        });
     }
 
     fn flush(&self) {
-        if let Some(serial) = SERIAL.lock().as_mut() {
+        with_serial(|serial| {
             let _ = SerialWriter(serial).flush();
-        }
+        });
     }
 }
 
@@ -71,16 +71,31 @@ impl<'a> SerialWriter<'a> {
 
 /// Writes directly to the serial port for panic handlers.
 pub fn write_str(s: &str) {
-    if let Some(serial) = SERIAL.lock().as_mut() {
+    with_serial(|serial| {
         let _ = SerialWriter(serial).write_str(s);
-    }
+    });
 }
 
 /// Writes raw bytes to the serial port without UTF-8 assumptions.
 pub fn write_bytes(bytes: &[u8]) {
-    if let Some(serial) = SERIAL.lock().as_mut() {
+    with_serial(|serial| {
         for byte in bytes {
             serial.send(*byte);
         }
+    });
+}
+
+fn with_serial<F>(mut f: F)
+where
+    F: FnMut(&mut SerialPort),
+{
+    let mut guard = SERIAL.lock();
+    if guard.is_none() {
+        let mut serial = unsafe { SerialPort::new(SERIAL_IO_PORT) };
+        serial.init();
+        *guard = Some(serial);
+    }
+    if let Some(serial) = guard.as_mut() {
+        f(serial);
     }
 }

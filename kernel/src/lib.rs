@@ -22,6 +22,7 @@ pub mod posix;
 pub mod process;
 pub mod scheduler;
 pub mod services;
+pub mod shell;
 pub mod syscall;
 
 pub use crate::core::{Kernel, KernelBuilder, KernelContext, KernelState, Subsystem, SubsystemId};

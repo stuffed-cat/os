@@ -3,7 +3,12 @@
 use arrayvec::ArrayVec;
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 use bootloader_api::BootInfo;
-use kernel::{hal::HalConfig, FrameRange, Hal, KernelBuilder};
+use kernel::{
+    arch::x86_64::serial,
+    hal::HalConfig,
+    memory::BootFrameAllocator,
+    FrameRange, Hal, KernelBuilder,
+};
 use linked_list_allocator::LockedHeap;
 use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
@@ -21,10 +26,11 @@ pub fn start(boot_info: &'static mut BootInfo, allocator: &'static LockedHeap) -
     let ranges = collect_frame_ranges(&boot_info.memory_regions);
     let hal_config = HalConfig {
         physical_memory_offset: phys_offset,
-        frame_ranges: ranges.as_slice(),
     };
 
-    let mut hal = unsafe { Hal::bootstrap(hal_config) }.expect("HAL bootstrap");
+    let frame_allocator = BootFrameAllocator::from_frame_ranges(ranges);
+
+    let hal = unsafe { Hal::bootstrap(hal_config, frame_allocator) }.expect("HAL bootstrap");
     hal.map_heap(
         VirtAddr::new(HEAP_START),
         HEAP_SIZE,
@@ -37,9 +43,15 @@ pub fn start(boot_info: &'static mut BootInfo, allocator: &'static LockedHeap) -
     }
 
     hal.enable_interrupts();
+    serial::write_str("kernel: interrupts enabled\r\n");
 
-    let mut kernel = KernelBuilder::default().with_hal(hal).build();
+    let mut kernel = KernelBuilder::default()
+        .with_hal(hal)
+        .with_subsystem(kernel::shell::ShellSubsystem::new())
+        .build();
+    serial::write_str("kernel: builder constructed\r\n");
     kernel.init().expect("kernel init");
+    serial::write_str("kernel: init complete\r\n");
     kernel.run().expect("kernel run");
 
     halt_loop();

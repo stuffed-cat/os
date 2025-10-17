@@ -23,3 +23,6 @@ spin = "0.9"
 log = { version = "0.4", default-features = false }
 x86_64 = { version = "0.15", default-features = false, features = ["instructions"] }
 uart_16550 = "0.2"
+arrayvec = { version = "0.7", default-features = false }
+bootloader_api = { version = "0.11", default-features = false }
+userland = { path = "../userland", default-features = false, features = ["baremetal"] }

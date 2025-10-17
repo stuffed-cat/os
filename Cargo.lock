@@ -348,10 +348,13 @@ dependencies = [
 name = "kernel"
 version = "0.2.0"
 dependencies = [
+ "arrayvec",
  "bitflags 2.9.4",
+ "bootloader_api",
  "log",
  "spin",
  "uart_16550",
+ "userland",
  "x86_64 0.15.2",
 ]
 
@@ -362,6 +365,7 @@ dependencies = [
  "arrayvec",
  "bootloader",
  "bootloader_api",
+ "itoa",
  "kernel",
  "linked_list_allocator",
  "spin",

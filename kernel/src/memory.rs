@@ -7,7 +7,7 @@ use spin::RwLock;
 use crate::error::SubsystemError;
 
 #[cfg(any(feature = "alloc", feature = "std"))]
-use alloc::vec::Vec;
+use arrayvec::ArrayVec;
 #[cfg(any(feature = "alloc", feature = "std"))]
 use spin::Mutex;
 #[cfg(any(feature = "alloc", feature = "std"))]
@@ -126,19 +126,17 @@ impl FrameRange {
         }
     }
 
+    fn start(&self) -> PhysAddr {
+        self.start
+    }
+
+    fn end(&self) -> PhysAddr {
+        self.end
+    }
+
     #[allow(dead_code)]
     fn contains(&self, addr: PhysAddr) -> bool {
         addr >= self.start && addr < self.end
-    }
-
-    fn push_frames(&self, frames: &mut Vec<PhysFrame>) {
-        let mut current = align_up(self.start.as_u64(), Size4KiB::SIZE);
-        let end = self.end.as_u64();
-        while current + Size4KiB::SIZE <= end {
-            let frame = PhysFrame::containing_address(PhysAddr::new(current));
-            frames.push(frame);
-            current += Size4KiB::SIZE;
-        }
     }
 }
 
@@ -147,34 +145,44 @@ fn align_up(addr: u64, align: u64) -> u64 {
     (addr + align - 1) & !(align - 1)
 }
 
-/// Boot-time frame allocator based on a pre-collected list of free frames.
+const FRAME_RANGE_CAPACITY: usize = 256;
+
+/// Boot-time frame allocator based on the list of available ranges.
 #[cfg(any(feature = "alloc", feature = "std"))]
 pub struct BootFrameAllocator {
-    free: Vec<PhysFrame>,
-    next: usize,
+    ranges: ArrayVec<FrameRange, FRAME_RANGE_CAPACITY>,
+    current_range: usize,
+    next_addr: u64,
 }
 
 #[cfg(any(feature = "alloc", feature = "std"))]
 impl BootFrameAllocator {
     /// Builds a frame allocator from the provided frame ranges.
-    pub fn from_ranges(regions: &[FrameRange]) -> Self {
-        let mut free = Vec::new();
-        for region in regions {
-            region.push_frames(&mut free);
+    pub fn from_frame_ranges(ranges: ArrayVec<FrameRange, FRAME_RANGE_CAPACITY>) -> Self {
+        Self {
+            ranges,
+            current_range: 0,
+            next_addr: 0,
         }
-        free.sort_by_key(|frame| frame.start_address());
-        free.dedup();
-        Self { free, next: 0 }
     }
 
     fn allocate(&mut self) -> Option<PhysFrame> {
-        if self.next >= self.free.len() {
-            None
-        } else {
-            let frame = self.free[self.next];
-            self.next += 1;
-            Some(frame)
+        while self.current_range < self.ranges.len() {
+            let range = self.ranges[self.current_range];
+            if self.next_addr == 0 {
+                self.next_addr = align_up(range.start().as_u64(), Size4KiB::SIZE);
+            }
+
+            if self.next_addr + Size4KiB::SIZE <= range.end().as_u64() {
+                let frame = PhysFrame::containing_address(PhysAddr::new(self.next_addr));
+                self.next_addr += Size4KiB::SIZE;
+                return Some(frame);
+            }
+
+            self.current_range += 1;
+            self.next_addr = 0;
         }
+        None
     }
 }
 

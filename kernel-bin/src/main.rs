@@ -3,13 +3,16 @@
 #![cfg_attr(feature = "boot", feature(lang_items))]
 
 #[cfg(feature = "boot")]
-extern crate alloc;
-
-#[cfg(feature = "boot")]
 mod boot;
 
 #[cfg(feature = "boot")]
+extern crate alloc;
+
+#[cfg(feature = "boot")]
 use bootloader_api::BootInfo;
+
+#[cfg(feature = "boot")]
+use bootloader_api::config::{BootloaderConfig, Mapping};
 
 #[cfg(feature = "boot")]
 use linked_list_allocator::LockedHeap;
@@ -19,7 +22,17 @@ use linked_list_allocator::LockedHeap;
 static GLOBAL_ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 #[cfg(feature = "boot")]
-bootloader_api::entry_point!(kernel_entry);
+use kernel::arch::x86_64::serial;
+
+#[cfg(feature = "boot")]
+pub static BOOTLOADER_CONFIG: BootloaderConfig = {
+    let mut config = BootloaderConfig::new_default();
+    config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config
+};
+
+#[cfg(feature = "boot")]
+bootloader_api::entry_point!(kernel_entry, config = &BOOTLOADER_CONFIG);
 
 #[cfg(feature = "boot")]
 fn kernel_entry(boot_info: &'static mut BootInfo) -> ! {
@@ -29,10 +42,20 @@ fn kernel_entry(boot_info: &'static mut BootInfo) -> ! {
 #[cfg(feature = "boot")]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
-    kernel::arch::x86_64::serial::write_str("kernel panic:\n");
+    serial::write_str("kernel panic!\r\n");
+    if let Some(location) = info.location() {
+        serial::write_str(" at ");
+        serial::write_str(location.file());
+        serial::write_str(":");
+        let mut buffer = itoa::Buffer::new();
+        let line = location.line();
+        serial::write_str(buffer.format(line));
+        serial::write_str("\r\n");
+    }
     if let Some(message) = info.payload().downcast_ref::<&str>() {
-        kernel::arch::x86_64::serial::write_str(message);
-        kernel::arch::x86_64::serial::write_str("\n");
+        serial::write_str(" message: ");
+        serial::write_str(message);
+        serial::write_str("\r\n");
     }
     loop {
         x86_64::instructions::hlt();

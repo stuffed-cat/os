@@ -155,20 +155,19 @@ impl Kernel {
     /// Transition to the running state and invoke subsystem ticks.
     pub fn run(&mut self) -> Result<(), KernelError> {
         self.state = KernelState::Running;
-        loop {
-            let hal_ref = self.hal.as_ref();
-            let ctx = KernelContext::new(self.state, &self.services, hal_ref);
-            for subsystem in self.subsystems.iter_mut() {
-                let id = subsystem.id();
-                subsystem
-                    .tick(&ctx)
-                    .map_err(|source| KernelError::Subsystem { id: id.0, source })?;
-            }
-            // In a real kernel this would yield to the scheduler and hardware interrupts.
-            // For now we break to prevent a busy loop during unit tests.
-            break;
+        #[cfg(feature = "std")]
+        {
+            self.service_tick()?;
+            return Ok(());
         }
-        Ok(())
+
+        #[cfg(not(feature = "std"))]
+        {
+            loop {
+                self.service_tick()?;
+                x86_64::instructions::hlt();
+            }
+        }
     }
 
     /// Initiates kernel shutdown.
@@ -185,5 +184,19 @@ impl Kernel {
     /// Provides a mutable reference to the HAL.
     pub fn hal_mut(&mut self) -> Option<&mut Hal> {
         self.hal.as_mut()
+    }
+}
+
+impl Kernel {
+    fn service_tick(&mut self) -> Result<(), KernelError> {
+        let hal_ref = self.hal.as_ref();
+        let ctx = KernelContext::new(self.state, &self.services, hal_ref);
+        for subsystem in self.subsystems.iter_mut() {
+            let id = subsystem.id();
+            subsystem
+                .tick(&ctx)
+                .map_err(|source| KernelError::Subsystem { id: id.0, source })?;
+        }
+        Ok(())
     }
 }

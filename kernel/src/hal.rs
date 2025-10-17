@@ -6,15 +6,13 @@ use x86_64::VirtAddr;
 use crate::{
     arch::x86_64::{interrupts::InterruptController, ArchBootstrap, Pic8259Controller},
     error::KernelError,
-    memory::{BootFrameAllocator, FrameRange, MemoryManager},
+    memory::{BootFrameAllocator, MemoryManager},
 };
 
 /// Configuration input required to bootstrap the HAL.
-pub struct HalConfig<'a> {
+pub struct HalConfig {
     /// Virtual address offset where physical memory is mapped.
     pub physical_memory_offset: u64,
-    /// Physical memory ranges available for allocation.
-    pub frame_ranges: &'a [FrameRange],
 }
 
 /// HAL facade for managing interrupts and paging.
@@ -25,12 +23,17 @@ pub struct Hal {
 
 impl Hal {
     /// Performs early CPU initialization and constructs the HAL instance.
-    pub unsafe fn bootstrap(config: HalConfig<'_>) -> Result<Self, KernelError> {
+    pub unsafe fn bootstrap(
+        config: HalConfig,
+        frame_allocator: BootFrameAllocator,
+    ) -> Result<Self, KernelError> {
         ArchBootstrap::init_cpu_features()?;
         ArchBootstrap::validate_virtualization()?;
 
-        let allocator = BootFrameAllocator::from_ranges(config.frame_ranges);
-        let memory = MemoryManager::new(VirtAddr::new(config.physical_memory_offset), allocator);
+        let memory = MemoryManager::new(
+            VirtAddr::new(config.physical_memory_offset),
+            frame_allocator,
+        );
 
         let controller = Pic8259Controller::new();
         controller.init();

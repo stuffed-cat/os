@@ -14,6 +14,8 @@ pub mod idt {
     pub fn load() {}
 }
 pub mod interrupts;
+#[cfg(feature = "hardware")]
+pub mod keyboard;
 pub mod serial;
 
 pub use boot::ArchBootstrap;
