@@ -1,12 +1,15 @@
 //! POSIX compatibility primitives enabling a Unix-like userland.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::slice;
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::RwLock;
 
 use crate::{
+    arch::x86_64::serial,
     error::SubsystemError,
     process::{Pid, ProcessTable, WaitError},
     syscall::SyscallId,
@@ -60,6 +63,8 @@ pub struct PosixLayer<'a> {
     process_table: &'a ProcessTable,
     program_handles: RwLock<BTreeMap<u64, String>>,
     path_handles: RwLock<BTreeMap<u64, String>>,
+    next_handle: AtomicU64,
+    pipes: RwLock<BTreeMap<u64, PipeState>>,
 }
 
 impl<'a> PosixLayer<'a> {
@@ -69,6 +74,8 @@ impl<'a> PosixLayer<'a> {
             process_table,
             program_handles: RwLock::new(BTreeMap::new()),
             path_handles: RwLock::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1_000),
+            pipes: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -85,12 +92,13 @@ impl<'a> PosixLayer<'a> {
                 let fd = args.get(0).copied().unwrap_or_default();
                 let buf = args.get(1).copied().unwrap_or_default();
                 let len = args.get(2).copied().unwrap_or_default();
-                self.write(pid, fd, buf, len).map_err(|_| Errno::NoImpl)
+                self.write(pid, fd, buf, len).map_err(Errno::from_subsystem)
             }
             SyscallId::Read => {
                 let fd = args.get(0).copied().unwrap_or_default();
-                let len = args.get(1).copied().unwrap_or_default();
-                self.read(pid, fd, len)
+                let buf = args.get(1).copied().unwrap_or_default();
+                let len = args.get(2).copied().unwrap_or_default();
+                self.read(pid, fd, buf, len)
             }
             SyscallId::Open => {
                 let handle = args.get(0).copied().unwrap_or_default();
@@ -112,6 +120,26 @@ impl<'a> PosixLayer<'a> {
                 let options = args.get(2).copied().unwrap_or_default();
                 self.waitpid(pid, target, options)
             }
+            SyscallId::Dup => {
+                let fd = args.get(0).copied().unwrap_or_default();
+                self.dup(pid, fd)
+            }
+            SyscallId::Dup2 => {
+                let fd = args.get(0).copied().unwrap_or_default();
+                let new_fd = args.get(1).copied().unwrap_or_default();
+                self.dup2(pid, fd, new_fd)
+            }
+            SyscallId::Pipe => self.pipe(pid),
+            SyscallId::Chdir => {
+                let handle = args.get(0).copied().unwrap_or_default();
+                let path = self.lookup_path_handle(handle)?;
+                self.chdir(pid, path)
+            }
+            SyscallId::GetCwd => self.getcwd(pid),
+            SyscallId::Sleep => {
+                let millis = args.get(0).copied().unwrap_or_default();
+                self.sleep(millis)
+            }
             _ => Err(Errno::NoImpl),
         }
     }
@@ -126,17 +154,86 @@ impl<'a> PosixLayer<'a> {
         self.path_handles.write().insert(handle, path);
     }
 
-    fn write(&self, _pid: Pid, _fd: u64, _buf: u64, _len: u64) -> Result<u64, SubsystemError> {
-        // We would copy from userland buffer and push to a pseudo TTY device service.
-        Ok(0)
+    /// Allocates a new handle id for either program or path associations.
+    pub fn allocate_handle(&self) -> u64 {
+        self.next_handle.fetch_add(1, Ordering::SeqCst)
     }
 
-    fn read(&self, pid: Pid, fd: u64, len: u64) -> Result<u64, Errno> {
+    fn write(&self, pid: Pid, fd: u64, buf: u64, len: u64) -> Result<u64, SubsystemError> {
+        if len == 0 {
+            return Ok(0);
+        }
+
+        if buf == 0 {
+            return Err(SubsystemError::Runtime("null buffer"));
+        }
+
+        let descriptor = self
+            .descriptor_for(pid, fd)
+            .ok_or(SubsystemError::Runtime("fd not found"))?;
+        let data = unsafe { slice::from_raw_parts(buf as *const u8, len as usize) };
+
+        match self.classify_descriptor(&descriptor) {
+            Descriptor::StdOut | Descriptor::StdErr => {
+                serial::write_bytes(data);
+                Ok(len)
+            }
+            Descriptor::Pipe {
+                id,
+                end: PipeEnd::Write,
+            } => {
+                let mut pipes = self.pipes.write();
+                let state = pipes
+                    .get_mut(&id)
+                    .ok_or(SubsystemError::Runtime("pipe not found"))?;
+                Ok(state.write(data) as u64)
+            }
+            Descriptor::Pipe { .. } => Err(SubsystemError::Runtime("write on read end")),
+            Descriptor::Path => Ok(len),
+            Descriptor::Unknown => Err(SubsystemError::Runtime("unsupported descriptor")),
+            Descriptor::StdIn => Err(SubsystemError::Runtime("write on stdin")),
+        }
+    }
+
+    fn read(&self, pid: Pid, fd: u64, buf: u64, len: u64) -> Result<u64, Errno> {
         let proc = self.process_table.lookup(pid).ok_or(Errno::NoEnt)?;
         if proc.get_fd(fd).is_none() {
             return Err(Errno::Inval);
         }
-        Ok(len)
+        if len == 0 {
+            return Ok(0);
+        }
+
+        if buf == 0 {
+            return Err(Errno::Inval);
+        }
+
+        let descriptor = proc.get_fd(fd).ok_or(Errno::Badf)?;
+        let buffer = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
+
+        match self.classify_descriptor(&descriptor) {
+            Descriptor::StdIn => Ok(0),
+            Descriptor::Pipe {
+                id,
+                end: PipeEnd::Read,
+            } => {
+                let mut pipes = self.pipes.write();
+                if let Some(state) = pipes.get_mut(&id) {
+                    Ok(state.read(buffer) as u64)
+                } else {
+                    Err(Errno::Inval)
+                }
+            }
+            Descriptor::Pipe { .. } => Err(Errno::Badf),
+            Descriptor::StdOut | Descriptor::StdErr => Err(Errno::Badf),
+            Descriptor::Path => {
+                for byte in buffer.iter_mut() {
+                    *byte = 0;
+                }
+                Ok(len)
+            }
+            Descriptor::Unknown => Err(Errno::NoImpl),
+        }
     }
 
     fn open(&self, pid: Pid, path: &str, _flags: u64) -> Result<u64, Errno> {
@@ -147,10 +244,13 @@ impl<'a> PosixLayer<'a> {
     }
 
     fn close(&self, pid: Pid, fd: u64) -> Result<(), Errno> {
+        let descriptor = self.descriptor_for(pid, fd).ok_or(Errno::Badf)?;
         self.process_table.close(pid, fd).map_err(|err| match err {
             SubsystemError::Runtime("fd not found") => Errno::Badf,
             other => Errno::from_subsystem(other),
-        })
+        })?;
+        self.release_descriptor(&descriptor);
+        Ok(())
     }
 
     fn exit(&self, pid: Pid, status: i32) {
@@ -200,6 +300,74 @@ impl<'a> PosixLayer<'a> {
         }
     }
 
+    fn dup(&self, pid: Pid, fd: u64) -> Result<u64, Errno> {
+        let descriptor = self.descriptor_for(pid, fd).ok_or(Errno::Badf)?;
+        let new_fd = self
+            .process_table
+            .dup(pid, fd)
+            .map_err(Errno::from_subsystem)? as u64;
+        self.retain_descriptor(&descriptor);
+        Ok(new_fd)
+    }
+
+    fn dup2(&self, pid: Pid, fd: u64, new_fd: u64) -> Result<u64, Errno> {
+        if fd == new_fd {
+            return Ok(new_fd);
+        }
+
+        let source = self.descriptor_for(pid, fd).ok_or(Errno::Badf)?;
+        let existing = self.descriptor_for(pid, new_fd);
+
+        let result = self
+            .process_table
+            .dup2(pid, fd, new_fd)
+            .map_err(Errno::from_subsystem)? as u64;
+
+        if let Some(old) = existing {
+            self.release_descriptor(&old);
+        }
+        self.retain_descriptor(&source);
+        Ok(result)
+    }
+
+    fn pipe(&self, pid: Pid) -> Result<u64, Errno> {
+        let (read_fd, write_fd, pipe_id) = self
+            .process_table
+            .pipe(pid)
+            .map_err(Errno::from_subsystem)?;
+        self.pipes.write().insert(pipe_id, PipeState::new());
+        Ok(((write_fd as u64) << 32) | (read_fd as u64))
+    }
+
+    fn chdir(&self, pid: Pid, path: String) -> Result<u64, Errno> {
+        let normalized = Self::normalize_path(&path);
+        self.process_table
+            .chdir(pid, normalized)
+            .map(|_| 0)
+            .map_err(Errno::from_subsystem)
+    }
+
+    fn getcwd(&self, pid: Pid) -> Result<u64, Errno> {
+        let cwd = self
+            .process_table
+            .getcwd(pid)
+            .map_err(Errno::from_subsystem)?;
+        let handle = self.allocate_handle();
+        self.register_path_handle(handle, cwd);
+        Ok(handle)
+    }
+
+    fn sleep(&self, millis: u64) -> Result<u64, Errno> {
+        // Placeholder: real implementation would integrate with a timer scheduler.
+        if millis == 0 {
+            return Ok(0);
+        }
+        for _ in 0..millis {
+            core::hint::spin_loop();
+        }
+        Ok(0)
+    }
+
     /// Normalizes POSIX path.
     pub fn normalize_path(path: &str) -> String {
         let mut parts = Vec::new();
@@ -223,5 +391,224 @@ impl Errno {
             SubsystemError::Runtime(_) => Errno::Inval,
             SubsystemError::Resource(_) => Errno::NoMem,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipeEnd {
+    Read,
+    Write,
+}
+
+#[derive(Debug)]
+enum Descriptor {
+    StdIn,
+    StdOut,
+    StdErr,
+    Pipe { id: u64, end: PipeEnd },
+    Path,
+    Unknown,
+}
+
+#[derive(Default)]
+struct PipeState {
+    buffer: VecDeque<u8>,
+    readers: usize,
+    writers: usize,
+}
+
+impl PipeState {
+    fn new() -> Self {
+        Self {
+            buffer: VecDeque::new(),
+            readers: 1,
+            writers: 1,
+        }
+    }
+
+    fn write(&mut self, data: &[u8]) -> usize {
+        for byte in data {
+            self.buffer.push_back(*byte);
+        }
+        data.len()
+    }
+
+    fn read(&mut self, out: &mut [u8]) -> usize {
+        let mut count = 0;
+        while count < out.len() {
+            match self.buffer.pop_front() {
+                Some(byte) => {
+                    out[count] = byte;
+                    count += 1;
+                }
+                None => break,
+            }
+        }
+        count
+    }
+
+    fn retain(&mut self, end: PipeEnd) {
+        match end {
+            PipeEnd::Read => self.readers += 1,
+            PipeEnd::Write => self.writers += 1,
+        }
+    }
+
+    fn release(&mut self, end: PipeEnd) {
+        match end {
+            PipeEnd::Read => {
+                self.readers = self.readers.saturating_sub(1);
+            }
+            PipeEnd::Write => {
+                self.writers = self.writers.saturating_sub(1);
+            }
+        }
+    }
+
+    fn is_orphaned(&self) -> bool {
+        self.readers == 0 && self.writers == 0
+    }
+}
+
+impl<'a> PosixLayer<'a> {
+    fn descriptor_for(&self, pid: Pid, fd: u64) -> Option<String> {
+        self.process_table
+            .lookup(pid)
+            .and_then(|proc| proc.get_fd(fd))
+    }
+
+    fn classify_descriptor(&self, descriptor: &str) -> Descriptor {
+        match descriptor {
+            "tty:stdin" => Descriptor::StdIn,
+            "tty:stdout" => Descriptor::StdOut,
+            "tty:stderr" => Descriptor::StdErr,
+            other => {
+                if let Some(pipe) = other.strip_prefix("pipe:") {
+                    let mut parts = pipe.split(':');
+                    if let (Some(id), Some(end)) = (parts.next(), parts.next()) {
+                        if let Ok(pipe_id) = id.parse::<u64>() {
+                            return match end {
+                                "r" => Descriptor::Pipe {
+                                    id: pipe_id,
+                                    end: PipeEnd::Read,
+                                },
+                                "w" => Descriptor::Pipe {
+                                    id: pipe_id,
+                                    end: PipeEnd::Write,
+                                },
+                                _ => Descriptor::Unknown,
+                            };
+                        }
+                    }
+                }
+                if descriptor.is_empty() {
+                    Descriptor::Unknown
+                } else {
+                    Descriptor::Path
+                }
+            }
+        }
+    }
+
+    fn retain_descriptor(&self, descriptor: &str) {
+        if let Descriptor::Pipe { id, end } = self.classify_descriptor(descriptor) {
+            if let Some(state) = self.pipes.write().get_mut(&id) {
+                state.retain(end);
+            }
+        }
+    }
+
+    fn release_descriptor(&self, descriptor: &str) {
+        if let Descriptor::Pipe { id, end } = self.classify_descriptor(descriptor) {
+            let mut pipes = self.pipes.write();
+            if let Some(state) = pipes.get_mut(&id) {
+                state.release(end);
+                if state.is_orphaned() {
+                    pipes.remove(&id);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::{Pid, ProcessTable};
+    use alloc::boxed::Box;
+
+    fn setup_layer() -> (&'static ProcessTable, PosixLayer<'static>, Pid) {
+        let table = ProcessTable::new();
+        let pid = table.spawn().pid();
+        // SAFETY: leak the table for the duration of the test process.
+        let static_table: &'static ProcessTable = Box::leak(Box::new(table));
+        let layer = PosixLayer::new(static_table);
+        (static_table, layer, pid)
+    }
+
+    #[test]
+    fn dup_and_dup2_roundtrip() {
+        let (table, layer, pid) = setup_layer();
+        let fd = table.open(pid, "/tmp/file".into()).unwrap();
+        let dup_fd = layer.dup(pid, fd).unwrap();
+        assert_ne!(dup_fd, fd);
+        let target_fd = fd + 5;
+        let target = layer.dup2(pid, fd, target_fd).unwrap();
+        assert_eq!(target, target_fd);
+    }
+
+    #[test]
+    fn pipe_returns_two_descriptors() {
+        let (_, layer, pid) = setup_layer();
+        let packed = layer.pipe(pid).unwrap();
+        let read_fd = (packed & 0xffff_ffff) as u32;
+        let write_fd = (packed >> 32) as u32;
+        assert_ne!(read_fd, write_fd);
+        assert!(read_fd >= 3);
+        assert!(write_fd > read_fd);
+    }
+
+    #[test]
+    fn getcwd_registers_handle() {
+        let (_, layer, pid) = setup_layer();
+        let initial = layer.getcwd(pid).unwrap();
+        let path = layer.lookup_path_handle(initial).unwrap();
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn pipe_write_then_read_roundtrip() {
+        let (_, layer, pid) = setup_layer();
+        let packed = layer.pipe(pid).unwrap();
+        let read_fd = (packed & 0xffff_ffff) as u64;
+        let write_fd = (packed >> 32) as u64;
+
+        let payload = b"abc";
+        let written = layer
+            .write(pid, write_fd, payload.as_ptr() as u64, payload.len() as u64)
+            .unwrap();
+        assert_eq!(written, payload.len() as u64);
+
+        let mut buffer = [0u8; 8];
+        let read = layer
+            .read(
+                pid,
+                read_fd,
+                buffer.as_mut_ptr() as u64,
+                payload.len() as u64,
+            )
+            .unwrap();
+        assert_eq!(read, payload.len() as u64);
+        assert_eq!(&buffer[..payload.len()], payload);
+    }
+
+    #[test]
+    fn write_to_stdout_accepts_data() {
+        let (_, layer, pid) = setup_layer();
+        let message = b"hi";
+        let written = layer
+            .write(pid, 1, message.as_ptr() as u64, message.len() as u64)
+            .unwrap();
+        assert_eq!(written, message.len() as u64);
     }
 }

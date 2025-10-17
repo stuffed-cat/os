@@ -1,0 +1,21 @@
+[package]
+name = "libc-lite"
+version = "0.1.0"
+edition = "2021"
+authors = ["stuffed-cat <dev@stuffedcat.dev>"]
+description = "A lightweight libc-style shim for experimental userland"
+license = "MIT"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[features]
+default = ["std"]
+std = []
+no_std = []
+
+[dependencies]
+
+[build-dependencies]
+cc = "1.0"
+

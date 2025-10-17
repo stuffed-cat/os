@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    process::Command as ProcessCommand,
 };
 
 use anyhow::{bail, Context, Result};
@@ -19,6 +20,12 @@ struct Args {
 enum Command {
     /// Build a bootable disk image using the vendored bootloader.
     Bootimage {
+        /// Package to target (defaults to kernel-bin).
+        #[arg(short = 'p', long = "package")]
+        package: Option<String>,
+        /// Override the manifest path (ignored, supported for compatibility).
+        #[arg(long = "manifest-path")]
+        manifest_path: Option<PathBuf>,
         /// Build the release profile instead of debug.
         #[arg(long)]
         release: bool,
@@ -28,6 +35,15 @@ enum Command {
         /// Output path for the generated disk image.
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Feature list passed through to the kernel build.
+        #[arg(long = "features", value_delimiter = ',')]
+        features: Option<Vec<String>>,
+        /// Suppress informational output.
+        #[arg(long)]
+        quiet: bool,
+        /// Collect any extra arguments for forward compatibility.
+        #[arg(last = true)]
+        extra: Vec<String>,
     },
 }
 
@@ -35,17 +51,55 @@ fn main() -> Result<()> {
     let args = Args::parse();
     match args.command {
         Command::Bootimage {
+            package,
+            manifest_path,
             release,
             target,
             output,
-        } => build_bootimage(release, target.as_deref(), output.as_deref())?,
+            features,
+            quiet: _quiet,
+            extra,
+        } => build_bootimage(
+            package.as_deref(),
+            manifest_path.as_deref(),
+            release,
+            target.as_deref(),
+            output.as_deref(),
+            features,
+            &extra,
+        )?,
     }
     Ok(())
 }
 
-fn build_bootimage(release: bool, target: Option<&str>, output: Option<&Path>) -> Result<()> {
+fn build_bootimage(
+    package: Option<&str>,
+    _manifest_path: Option<&Path>,
+    release: bool,
+    target: Option<&str>,
+    output: Option<&Path>,
+    features: Option<Vec<String>>,
+    extra_args: &[String],
+) -> Result<()> {
+    if let Some(additional) = extra_args.first() {
+        bail!("unrecognized argument `{additional}`");
+    }
+
+    if let Some(pkg) = package {
+        if pkg != "kernel-bin" {
+            bail!("unsupported package `{pkg}`; expected `kernel-bin`");
+        }
+    }
+
+    let feature_list: Vec<String> = match features {
+        Some(list) if !list.is_empty() => list,
+        _ => vec!["boot".to_string()],
+    };
+
     let target_triple = target.unwrap_or("x86_64-unknown-none");
     let profile = if release { "release" } else { "debug" };
+
+    build_kernel_binary(release, target_triple, &feature_list)?;
 
     let metadata = MetadataCommand::new()
         .exec()
@@ -58,7 +112,7 @@ fn build_bootimage(release: bool, target: Option<&str>, output: Option<&Path>) -
 
     if !kernel_path.exists() {
         bail!(
-            "kernel binary not found at {} (build it with `cargo +nightly build -p kernel-bin --features boot -Z build-std=core,alloc,compiler_builtins --target {target_triple}`)",
+            "kernel binary not found at {} even after build",
             kernel_path.display()
         );
     }
@@ -82,5 +136,27 @@ fn build_bootimage(release: bool, target: Option<&str>, output: Option<&Path>) -
         .with_context(|| format!("failed to create BIOS image at {}", out_path.display()))?;
 
     println!("boot image written to {}", out_path.display());
+    Ok(())
+}
+
+fn build_kernel_binary(release: bool, target_triple: &str, features: &[String]) -> Result<()> {
+    let mut cmd = ProcessCommand::new("rustup");
+    cmd.arg("run").arg("nightly").arg("cargo");
+    cmd.arg("-Zbuild-std=core,alloc,compiler_builtins");
+    cmd.arg("-Zbuild-std-features=compiler-builtins-mem");
+    cmd.arg("build");
+    cmd.arg("-p").arg("kernel-bin");
+    if !features.is_empty() {
+        cmd.arg("--features").arg(features.join(","));
+    }
+    cmd.arg("--target").arg(target_triple);
+    if release {
+        cmd.arg("--release");
+    }
+    cmd.env("RUSTUP_TOOLCHAIN", "nightly");
+    let status = cmd.status().context("failed to invoke cargo build")?;
+    if !status.success() {
+        bail!("kernel build failed (status {status})");
+    }
     Ok(())
 }

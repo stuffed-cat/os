@@ -29,6 +29,18 @@ pub enum SyscallId {
     WaitPid,
     /// POSIX `getpid` syscall.
     GetPid,
+    /// POSIX `pipe` syscall.
+    Pipe,
+    /// POSIX `dup` syscall.
+    Dup,
+    /// POSIX `dup2` syscall.
+    Dup2,
+    /// POSIX `chdir` syscall.
+    Chdir,
+    /// POSIX `getcwd` syscall.
+    GetCwd,
+    /// POSIX `nanosleep` (millisecond placeholder) syscall.
+    Sleep,
     /// Placeholder for future syscalls.
     Unknown(u64),
 }
@@ -45,6 +57,12 @@ impl From<u64> for SyscallId {
             60 => SyscallId::Exit,
             61 => SyscallId::WaitPid,
             39 => SyscallId::GetPid,
+            22 => SyscallId::Pipe,
+            32 => SyscallId::Dup,
+            33 => SyscallId::Dup2,
+            80 => SyscallId::Chdir,
+            79 => SyscallId::GetCwd,
+            35 => SyscallId::Sleep,
             other => SyscallId::Unknown(other),
         }
     }

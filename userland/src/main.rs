@@ -4,8 +4,7 @@
 //! shared memory channel or direct syscall traps. Here we showcase the
 //! message formats that future IPC layers can consume.
 
-use serde::{Deserialize, Serialize};
-use std::fmt::Write as _;
+use userland::{to_hex, Runtime, SyscallRequest};
 
 fn main() {
     println!("hybrid kernel userland runtime prototype");
@@ -38,31 +37,14 @@ fn main() {
 
     let exit_packet = runtime.invoke(SyscallRequest::Exit { status: 0 });
     println!("exit => {}", to_hex(&exit_packet));
-}
 
-#[derive(Debug, Serialize, Deserialize)]
-enum SyscallRequest {
-    Fork,
-    Exec { path: String, argv: Vec<String> },
-    Open { path: String, flags: u32 },
-    Read { fd: u64, len: u64 },
-    Write { fd: u64, data: Vec<u8> },
-    Exit { status: i32 },
-}
+    let dup_packet = runtime.invoke(SyscallRequest::Dup { fd: 1 });
+    println!("dup => {}", to_hex(&dup_packet));
 
-#[derive(Default)]
-struct Runtime;
+    let pipe_packet = runtime.invoke(SyscallRequest::Pipe);
+    println!("pipe => {}", to_hex(&pipe_packet));
 
-impl Runtime {
-    fn invoke(&self, request: SyscallRequest) -> Vec<u8> {
-        bincode::serialize(&request).expect("serialize syscall request")
-    }
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(&mut output, "{:02x}", byte).expect("write hex");
-    }
-    output
+    let c_string = b"libc-lite\0";
+    let length = unsafe { libc_lite::strlen(c_string.as_ptr()) };
+    println!("strlen(c string) => {length}");
 }

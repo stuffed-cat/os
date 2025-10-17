@@ -62,10 +62,15 @@ fn posix_fork_exec_open_read_flow() {
     let fd = layer
         .dispatch(parent.pid(), SyscallId::Open, &[2, 0])
         .expect("open returns fd");
-    assert!(fd >= 4);
+    assert!(fd >= 3);
 
+    let mut buf = [0u8; 64];
     let read_len = layer
-        .dispatch(parent.pid(), SyscallId::Read, &[fd, 64])
+        .dispatch(
+            parent.pid(),
+            SyscallId::Read,
+            &[fd, buf.as_mut_ptr() as u64, buf.len() as u64],
+        )
         .expect("read returns count");
     assert_eq!(read_len, 64);
 

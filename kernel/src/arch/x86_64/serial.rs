@@ -75,3 +75,12 @@ pub fn write_str(s: &str) {
         let _ = SerialWriter(serial).write_str(s);
     }
 }
+
+/// Writes raw bytes to the serial port without UTF-8 assumptions.
+pub fn write_bytes(bytes: &[u8]) {
+    if let Some(serial) = SERIAL.lock().as_mut() {
+        for byte in bytes {
+            serial.send(*byte);
+        }
+    }
+}

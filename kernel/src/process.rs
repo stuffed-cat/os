@@ -1,8 +1,10 @@
 //! Process management and hybrid capability tracking.
 
 use alloc::collections::BTreeMap;
+use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use spin::RwLock;
 
@@ -45,29 +47,41 @@ impl Tid {
 pub struct Process {
     pid: Pid,
     threads: RwLock<BTreeMap<Tid, ThreadState>>, // monolithic fast path for scheduling
-    capabilities: RwLock<alloc::vec::Vec<Capability>>, // microkernel style capability list
+    capabilities: RwLock<Vec<Capability>>,       // microkernel style capability list
     exit_status: AtomicI32,
     terminated: AtomicBool,
     parent: RwLock<Option<Pid>>,
     program: RwLock<Option<String>>,
     fds: RwLock<BTreeMap<u64, String>>,
     next_fd: AtomicU64,
+    cwd: RwLock<String>,
+    env: RwLock<BTreeMap<String, String>>,
+    pipe_seed: AtomicU64,
 }
 
 impl Process {
     /// Allocates a new process.
     pub fn new(pid: Pid) -> Arc<Self> {
-        Arc::new(Self {
+        let process = Arc::new(Self {
             pid,
             threads: RwLock::new(BTreeMap::new()),
-            capabilities: RwLock::new(alloc::vec::Vec::new()),
+            capabilities: RwLock::new(Vec::new()),
             exit_status: AtomicI32::new(0),
             terminated: AtomicBool::new(false),
             parent: RwLock::new(None),
             program: RwLock::new(None),
             fds: RwLock::new(BTreeMap::new()),
-            next_fd: AtomicU64::new(4),
-        })
+            next_fd: AtomicU64::new(3),
+            cwd: RwLock::new(String::from("/")),
+            env: RwLock::new(BTreeMap::new()),
+            pipe_seed: AtomicU64::new(1),
+        });
+
+        process.set_fd(0, String::from("tty:stdin"));
+        process.set_fd(1, String::from("tty:stdout"));
+        process.set_fd(2, String::from("tty:stderr"));
+
+        process
     }
 
     /// Returns the process identifier.
@@ -134,6 +148,7 @@ impl Process {
     /// Inserts a descriptor binding.
     pub fn insert_fd(&self, fd: u64, path: String) {
         self.fds.write().insert(fd, path);
+        self.ensure_next_fd(fd.saturating_add(1));
     }
 
     /// Retrieves a descriptor binding.
@@ -146,6 +161,57 @@ impl Process {
         self.fds.write().remove(&fd).is_some()
     }
 
+    /// Forcefully assigns a descriptor binding, replacing any existing entry.
+    pub fn set_fd(&self, fd: u64, descriptor: String) {
+        self.fds.write().insert(fd, descriptor);
+        self.ensure_next_fd(fd.saturating_add(1));
+    }
+
+    /// Returns the current working directory string.
+    pub fn cwd(&self) -> String {
+        self.cwd.read().clone()
+    }
+
+    /// Updates the working directory.
+    pub fn set_cwd(&self, path: String) {
+        *self.cwd.write() = path;
+    }
+
+    /// Retrieves an environment variable.
+    pub fn get_env(&self, key: &str) -> Option<String> {
+        self.env.read().get(key).cloned()
+    }
+
+    /// Sets an environment variable.
+    pub fn set_env(&self, key: String, value: String) {
+        self.env.write().insert(key, value);
+    }
+
+    /// Returns an iterator snapshot of all environment variables.
+    pub fn env_snapshot(&self) -> BTreeMap<String, String> {
+        self.env.read().clone()
+    }
+
+    /// Generates a unique identifier for pipe bookkeeping.
+    pub fn next_pipe_id(&self) -> u64 {
+        self.pipe_seed.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn ensure_next_fd(&self, candidate: u64) {
+        let mut current = self.next_fd.load(Ordering::SeqCst);
+        while current < candidate {
+            match self.next_fd.compare_exchange(
+                current,
+                candidate,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
     /// Clones mutable state into a target process (used by fork).
     pub fn clone_state_into(&self, target: &Process) {
         *target.capabilities.write() = self.capabilities.read().clone();
@@ -154,6 +220,11 @@ impl Process {
         target
             .next_fd
             .store(self.next_fd.load(Ordering::SeqCst), Ordering::SeqCst);
+        target.set_cwd(self.cwd());
+        *target.env.write() = self.env.read().clone();
+        target
+            .pipe_seed
+            .store(self.pipe_seed.load(Ordering::SeqCst), Ordering::SeqCst);
     }
 }
 
@@ -247,6 +318,78 @@ impl ProcessTable {
         } else {
             Err(SubsystemError::Runtime("fd not found"))
         }
+    }
+
+    /// Duplicates an existing file descriptor, returning the new descriptor number.
+    pub fn dup(&self, pid: Pid, fd: u64) -> Result<u64, SubsystemError> {
+        let proc = self
+            .lookup(pid)
+            .ok_or(SubsystemError::Runtime("process not found"))?;
+        let descriptor = proc
+            .get_fd(fd)
+            .ok_or(SubsystemError::Runtime("fd not found"))?;
+        let new_fd = proc.next_fd();
+        proc.insert_fd(new_fd, descriptor);
+        Ok(new_fd)
+    }
+
+    /// Duplicates a descriptor into a specific target number.
+    pub fn dup2(&self, pid: Pid, fd: u64, target_fd: u64) -> Result<u64, SubsystemError> {
+        let proc = self
+            .lookup(pid)
+            .ok_or(SubsystemError::Runtime("process not found"))?;
+        let descriptor = proc
+            .get_fd(fd)
+            .ok_or(SubsystemError::Runtime("fd not found"))?;
+        proc.set_fd(target_fd, descriptor);
+        Ok(target_fd)
+    }
+
+    /// Creates a simple pipe-like pair of descriptors for the process.
+    pub fn pipe(&self, pid: Pid) -> Result<(u64, u64, u64), SubsystemError> {
+        let proc = self
+            .lookup(pid)
+            .ok_or(SubsystemError::Runtime("process not found"))?;
+        let pipe_id = proc.next_pipe_id();
+        let read_fd = proc.next_fd();
+        let write_fd = proc.next_fd();
+        proc.insert_fd(read_fd, format!("pipe:{}:r", pipe_id));
+        proc.insert_fd(write_fd, format!("pipe:{}:w", pipe_id));
+        Ok((read_fd, write_fd, pipe_id))
+    }
+
+    /// Changes the working directory for the process.
+    pub fn chdir(&self, pid: Pid, path: String) -> Result<(), SubsystemError> {
+        let proc = self
+            .lookup(pid)
+            .ok_or(SubsystemError::Runtime("process not found"))?;
+        proc.set_cwd(path);
+        Ok(())
+    }
+
+    /// Returns the current working directory for the process.
+    pub fn getcwd(&self, pid: Pid) -> Result<String, SubsystemError> {
+        let proc = self
+            .lookup(pid)
+            .ok_or(SubsystemError::Runtime("process not found"))?;
+        Ok(proc.cwd())
+    }
+
+    /// Reads all environment variables for the process as a snapshot.
+    pub fn env_snapshot(&self, pid: Pid) -> Result<BTreeMap<String, String>, SubsystemError> {
+        let proc = self
+            .lookup(pid)
+            .ok_or(SubsystemError::Runtime("process not found"))?;
+        Ok(proc.env_snapshot())
+    }
+
+    /// Sets an environment variable for the given process.
+    pub fn set_env(&self, pid: Pid, key: String, value: String) -> Result<(), SubsystemError> {
+        let proc = self
+            .lookup(pid)
+            .ok_or(SubsystemError::Runtime("process not found"))?;
+        proc.set_env(key, value);
+        Ok(())
     }
 
     /// Marks the process as terminated with the given status.
