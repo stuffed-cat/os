@@ -1,4 +1,10 @@
-use kernel::{ipc::{IpcRouter, Message}, posix::PosixLayer, process::{Pid, ProcessTable, Tid}, scheduler::{RunQueueEntry, Scheduler, SchedulingClass}, syscall::SyscallId};
+use kernel::{
+    ipc::{IpcRouter, Message},
+    posix::{Errno, PosixLayer},
+    process::{Pid, ProcessTable, Tid},
+    scheduler::{RunQueueEntry, Scheduler, SchedulingClass},
+    syscall::SyscallId,
+};
 
 #[test]
 fn ipc_message_roundtrip() {
@@ -46,4 +52,27 @@ fn posix_fork_exec_open_read_flow() {
 
     let read_len = layer.dispatch(parent.pid(), SyscallId::Read, &[fd, 64]).expect("read returns count");
     assert_eq!(read_len, 64);
+
+    // getpid should return the caller's PID.
+    let reported_pid = layer.dispatch(parent.pid(), SyscallId::GetPid, &[]).expect("getpid works");
+    assert_eq!(reported_pid, parent.pid().as_u64());
+
+    // close should succeed once and fail with EBADF on repeated calls.
+    assert_eq!(layer.dispatch(parent.pid(), SyscallId::Close, &[fd]).expect("close succeeds"), 0);
+    let close_err = layer.dispatch(parent.pid(), SyscallId::Close, &[fd]).unwrap_err();
+    assert_eq!(close_err, Errno::Badf);
+
+    // waitpid should return EAGAIN while the child is still running.
+    let wait_err = layer.dispatch(parent.pid(), SyscallId::WaitPid, &[child_pid, 0, 0]).unwrap_err();
+    assert_eq!(wait_err, Errno::Again);
+
+    // Simulate child exit and ensure waitpid reaps it.
+    layer.dispatch(Pid::new(child_pid), SyscallId::Exit, &[42]).expect("child exit succeeds");
+    let wait_result = layer.dispatch(parent.pid(), SyscallId::WaitPid, &[child_pid, 0, 0]).expect("waitpid succeeds");
+    assert_eq!(wait_result & 0xFFFF_FFFF, child_pid);
+    assert_eq!((wait_result >> 32) as i32, 42);
+
+    // Subsequent wait should report no remaining children.
+    let no_child = layer.dispatch(parent.pid(), SyscallId::WaitPid, &[child_pid, 0, 0]).unwrap_err();
+    assert_eq!(no_child, Errno::Child);
 }

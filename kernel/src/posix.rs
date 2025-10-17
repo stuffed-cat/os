@@ -1,13 +1,14 @@
 //! POSIX compatibility primitives enabling a Unix-like userland.
 
 use alloc::collections::BTreeMap;
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use spin::RwLock;
 
 use crate::{
     error::SubsystemError,
-    process::{Pid, ProcessTable},
+    process::{Pid, ProcessTable, WaitError},
     syscall::SyscallId,
 };
 
@@ -24,6 +25,10 @@ pub enum Errno {
     Intr = 4,
     /// Try again.
     Again = 11,
+    /// Bad file descriptor.
+    Badf = 9,
+    /// No child processes.
+    Child = 10,
     /// Not enough memory.
     NoMem = 12,
     /// Invalid argument.
@@ -89,9 +94,19 @@ impl<'a> PosixLayer<'a> {
                 let path = self.lookup_path_handle(handle)?;
                 self.open(pid, &path, flags)
             }
+            SyscallId::Close => {
+                let fd = args.get(0).copied().unwrap_or_default();
+                self.close(pid, fd).map(|_| 0)
+            }
             SyscallId::Exit => {
                 self.exit(pid, args.get(0).copied().unwrap_or_default() as i32);
                 Ok(0)
+            }
+            SyscallId::GetPid => Ok(pid.as_u64()),
+            SyscallId::WaitPid => {
+                let target = args.get(0).copied().unwrap_or(u64::MAX) as i64;
+                let options = args.get(2).copied().unwrap_or_default();
+                self.waitpid(pid, target, options)
             }
             _ => Err(Errno::NoImpl),
         }
@@ -128,10 +143,15 @@ impl<'a> PosixLayer<'a> {
             .map_err(Errno::from_subsystem)
     }
 
+    fn close(&self, pid: Pid, fd: u64) -> Result<(), Errno> {
+        self.process_table.close(pid, fd).map_err(|err| match err {
+            SubsystemError::Runtime("fd not found") => Errno::Badf,
+            other => Errno::from_subsystem(other),
+        })
+    }
+
     fn exit(&self, pid: Pid, status: i32) {
-        if let Some(proc) = self.process_table.lookup(pid) {
-            proc.set_exit_status(status);
-        }
+        self.process_table.mark_exit(pid, status);
     }
 
     fn fork(&self, pid: Pid) -> Result<Pid, Errno> {
@@ -158,6 +178,19 @@ impl<'a> PosixLayer<'a> {
             .ok_or(Errno::NoEnt)
     }
 
+    fn waitpid(&self, parent: Pid, child_raw: i64, _options: u64) -> Result<u64, Errno> {
+        let target = if child_raw <= 0 { None } else { Some(Pid::new(child_raw as u64)) };
+        match self.process_table.wait_pid(parent, target) {
+            Ok((pid, status)) => {
+                // For now, we return the child PID and encode the status in the upper bits.
+                Ok(((status as u64) << 32) | pid.as_u64())
+            }
+            Err(WaitError::NoChildren) => Err(Errno::Child),
+            Err(WaitError::NotChild) => Err(Errno::Child),
+            Err(WaitError::ChildRunning) => Err(Errno::Again),
+        }
+    }
+
     /// Normalizes POSIX path.
     pub fn normalize_path(path: &str) -> String {
         let mut parts = Vec::new();
@@ -178,7 +211,7 @@ impl Errno {
     fn from_subsystem(err: SubsystemError) -> Self {
         match err {
             SubsystemError::Init(_) => Errno::NoImpl,
-            SubsystemError::Runtime(_) => Errno::NoEnt,
+            SubsystemError::Runtime(_) => Errno::Inval,
             SubsystemError::Resource(_) => Errno::NoMem,
         }
     }

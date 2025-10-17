@@ -1,5 +1,6 @@
 #![cfg_attr(feature = "boot", no_std)]
 #![cfg_attr(feature = "boot", no_main)]
+#![cfg_attr(feature = "boot", feature(lang_items))]
 
 #[cfg(feature = "boot")]
 extern crate alloc;
@@ -37,6 +38,10 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
         x86_64::instructions::hlt();
     }
 }
+
+#[cfg(feature = "boot")]
+#[lang = "eh_personality"]
+extern "C" fn eh_personality() {}
 
 #[cfg(not(feature = "boot"))]
 fn main() {

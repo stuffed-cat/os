@@ -3,7 +3,7 @@
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use spin::RwLock;
 
 use crate::{
@@ -51,6 +51,7 @@ pub struct Process {
     threads: RwLock<BTreeMap<Tid, ThreadState>>, // monolithic fast path for scheduling
     capabilities: RwLock<alloc::vec::Vec<Capability>>, // microkernel style capability list
     exit_status: AtomicI32,
+    terminated: AtomicBool,
     parent: RwLock<Option<Pid>>,
     program: RwLock<Option<String>>,
     fds: RwLock<BTreeMap<u64, String>>,
@@ -65,6 +66,7 @@ impl Process {
             threads: RwLock::new(BTreeMap::new()),
             capabilities: RwLock::new(alloc::vec::Vec::new()),
             exit_status: AtomicI32::new(0),
+            terminated: AtomicBool::new(false),
             parent: RwLock::new(None),
             program: RwLock::new(None),
             fds: RwLock::new(BTreeMap::new()),
@@ -80,6 +82,22 @@ impl Process {
     /// Stores exit status.
     pub fn set_exit_status(&self, status: i32) {
         self.exit_status.store(status, Ordering::SeqCst);
+    }
+
+    /// Returns the stored exit status.
+    pub fn exit_status(&self) -> i32 {
+        self.exit_status.load(Ordering::SeqCst)
+    }
+
+    /// Marks the process as terminated.
+    pub fn mark_terminated(&self, status: i32) {
+        self.exit_status.store(status, Ordering::SeqCst);
+        self.terminated.store(true, Ordering::SeqCst);
+    }
+
+    /// Returns whether the process has terminated.
+    pub fn is_terminated(&self) -> bool {
+        self.terminated.load(Ordering::SeqCst)
     }
 
     /// Registers a capability token.
@@ -127,6 +145,11 @@ impl Process {
         self.fds.read().get(&fd).cloned()
     }
 
+    /// Removes a descriptor binding, returning whether it existed.
+    pub fn remove_fd(&self, fd: u64) -> bool {
+        self.fds.write().remove(&fd).is_some()
+    }
+
     /// Clones mutable state into a target process (used by fork).
     pub fn clone_state_into(&self, target: &Process) {
         *target.capabilities.write() = self.capabilities.read().clone();
@@ -140,6 +163,17 @@ impl Process {
 pub struct ProcessTable {
     next_pid: AtomicU64,
     processes: RwLock<BTreeMap<Pid, Arc<Process>>>,
+}
+
+/// Errors returned when waiting on child processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitError {
+    /// The given PID is not a child of the caller.
+    NotChild,
+    /// The child exists but has not exited yet.
+    ChildRunning,
+    /// The caller has no children that can be waited on.
+    NoChildren,
 }
 
 impl Default for ProcessTable {
@@ -194,5 +228,56 @@ impl ProcessTable {
         let fd = proc.next_fd();
         proc.insert_fd(fd, path);
         Ok(fd)
+    }
+
+    /// Closes a file descriptor for the process.
+    pub fn close(&self, pid: Pid, fd: u64) -> Result<(), SubsystemError> {
+        let proc = self.lookup(pid).ok_or(SubsystemError::Runtime("process not found"))?;
+        if proc.remove_fd(fd) {
+            Ok(())
+        } else {
+            Err(SubsystemError::Runtime("fd not found"))
+        }
+    }
+
+    /// Marks the process as terminated with the given status.
+    pub fn mark_exit(&self, pid: Pid, status: i32) {
+        if let Some(proc) = self.lookup(pid) {
+            proc.mark_terminated(status);
+        }
+    }
+
+    /// Waits for a child process to exit.
+    pub fn wait_pid(&self, parent: Pid, child: Option<Pid>) -> Result<(Pid, i32), WaitError> {
+        let mut table = self.processes.write();
+
+        if let Some(target_pid) = child {
+            let proc = table.get(&target_pid).ok_or(WaitError::NoChildren)?;
+            if proc.parent() != Some(parent) {
+                return Err(WaitError::NotChild);
+            }
+            if !proc.is_terminated() {
+                return Err(WaitError::ChildRunning);
+            }
+            let status = proc.exit_status();
+            table.remove(&target_pid);
+            return Ok((target_pid, status));
+        }
+
+        let mut found: Option<(Pid, i32)> = None;
+        for (pid, proc) in table.iter() {
+            if proc.parent() == Some(parent) && proc.is_terminated() {
+                found = Some((*pid, proc.exit_status()));
+                break;
+            }
+        }
+
+        match found {
+            Some((pid, status)) => {
+                table.remove(&pid);
+                Ok((pid, status))
+            }
+            None => Err(WaitError::NoChildren),
+        }
     }
 }

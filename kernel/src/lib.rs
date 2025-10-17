@@ -1,4 +1,5 @@
 #![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(feature = "hardware", feature(abi_x86_interrupt))]
 #![deny(missing_docs)]
 
 //! Core hybrid-kernel primitives for the "os" project.

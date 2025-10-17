@@ -197,7 +197,6 @@ dependencies = [
  "bitflags 2.9.4",
  "log",
  "spin",
- "thiserror",
  "uart_16550",
  "x86_64 0.15.2",
 ]

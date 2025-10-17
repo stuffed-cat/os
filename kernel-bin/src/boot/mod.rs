@@ -15,10 +15,10 @@ const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4 MiB heap for early allocations
 pub fn start(boot_info: &'static mut BootInfo, allocator: &'static LockedHeap) -> ! {
     let phys_offset = boot_info
         .physical_memory_offset
-        .map(|offset| offset.as_u64())
+        .into_option()
         .expect("physical memory offset provided");
 
-    let ranges = collect_frame_ranges(boot_info.memory_regions);
+    let ranges = collect_frame_ranges(&boot_info.memory_regions);
     let hal_config = HalConfig { physical_memory_offset: phys_offset, frame_ranges: ranges.as_slice() };
 
     let mut hal = unsafe { Hal::bootstrap(hal_config) }.expect("HAL bootstrap");
@@ -45,7 +45,7 @@ fn collect_frame_ranges(regions: &MemoryRegions) -> ArrayVec<FrameRange, 256> {
     for region in regions.iter() {
         if region.kind == MemoryRegionKind::Usable {
             let start = region.start;
-            let end = region.start + region.len;
+            let end = region.end;
             if ranges.try_push(FrameRange::new(start, end)).is_err() {
                 break;
             }

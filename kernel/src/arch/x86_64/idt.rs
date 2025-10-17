@@ -1,12 +1,13 @@
 //! Interrupt Descriptor Table initialization and handlers.
 
-use core::fmt::Debug;
-
 use log::trace;
 use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 
-use super::{gdt, interrupts::{self, InterruptIndex}};
+use super::{
+    gdt,
+    interrupts::{self, InterruptIndex},
+};
 
 static IDT: Once<InterruptDescriptorTable> = Once::new();
 
@@ -20,8 +21,8 @@ pub fn init() {
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(gdt::double_fault_ist_index());
         }
-        idt[InterruptIndex::Timer.as_usize()].set_handler_fn(timer_interrupt_handler);
-        idt[InterruptIndex::Keyboard.as_usize()].set_handler_fn(keyboard_interrupt_handler);
+    idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
+    idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
         idt
     });
 }

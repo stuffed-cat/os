@@ -17,12 +17,18 @@ pub enum SyscallId {
     Write,
     /// POSIX `open` syscall.
     Open,
+    /// POSIX `close` syscall.
+    Close,
     /// POSIX `fork` syscall.
     Fork,
     /// POSIX `execve` syscall.
     Exec,
     /// POSIX `exit` syscall.
     Exit,
+    /// POSIX `waitpid` syscall.
+    WaitPid,
+    /// POSIX `getpid` syscall.
+    GetPid,
     /// Placeholder for future syscalls.
     Unknown(u64),
 }
@@ -33,9 +39,12 @@ impl From<u64> for SyscallId {
             0 => SyscallId::Read,
             1 => SyscallId::Write,
             2 => SyscallId::Open,
+            3 => SyscallId::Close,
             57 => SyscallId::Fork,
             59 => SyscallId::Exec,
             60 => SyscallId::Exit,
+            61 => SyscallId::WaitPid,
+            39 => SyscallId::GetPid,
             other => SyscallId::Unknown(other),
         }
     }
@@ -74,6 +83,8 @@ fn map_errno(errno: Errno, id: SyscallId) -> KernelError {
         Errno::NoEnt => KernelError::Subsystem { id: "posix", source: SubsystemError::Runtime("not found") },
         Errno::Intr => KernelError::Subsystem { id: "posix", source: SubsystemError::Runtime("interrupted") },
         Errno::Again => KernelError::Subsystem { id: "posix", source: SubsystemError::Runtime("try again") },
+        Errno::Badf => KernelError::Subsystem { id: "posix", source: SubsystemError::Runtime("bad file descriptor") },
+        Errno::Child => KernelError::Subsystem { id: "posix", source: SubsystemError::Runtime("no child processes") },
         Errno::NoMem => KernelError::Memory("ENOMEM"),
         Errno::Inval => KernelError::Subsystem { id: "posix", source: SubsystemError::Runtime("invalid argument") },
         Errno::NoImpl => match id {
