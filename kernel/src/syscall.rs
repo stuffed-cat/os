@@ -58,7 +58,9 @@ pub struct SyscallDispatcher<'a> {
 impl<'a> SyscallDispatcher<'a> {
     /// Creates a dispatcher.
     pub fn new(process_table: &'a ProcessTable) -> Self {
-        Self { posix: PosixLayer::new(process_table) }
+        Self {
+            posix: PosixLayer::new(process_table),
+        }
     }
 
     /// Handles a syscall from a user process.
@@ -79,14 +81,35 @@ impl<'a> SyscallDispatcher<'a> {
 fn map_errno(errno: Errno, id: SyscallId) -> KernelError {
     match errno {
         Errno::Success => KernelError::Unimplemented("unexpected success"),
-        Errno::Perm => KernelError::Subsystem { id: "posix", source: SubsystemError::Runtime("permission denied") },
-        Errno::NoEnt => KernelError::Subsystem { id: "posix", source: SubsystemError::Runtime("not found") },
-        Errno::Intr => KernelError::Subsystem { id: "posix", source: SubsystemError::Runtime("interrupted") },
-        Errno::Again => KernelError::Subsystem { id: "posix", source: SubsystemError::Runtime("try again") },
-        Errno::Badf => KernelError::Subsystem { id: "posix", source: SubsystemError::Runtime("bad file descriptor") },
-        Errno::Child => KernelError::Subsystem { id: "posix", source: SubsystemError::Runtime("no child processes") },
+        Errno::Perm => KernelError::Subsystem {
+            id: "posix",
+            source: SubsystemError::Runtime("permission denied"),
+        },
+        Errno::NoEnt => KernelError::Subsystem {
+            id: "posix",
+            source: SubsystemError::Runtime("not found"),
+        },
+        Errno::Intr => KernelError::Subsystem {
+            id: "posix",
+            source: SubsystemError::Runtime("interrupted"),
+        },
+        Errno::Again => KernelError::Subsystem {
+            id: "posix",
+            source: SubsystemError::Runtime("try again"),
+        },
+        Errno::Badf => KernelError::Subsystem {
+            id: "posix",
+            source: SubsystemError::Runtime("bad file descriptor"),
+        },
+        Errno::Child => KernelError::Subsystem {
+            id: "posix",
+            source: SubsystemError::Runtime("no child processes"),
+        },
         Errno::NoMem => KernelError::Memory("ENOMEM"),
-        Errno::Inval => KernelError::Subsystem { id: "posix", source: SubsystemError::Runtime("invalid argument") },
+        Errno::Inval => KernelError::Subsystem {
+            id: "posix",
+            source: SubsystemError::Runtime("invalid argument"),
+        },
         Errno::NoImpl => match id {
             SyscallId::Unknown(_) => KernelError::Unimplemented("unknown syscall"),
             _ => KernelError::Unimplemented("syscall not implemented"),

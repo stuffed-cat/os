@@ -5,10 +5,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
-use crate::{
-    error::SubsystemError,
-    process::Pid,
-};
+use crate::{error::SubsystemError, process::Pid};
 
 /// Unique channel identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -40,7 +37,9 @@ pub struct Mailbox {
 impl Mailbox {
     /// Creates an empty mailbox.
     pub fn new() -> Self {
-        Self { messages: Mutex::new(VecDeque::new()) }
+        Self {
+            messages: Mutex::new(VecDeque::new()),
+        }
     }
 
     /// Enqueues a message.
@@ -62,7 +61,10 @@ pub struct IpcRouter {
 
 impl Default for IpcRouter {
     fn default() -> Self {
-        Self { next_id: AtomicU64::new(1), mailboxes: Mutex::new(BTreeMap::new()) }
+        Self {
+            next_id: AtomicU64::new(1),
+            mailboxes: Mutex::new(BTreeMap::new()),
+        }
     }
 }
 
@@ -80,11 +82,15 @@ impl IpcRouter {
     pub fn get_or_create(&self, channel: Option<ChannelId>) -> (ChannelId, Arc<Mailbox>) {
         let mut guard = self.mailboxes.lock();
         if let Some(id) = channel {
-            guard.get(&id).cloned().map(|mailbox| (id, mailbox)).unwrap_or_else(|| {
-                let mb = Arc::new(Mailbox::new());
-                guard.insert(id, mb.clone());
-                (id, mb)
-            })
+            guard
+                .get(&id)
+                .cloned()
+                .map(|mailbox| (id, mailbox))
+                .unwrap_or_else(|| {
+                    let mb = Arc::new(Mailbox::new());
+                    guard.insert(id, mb.clone());
+                    (id, mb)
+                })
         } else {
             let id = self.allocate_channel();
             let mb = Arc::new(Mailbox::new());
@@ -96,13 +102,18 @@ impl IpcRouter {
     /// Sends a message to the destination channel.
     pub fn send(&self, channel: ChannelId, message: Message) -> Result<(), SubsystemError> {
         let guard = self.mailboxes.lock();
-        let mailbox = guard.get(&channel).ok_or(SubsystemError::Runtime("channel not found"))?;
+        let mailbox = guard
+            .get(&channel)
+            .ok_or(SubsystemError::Runtime("channel not found"))?;
         mailbox.enqueue(message);
         Ok(())
     }
 
     /// Receives a message if one is pending.
     pub fn recv(&self, channel: ChannelId) -> Option<Message> {
-        self.mailboxes.lock().get(&channel).and_then(|mailbox| mailbox.dequeue())
+        self.mailboxes
+            .lock()
+            .get(&channel)
+            .and_then(|mailbox| mailbox.dequeue())
     }
 }

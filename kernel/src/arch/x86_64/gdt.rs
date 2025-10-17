@@ -21,8 +21,8 @@ struct Selectors {
 pub fn init() {
     TSS.call_once(|| {
         let mut tss = TaskStateSegment::new();
-    static mut DOUBLE_FAULT_STACK: [u8; 4096] = [0; 4096];
-    let stack_start = VirtAddr::from_ptr(core::ptr::addr_of!(DOUBLE_FAULT_STACK));
+        static mut DOUBLE_FAULT_STACK: [u8; 4096] = [0; 4096];
+        let stack_start = VirtAddr::from_ptr(core::ptr::addr_of!(DOUBLE_FAULT_STACK));
         let stack_end = stack_start + 4096;
         tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX] = stack_end;
         tss
@@ -32,7 +32,13 @@ pub fn init() {
         let mut gdt = GlobalDescriptorTable::new();
         let code_selector = gdt.append(Descriptor::kernel_code_segment());
         let tss_selector = gdt.append(Descriptor::tss_segment(TSS.wait()));
-        (gdt, Selectors { code_selector, tss_selector })
+        (
+            gdt,
+            Selectors {
+                code_selector,
+                tss_selector,
+            },
+        )
     });
 
     let gdt_data = GDT.wait();

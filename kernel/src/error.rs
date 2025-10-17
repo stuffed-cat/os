@@ -79,7 +79,9 @@ impl std::error::Error for SubsystemError {}
 
 impl From<SubsystemError> for KernelError {
     fn from(value: SubsystemError) -> Self {
-        KernelError::Subsystem { id: "unknown", source: value }
+        KernelError::Subsystem {
+            id: "unknown",
+            source: value,
+        }
     }
 }
-

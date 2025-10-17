@@ -35,7 +35,12 @@ impl Log for SerialLogger {
             return;
         }
         if let Some(serial) = SERIAL.lock().as_mut() {
-            let _ = writeln!(SerialWriter(serial), "[{}] {}", record.level(), record.args());
+            let _ = writeln!(
+                SerialWriter(serial),
+                "[{}] {}",
+                record.level(),
+                record.args()
+            );
         }
     }
 

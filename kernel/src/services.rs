@@ -19,7 +19,9 @@ pub struct ServiceRegistry {
 
 impl Default for ServiceRegistry {
     fn default() -> Self {
-        Self { services: RwLock::new(BTreeMap::new()) }
+        Self {
+            services: RwLock::new(BTreeMap::new()),
+        }
     }
 }
 
@@ -29,7 +31,9 @@ impl ServiceRegistry {
     where
         S: Service,
     {
-        self.services.write().insert(TypeId::of::<S>(), Arc::new(service));
+        self.services
+            .write()
+            .insert(TypeId::of::<S>(), Arc::new(service));
     }
 
     /// Registers a boxed service at runtime.

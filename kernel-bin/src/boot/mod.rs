@@ -19,7 +19,10 @@ pub fn start(boot_info: &'static mut BootInfo, allocator: &'static LockedHeap) -
         .expect("physical memory offset provided");
 
     let ranges = collect_frame_ranges(&boot_info.memory_regions);
-    let hal_config = HalConfig { physical_memory_offset: phys_offset, frame_ranges: ranges.as_slice() };
+    let hal_config = HalConfig {
+        physical_memory_offset: phys_offset,
+        frame_ranges: ranges.as_slice(),
+    };
 
     let mut hal = unsafe { Hal::bootstrap(hal_config) }.expect("HAL bootstrap");
     hal.map_heap(
@@ -29,7 +32,9 @@ pub fn start(boot_info: &'static mut BootInfo, allocator: &'static LockedHeap) -
     )
     .expect("heap mapping");
 
-    unsafe { allocator.lock().init(HEAP_START as *mut u8, HEAP_SIZE); }
+    unsafe {
+        allocator.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
+    }
 
     hal.enable_interrupts();
 

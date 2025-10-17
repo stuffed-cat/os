@@ -79,8 +79,13 @@ impl VirtualMemoryManager {
 
     /// Maps a region with associated capability.
     pub fn map(&self, region: VmRegion) -> Result<Capability, SubsystemError> {
-        let cap = Capability(self.next_cap.fetch_add(1, core::sync::atomic::Ordering::SeqCst));
-        self.regions.write().insert(region.range.start, region.clone());
+        let cap = Capability(
+            self.next_cap
+                .fetch_add(1, core::sync::atomic::Ordering::SeqCst),
+        );
+        self.regions
+            .write()
+            .insert(region.range.start, region.clone());
         self.capabilities.write().insert(cap, region);
         Ok(cap)
     }
@@ -115,7 +120,10 @@ pub struct FrameRange {
 impl FrameRange {
     /// Creates a new range from raw physical addresses.
     pub fn new(start: u64, end: u64) -> Self {
-        Self { start: PhysAddr::new(start), end: PhysAddr::new(end) }
+        Self {
+            start: PhysAddr::new(start),
+            end: PhysAddr::new(end),
+        }
     }
 
     #[allow(dead_code)]
@@ -190,7 +198,11 @@ impl MemoryManager {
     /// Creates a new memory manager instance.
     pub unsafe fn new(phys_mem_offset: VirtAddr, allocator: BootFrameAllocator) -> Self {
         let mapper = init_offset_page_table(phys_mem_offset);
-        Self { mapper: Mutex::new(mapper), frames: Mutex::new(allocator), phys_offset: phys_mem_offset }
+        Self {
+            mapper: Mutex::new(mapper),
+            frames: Mutex::new(allocator),
+            phys_offset: phys_mem_offset,
+        }
     }
 
     /// Maps a linear virtual memory region backed by fresh physical frames.
@@ -208,7 +220,9 @@ impl MemoryManager {
         let end_page = Page::containing_address(start + (size as u64 - 1));
 
         for page in Page::range_inclusive(start_page, end_page) {
-            let frame = allocator.allocate_frame().ok_or(MapToError::FrameAllocationFailed)?;
+            let frame = allocator
+                .allocate_frame()
+                .ok_or(MapToError::FrameAllocationFailed)?;
             unsafe {
                 mapper.map_to(page, frame, flags, &mut *allocator)?.flush();
             }
@@ -225,7 +239,9 @@ impl MemoryManager {
     ) -> Result<(), MapToError<Size4KiB>> {
         let mut mapper = self.mapper.lock();
         let mut allocator = self.frames.lock();
-        unsafe { mapper.map_to(page, frame, flags, &mut *allocator)?.flush(); }
+        unsafe {
+            mapper.map_to(page, frame, flags, &mut *allocator)?.flush();
+        }
         Ok(())
     }
 

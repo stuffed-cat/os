@@ -43,7 +43,9 @@ pub struct Scheduler {
 
 impl Default for Scheduler {
     fn default() -> Self {
-        Self { run_queue: Mutex::new(VecDeque::new()) }
+        Self {
+            run_queue: Mutex::new(VecDeque::new()),
+        }
     }
 }
 

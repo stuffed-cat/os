@@ -1,5 +1,5 @@
-use alloc::sync::Arc;
 use ::core::sync::atomic::{AtomicBool, Ordering};
+use alloc::sync::Arc;
 
 use super::*;
 
@@ -14,7 +14,11 @@ impl DummySubsystem {
         let init_called = Arc::new(AtomicBool::new(false));
         let tick_called = Arc::new(AtomicBool::new(false));
         (
-            Self { id: SubsystemId(name), init_called: init_called.clone(), tick_called: tick_called.clone() },
+            Self {
+                id: SubsystemId(name),
+                init_called: init_called.clone(),
+                tick_called: tick_called.clone(),
+            },
             init_called,
             tick_called,
         )

@@ -21,13 +21,19 @@ fn main() {
     });
     println!("exec => {}", to_hex(&exec_packet));
 
-    let open_packet = runtime.invoke(SyscallRequest::Open { path: "/tmp/data".into(), flags: 0o644 });
+    let open_packet = runtime.invoke(SyscallRequest::Open {
+        path: "/tmp/data".into(),
+        flags: 0o644,
+    });
     println!("open => {}", to_hex(&open_packet));
 
     let read_packet = runtime.invoke(SyscallRequest::Read { fd: 4, len: 128 });
     println!("read => {}", to_hex(&read_packet));
 
-    let write_packet = runtime.invoke(SyscallRequest::Write { fd: 1, data: b"hello from userland\n".to_vec() });
+    let write_packet = runtime.invoke(SyscallRequest::Write {
+        fd: 1,
+        data: b"hello from userland\n".to_vec(),
+    });
     println!("write => {}", to_hex(&write_packet));
 
     let exit_packet = runtime.invoke(SyscallRequest::Exit { status: 0 });

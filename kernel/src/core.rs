@@ -55,7 +55,11 @@ pub struct KernelContext<'a> {
 impl<'a> KernelContext<'a> {
     /// Creates a new kernel context.
     pub fn new(state: KernelState, registry: &'a ServiceRegistry, hal: Option<&'a Hal>) -> Self {
-        Self { state, registry, hal }
+        Self {
+            state,
+            registry,
+            hal,
+        }
     }
 
     /// Returns the current kernel state.
@@ -83,7 +87,11 @@ pub struct KernelBuilder {
 
 impl Default for KernelBuilder {
     fn default() -> Self {
-        Self { services: ServiceRegistry::default(), subsystems: Vec::new(), hal: None }
+        Self {
+            services: ServiceRegistry::default(),
+            subsystems: Vec::new(),
+            hal: None,
+        }
     }
 }
 

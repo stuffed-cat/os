@@ -3,9 +3,13 @@ resolver = "2"
 members = [
     "kernel",
     "kernel-bin",
+    "xtask",
     "userland",
 ]
 default-members = [
     "kernel",
     "userland"
 ]
+
+[patch.crates-io]
+bootloader = { path = "third_party/bootloader" }

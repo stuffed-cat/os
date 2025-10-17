@@ -21,8 +21,8 @@ pub fn init() {
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(gdt::double_fault_ist_index());
         }
-    idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
-    idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
+        idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
+        idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
         idt
     });
 }

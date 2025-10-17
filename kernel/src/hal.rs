@@ -36,7 +36,10 @@ impl Hal {
         controller.init();
         ArchBootstrap::init_interrupts()?;
 
-        Ok(Self { interrupts: controller, memory })
+        Ok(Self {
+            interrupts: controller,
+            memory,
+        })
     }
 
     /// Enables interrupts globally.
@@ -60,7 +63,12 @@ impl Hal {
     }
 
     /// Convenience helper to map and initialize the kernel heap.
-    pub fn map_heap(&self, start: VirtAddr, size: usize, flags: PageTableFlags) -> Result<(), KernelError> {
+    pub fn map_heap(
+        &self,
+        start: VirtAddr,
+        size: usize,
+        flags: PageTableFlags,
+    ) -> Result<(), KernelError> {
         self.memory
             .map_region(start, size, flags)
             .map_err(|_| KernelError::Memory("heap mapping failed"))

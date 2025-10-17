@@ -6,11 +6,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use spin::RwLock;
 
-use crate::{
-    error::SubsystemError,
-    memory::Capability,
-    scheduler::ThreadState,
-};
+use crate::{error::SubsystemError, memory::Capability, scheduler::ThreadState};
 use log::trace;
 
 /// Process identifier type.
@@ -155,7 +151,9 @@ impl Process {
         *target.capabilities.write() = self.capabilities.read().clone();
         *target.program.write() = self.program.read().clone();
         *target.fds.write() = self.fds.read().clone();
-        target.next_fd.store(self.next_fd.load(Ordering::SeqCst), Ordering::SeqCst);
+        target
+            .next_fd
+            .store(self.next_fd.load(Ordering::SeqCst), Ordering::SeqCst);
     }
 }
 
@@ -178,7 +176,10 @@ pub enum WaitError {
 
 impl Default for ProcessTable {
     fn default() -> Self {
-        Self { next_pid: AtomicU64::new(100), processes: RwLock::new(BTreeMap::new()) }
+        Self {
+            next_pid: AtomicU64::new(100),
+            processes: RwLock::new(BTreeMap::new()),
+        }
     }
 }
 
@@ -208,7 +209,9 @@ impl ProcessTable {
 
     /// Forks the given parent process, returning the child's PID.
     pub fn fork(&self, parent: Pid) -> Result<Pid, SubsystemError> {
-        let parent_proc = self.lookup(parent).ok_or(SubsystemError::Runtime("parent not found"))?;
+        let parent_proc = self
+            .lookup(parent)
+            .ok_or(SubsystemError::Runtime("parent not found"))?;
         let child = self.spawn();
         child.set_parent(parent);
         parent_proc.clone_state_into(&child);
@@ -217,14 +220,18 @@ impl ProcessTable {
 
     /// Replaces the program image for a process.
     pub fn exec(&self, pid: Pid, program: String) -> Result<(), SubsystemError> {
-        let proc = self.lookup(pid).ok_or(SubsystemError::Runtime("process not found"))?;
+        let proc = self
+            .lookup(pid)
+            .ok_or(SubsystemError::Runtime("process not found"))?;
         proc.set_program(program);
         Ok(())
     }
 
     /// Registers an open file descriptor for the process.
     pub fn open(&self, pid: Pid, path: String) -> Result<u64, SubsystemError> {
-        let proc = self.lookup(pid).ok_or(SubsystemError::Runtime("process not found"))?;
+        let proc = self
+            .lookup(pid)
+            .ok_or(SubsystemError::Runtime("process not found"))?;
         let fd = proc.next_fd();
         proc.insert_fd(fd, path);
         Ok(fd)
@@ -232,7 +239,9 @@ impl ProcessTable {
 
     /// Closes a file descriptor for the process.
     pub fn close(&self, pid: Pid, fd: u64) -> Result<(), SubsystemError> {
-        let proc = self.lookup(pid).ok_or(SubsystemError::Runtime("process not found"))?;
+        let proc = self
+            .lookup(pid)
+            .ok_or(SubsystemError::Runtime("process not found"))?;
         if proc.remove_fd(fd) {
             Ok(())
         } else {

@@ -65,7 +65,11 @@ pub struct PosixLayer<'a> {
 impl<'a> PosixLayer<'a> {
     /// Wraps the process table.
     pub fn new(process_table: &'a ProcessTable) -> Self {
-        Self { process_table, program_handles: RwLock::new(BTreeMap::new()), path_handles: RwLock::new(BTreeMap::new()) }
+        Self {
+            process_table,
+            program_handles: RwLock::new(BTreeMap::new()),
+            path_handles: RwLock::new(BTreeMap::new()),
+        }
     }
 
     /// Dispatches a POSIX syscall.
@@ -137,8 +141,7 @@ impl<'a> PosixLayer<'a> {
 
     fn open(&self, pid: Pid, path: &str, _flags: u64) -> Result<u64, Errno> {
         let normalized = Self::normalize_path(path);
-        self
-            .process_table
+        self.process_table
             .open(pid, normalized)
             .map_err(Errno::from_subsystem)
     }
@@ -159,7 +162,9 @@ impl<'a> PosixLayer<'a> {
     }
 
     fn exec(&self, pid: Pid, program: String) -> Result<(), Errno> {
-        self.process_table.exec(pid, program).map_err(Errno::from_subsystem)
+        self.process_table
+            .exec(pid, program)
+            .map_err(Errno::from_subsystem)
     }
 
     fn lookup_program_handle(&self, handle: u64) -> Result<String, Errno> {
@@ -179,7 +184,11 @@ impl<'a> PosixLayer<'a> {
     }
 
     fn waitpid(&self, parent: Pid, child_raw: i64, _options: u64) -> Result<u64, Errno> {
-        let target = if child_raw <= 0 { None } else { Some(Pid::new(child_raw as u64)) };
+        let target = if child_raw <= 0 {
+            None
+        } else {
+            Some(Pid::new(child_raw as u64))
+        };
         match self.process_table.wait_pid(parent, target) {
             Ok((pid, status)) => {
                 // For now, we return the child PID and encode the status in the upper bits.

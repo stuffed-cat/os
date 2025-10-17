@@ -131,7 +131,8 @@ impl Pics {
     unsafe fn initialize(&mut self) {
         trace!(
             "Initializing chained PIC with offsets {} and {}",
-            self.primary.offset, self.secondary.offset
+            self.primary.offset,
+            self.secondary.offset
         );
 
         let mut wait_port: Port<u8> = Port::new(0x80);
