@@ -1,0 +1,23 @@
+[package]
+name = "kernel"
+version = "0.1.0"
+edition = "2021"
+authors = ["stuffed-cat <dev@stuffedcat.dev>"]
+description = "Hybrid micro/monolithic kernel core for a POSIX-like x86-64 OS"
+license = "MIT"
+
+[lib]
+name = "kernel"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+bitflags = "2.4"
+thiserror = "1.0"
+spin = "0.9"
+once_cell = { version = "1.19", features = ["std"] }
+log = { version = "0.4", features = ["std"] }

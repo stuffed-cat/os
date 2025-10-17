@@ -1,0 +1,9 @@
+[package]
+name = "userland"
+version = "0.1.0"
+edition = "2021"
+authors = ["stuffed-cat <dev@stuffedcat.dev>"]
+description = "Prototype POSIX-ish userland for the hybrid kernel"
+license = "MIT"
+
+[dependencies]
