@@ -91,7 +91,13 @@ pub trait ShellSystem {
     /// Requests a system shutdown/power off.
     fn shutdown(&self) -> Result<(), SystemError>;
     /// Launches an external executable with the provided arguments in the current working directory.
-    fn exec(&self, path: &str, args: &[&str], cwd: &str) -> Result<ExecResult, SystemError>;
+    fn exec(
+        &self,
+        path: &str,
+        args: &[&str],
+        cwd: &str,
+        env: &[(&str, &str)],
+    ) -> Result<ExecResult, SystemError>;
 }
 
 /// Errors returned by platform control hooks.
@@ -634,10 +640,6 @@ where
     }
 
     fn resolve_command(&mut self, name: &str) -> Result<CommandExecutable, CommandResolutionError> {
-        if let Some(builtin) = Self::builtin_from_str(name) {
-            return Ok(CommandExecutable::Builtin(builtin));
-        }
-
         let path = format!("/bin/{name}");
         match self.fs.read_file(&path) {
             Ok(data) => match self.parse_command_binary(&data) {
@@ -648,7 +650,11 @@ where
                 Err(other) => Err(other),
             },
             Err(FsError::NotFound) | Err(FsError::NotDirectory) | Err(FsError::NotFile) => {
-                Err(CommandResolutionError::NotFound)
+                if let Some(builtin) = Self::builtin_from_str(name) {
+                    Ok(CommandExecutable::Builtin(builtin))
+                } else {
+                    Err(CommandResolutionError::NotFound)
+                }
             }
             Err(FsError::Unavailable) => {
                 Err(CommandResolutionError::Filesystem(FsError::Unavailable))
@@ -872,7 +878,26 @@ where
 
     fn run_external(&mut self, path: &str, args: &[&str]) {
         let display = path.rsplit('/').next().unwrap_or(path);
-        match self.sys.exec(path, args, &self.current_dir) {
+        let mut env_pairs: Vec<(&str, &str)> = Vec::new();
+        let mut history_blob = None;
+        let mut history_count = None;
+
+        if !self.history.is_empty() {
+            history_blob = Some(self.history.join("\n"));
+            history_count = Some(self.history.len().to_string());
+        }
+
+        if let Some(ref blob) = history_blob {
+            env_pairs.push(("SHELL_HISTORY", blob.as_str()));
+        }
+        if let Some(ref count) = history_count {
+            env_pairs.push(("SHELL_HISTORY_COUNT", count.as_str()));
+        }
+
+        match self
+            .sys
+            .exec(path, args, &self.current_dir, env_pairs.as_slice())
+        {
             Ok(result) => {
                 self.print("launched process pid ");
                 self.println(&result.pid.to_string());
@@ -1271,7 +1296,13 @@ mod tests {
             Err(SystemError::Unsupported)
         }
 
-        fn exec(&self, _path: &str, _args: &[&str], _cwd: &str) -> Result<ExecResult, SystemError> {
+        fn exec(
+            &self,
+            _path: &str,
+            _args: &[&str],
+            _cwd: &str,
+            _env: &[(&str, &str)],
+        ) -> Result<ExecResult, SystemError> {
             Err(SystemError::Unsupported)
         }
     }

@@ -36,3 +36,73 @@ required-features = ["std"]
 name = "cat"
 path = "src/bin/cat.rs"
 required-features = ["std"]
+
+[[bin]]
+name = "help"
+path = "src/bin/help.rs"
+required-features = ["std"]
+
+[[bin]]
+name = "history"
+path = "src/bin/history.rs"
+required-features = ["std"]
+
+[[bin]]
+name = "pwd"
+path = "src/bin/pwd.rs"
+required-features = ["std"]
+
+[[bin]]
+name = "cd"
+path = "src/bin/cd.rs"
+required-features = ["std"]
+
+[[bin]]
+name = "echo"
+path = "src/bin/echo.rs"
+required-features = ["std"]
+
+[[bin]]
+name = "touch"
+path = "src/bin/touch.rs"
+required-features = ["std"]
+
+[[bin]]
+name = "mkdir"
+path = "src/bin/mkdir.rs"
+required-features = ["std"]
+
+[[bin]]
+name = "rmdir"
+path = "src/bin/rmdir.rs"
+required-features = ["std"]
+
+[[bin]]
+name = "rm"
+path = "src/bin/rm.rs"
+required-features = ["std"]
+
+[[bin]]
+name = "cp"
+path = "src/bin/cp.rs"
+required-features = ["std"]
+
+[[bin]]
+name = "mv"
+path = "src/bin/mv.rs"
+required-features = ["std"]
+
+[[bin]]
+name = "reboot"
+path = "src/bin/reboot.rs"
+required-features = ["std"]
+
+[[bin]]
+name = "shutdown"
+path = "src/bin/shutdown.rs"
+required-features = ["std"]
+
+[[bin]]
+name = "sh"
+path = "src/bin/sh.rs"
+required-features = ["std"]

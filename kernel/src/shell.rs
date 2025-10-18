@@ -296,7 +296,13 @@ impl ShellSystem for KernelShellSystem {
         }
     }
 
-    fn exec(&self, path: &str, args: &[&str], cwd: &str) -> Result<ExecResult, SystemError> {
+    fn exec(
+        &self,
+        path: &str,
+        args: &[&str],
+        cwd: &str,
+        env: &[(&str, &str)],
+    ) -> Result<ExecResult, SystemError> {
         let process = self.process_table.spawn();
         let pid = process.pid();
 
@@ -308,6 +314,10 @@ impl ShellSystem for KernelShellSystem {
         process.set_env("ARGC".to_string(), (args.len() + 1).to_string());
         for (index, arg) in args.iter().enumerate() {
             process.set_env(format!("ARG{}", index + 1), (*arg).to_string());
+        }
+
+        for &(key, value) in env {
+            process.set_env(key.to_string(), value.to_string());
         }
 
         let program = path.to_string();

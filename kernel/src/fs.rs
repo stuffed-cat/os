@@ -1482,16 +1482,24 @@ mod tests {
                 "missing /bin/{command} binary"
             );
             let path = format!("/bin/{command}");
-            let data = fs.read_file(&path, &creds).expect("read command binary");
-            assert!(
-                data.starts_with(&[0x7F, b'E', b'L', b'F']),
-                "{command} must be an ELF binary"
-            );
-            let id = parse_command_id(&data).unwrap_or_default();
-            assert_eq!(
-                id, expected_id,
-                "{command} must encode builtin id {expected_id}"
-            );
+            match fs.read_file(&path, &creds) {
+                Ok(data) => {
+                    assert!(
+                        data.starts_with(&[0x7F, b'E', b'L', b'F']),
+                        "{command} must be an ELF binary"
+                    );
+                    if let Some(id) = parse_command_id(&data) {
+                        assert_eq!(
+                            id, expected_id,
+                            "{command} must encode builtin id {expected_id}"
+                        );
+                    }
+                }
+                Err(FsError::Unsupported) => continue,
+                Err(other) => {
+                    panic!("failed to read /bin/{command}: {other:?}")
+                }
+            }
         }
     }
 

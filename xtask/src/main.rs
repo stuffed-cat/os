@@ -212,18 +212,20 @@ fn generate_command_binaries(workspace_root: &Path) -> Result<()> {
 }
 
 fn copy_userland_execs(workspace_root: &Path, bin_dir: &Path) -> Result<()> {
+    let commands = [
+        "bash", "cat", "cd", "cp", "echo", "help", "history", "ls", "mkdir", "mv", "pwd", "reboot",
+        "rm", "rmdir", "sh", "shutdown", "touch",
+    ];
+
+    let mut build_args = vec!["build", "--release", "-p", "userland"];
+    for cmd in commands.iter() {
+        build_args.push("--bin");
+        build_args.push(cmd);
+    }
+
     let status = ProcessCommand::new("cargo")
         .current_dir(workspace_root)
-        .args([
-            "build",
-            "--release",
-            "-p",
-            "userland",
-            "--bin",
-            "ls",
-            "--bin",
-            "cat",
-        ])
+        .args(&build_args)
         .status()
         .context("failed to build userland command binaries")?;
     if !status.success() {
@@ -237,7 +239,6 @@ fn copy_userland_execs(workspace_root: &Path, bin_dir: &Path) -> Result<()> {
     let target_dir = PathBuf::from(metadata.target_directory);
     let profile_dir = target_dir.join("release");
 
-    let commands = ["ls", "cat"];
     for cmd in commands {
         let artifact = if cfg!(target_os = "windows") {
             profile_dir.join(format!("{cmd}.exe"))
