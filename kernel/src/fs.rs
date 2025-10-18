@@ -30,6 +30,8 @@ pub enum FsError {
     NotFound,
     /// Requested path exists but is not a directory.
     NotDirectory,
+    /// Requested path exists but is not a regular file.
+    NotFile,
 }
 
 /// Directory entry returned by [`list_dir`].
@@ -88,6 +90,13 @@ pub fn list_dir(path: &str) -> Result<Vec<DirEntry>, FsError> {
     let guard = FILESYSTEM.lock();
     let fs = guard.as_ref().ok_or(FsError::NotInitialized)?;
     fs.list_dir(path)
+}
+
+/// Reads a regular file from the provided absolute path.
+pub fn read_file(path: &str) -> Result<Vec<u8>, FsError> {
+    let guard = FILESYSTEM.lock();
+    let fs = guard.as_ref().ok_or(FsError::NotInitialized)?;
+    fs.read_file(path)
 }
 
 struct Ext2Fs<'a> {
@@ -224,6 +233,40 @@ impl<'a> Ext2Fs<'a> {
         Ok(None)
     }
 
+    fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError> {
+        let inode_num = self.resolve_path(path)?;
+        let inode = self.load_inode(inode_num)?;
+        if inode.is_directory() {
+            return Err(FsError::NotFile);
+        }
+        if !inode.is_regular_file() {
+            return Err(FsError::Unsupported);
+        }
+
+        let mut remaining = inode.size as usize;
+        let mut data = Vec::with_capacity(remaining);
+
+        for &block in inode.block.iter().take(INODE_DIRECT_BLOCKS) {
+            if remaining == 0 {
+                break;
+            }
+            if block == 0 {
+                break;
+            }
+            let block_data = self.block(block)?;
+            let to_copy = cmp::min(remaining, self.block_size);
+            data.extend_from_slice(&block_data[..to_copy]);
+            remaining = remaining.saturating_sub(to_copy);
+        }
+
+        if remaining != 0 {
+            return Err(FsError::Unsupported);
+        }
+
+        data.truncate(inode.size as usize);
+        Ok(data)
+    }
+
     fn read_directory(&self, inode: &Inode) -> Result<Vec<DirectoryRecord>, FsError> {
         let mut records = Vec::new();
         let mut remaining = inode.size as usize;
@@ -314,6 +357,10 @@ impl Inode {
     fn is_directory(&self) -> bool {
         (self.mode & 0xF000) == 0x4000
     }
+
+    fn is_regular_file(&self) -> bool {
+        (self.mode & 0xF000) == 0x8000
+    }
 }
 
 struct DirectoryRecord {
@@ -350,5 +397,36 @@ mod tests {
         let names: Vec<_> = entries.into_iter().map(|e| e.name).collect();
         assert!(names.contains(&"README".to_string()));
         assert!(names.contains(&"bin".to_string()));
+    }
+
+    #[test]
+    fn read_readme_file() {
+        let bytes = include_bytes!("../../assets/rootfs.ext2");
+        let fs = Ext2Fs::parse(bytes).expect("parse ext2");
+        let data = fs.read_file("/README").expect("read README");
+        assert!(!data.is_empty());
+    }
+
+    #[test]
+    fn bin_contains_command_placeholders() {
+        let bytes = include_bytes!("../../assets/rootfs.ext2");
+        let fs = Ext2Fs::parse(bytes).expect("parse ext2");
+        let entries = fs.list_dir("/bin").expect("list /bin");
+        let names: Vec<String> = entries.into_iter().map(|entry| entry.name).collect();
+        for expected in [
+            "cat",
+            "cd",
+            "cp",
+            "echo",
+            "ls",
+            "mkdir",
+            "mv",
+            "pwd",
+            "rm",
+            "rmdir",
+            "touch",
+        ] {
+            assert!(names.contains(&expected.to_string()), "missing /bin/{expected}");
+        }
     }
 }

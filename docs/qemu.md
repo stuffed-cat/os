@@ -11,7 +11,7 @@
    rustup target add x86_64-unknown-none --toolchain nightly
    ```
 
-2. **bootimage 工具**：用于生成包含引导程序的镜像。
+2. **（可选）bootimage 工具**：若希望直接使用 `cargo bootimage`，可单独安装。
    ```bash
    cargo +nightly install bootimage
    ```
@@ -30,23 +30,18 @@
 
 2. **编译并生成镜像**
    ```bash
-   cargo +nightly bootimage -p kernel-bin --features boot
+   RUSTUP_TOOLCHAIN=nightly cargo xtask bootimage
    ```
 
-   - `--features boot` 打开 `kernel-bin` 中的裸机入口与引导代码。
-   - `bootimage` 会自动使用 `-Z build-std=core,alloc` 构建必需的标准库子集。
-   - 若遇到 `serde_core` 等依赖缺少 `Result`/`Option` 的报错，通常是因 `llvm-tools-preview` 未安装或未使用 nightly 工具链；请确认前置条件已满足。
-
-   生成的镜像位于：
-   ```
-   target/x86_64-unknown-none/debug/bootimage-kernel-bin.bin
-   ```
+   - `xtask` 会调用仓库中 vendored 的 `bootloader` 生成 BIOS 镜像，输出路径为 `target/x86_64-unknown-none/debug/bootimage-bios.img`。
+   - 若出现 “failed to get llvm tools” 或 “the option `Z` is only accepted on the nightly compiler” 等报错，请确认命令前缀中的 `RUSTUP_TOOLCHAIN=nightly` 已添加，且已安装 `llvm-tools-preview` 组件。
+   - 如需使用原生 `cargo bootimage` 工作流，可参考 `bootloader` 官方文档；此处推荐的 `xtask` 已封装正确的参数与路径。
 
 ## 使用 QEMU 启动
 
 ```bash
 qemu-system-x86_64 \
-  -drive format=raw,file=target/x86_64-unknown-none/debug/bootimage-kernel-bin.bin \
+   -drive format=raw,file=target/x86_64-unknown-none/debug/bootimage-bios.img \
   -serial stdio \
   -display none
 ```
@@ -61,10 +56,10 @@ qemu-system-x86_64 \
 - **开启 GDB 远程调试**：在 QEMU 命令中加入 `-s -S`，QEMU 会在启动时挂起并监听 1234 端口，可使用 `gdb`/`lldb` 连接。
 - **查看引导日志**：`kernel` 使用串口输出日志，确保 `-serial stdio` 或指向文件以保存信息。
 - **构建 release 版本**：
-  ```bash
-  cargo +nightly bootimage -p kernel-bin --features boot --release
-  ```
-- **磁盘镜像路径**：若修改 target 目录或使用自定义目标，可通过 `cargo bootimage --help` 查询更多选项。
+   ```bash
+   RUSTUP_TOOLCHAIN=nightly cargo xtask bootimage --release
+   ```
+- **磁盘镜像路径**：若修改 target 目录或使用自定义目标，可在 `cargo xtask bootimage --help` 查看更多参数。
 
 ## 常见问题
 

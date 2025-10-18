@@ -84,6 +84,20 @@ impl ShellFs for KernelShellFs {
             Err(KernelFsError::InvalidImage) => Err(ShellFsError::Corrupt),
             Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
             Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
+            Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
+        }
+    }
+
+    fn read_file(&self, path: &str) -> Result<Vec<u8>, ShellFsError> {
+        match fs::read_file(path) {
+            Ok(data) => Ok(data),
+            Err(KernelFsError::NotInitialized | KernelFsError::Unsupported) => {
+                Err(ShellFsError::Unavailable)
+            }
+            Err(KernelFsError::InvalidImage) => Err(ShellFsError::Corrupt),
+            Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
+            Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
+            Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
         }
     }
 }

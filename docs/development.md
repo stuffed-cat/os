@@ -42,6 +42,33 @@ mke2fs -t ext2 -d assets/rootfs -b 1024 -m 0 assets/rootfs.ext2 1024
 
 > 提示：上述命令依赖 `mke2fs`（e2fsprogs）工具。镜像大小为 1 MiB；如需更多空间，可调整最后的块数量参数。
 
+#### Bare shell 内置命令
+
+重新生成 `rootfs.ext2` 后，`/bin` 目录会包含一组与裸机 shell 内置命令同名的占位符文件，便于未来在具备进程/exec 能力时直接替换为真实可执行文件。当前版本的 shell 在内核态解释以下命令：
+
+| 命令 | 功能 | 备注 |
+|------|------|------|
+| `help` | 显示帮助 | |
+| `history` | 查看历史命令 | |
+| `ls [PATH]` | 列出目录内容 | 支持相对/绝对路径 |
+| `pwd` | 显示当前工作目录 | |
+| `cd [PATH]` | 切换工作目录 | 多参数报错 |
+| `cat FILE...` | 打印文件内容 | 仅支持 ext2 中的常规文件 |
+| `echo ARGS...` | 原样回显参数 | |
+| `touch`/`mkdir`/`rmdir`/`rm`/`cp`/`mv` | 预留命令 | 当前根文件系统为只读，这些命令会提示只读限制 |
+
+> 注意：上述命令的逻辑在 `userland/src/bare_shell.rs` 中实现，并通过 `/bin/<command>` 占位符文件在镜像中暴露，方便后续迁移到可执行文件模型。
+
+### 构建裸机镜像
+
+使用工作区内置的 `xtask` 可生成 BIOS 镜像（调用 vendored `bootloader`）。由于 bootloader 依赖 nightly toolchain，请在执行命令时显式指定：
+
+```bash
+RUSTUP_TOOLCHAIN=nightly cargo xtask bootimage
+```
+
+生成的镜像位于 `target/x86_64-unknown-none/debug/bootimage-bios.img`，可配合 `qemu-system-x86_64` 启动验证。
+
 ## 代码布局速查
 
 ```
