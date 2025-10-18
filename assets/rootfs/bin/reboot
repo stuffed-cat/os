@@ -1,1 +1,2 @@
-builtin placeholder for reboot
+#!bare-script
+builtin reboot

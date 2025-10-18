@@ -81,6 +81,9 @@ impl ShellFs for KernelShellFs {
                         FsEntryKind::Directory => EntryKind::Directory,
                         FsEntryKind::File => EntryKind::File,
                     },
+                    size: entry.size,
+                    mode: entry.mode,
+                    inode: entry.inode,
                 })
                 .collect()),
             Err(KernelFsError::NotInitialized | KernelFsError::Unsupported) => {

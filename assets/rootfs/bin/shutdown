@@ -1,1 +1,2 @@
-builtin placeholder for shutdown
+#!bare-script
+builtin shutdown

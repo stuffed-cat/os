@@ -1,1 +1,2 @@
-builtin placeholder for cd
+#!bare-script
+builtin cd "$@"

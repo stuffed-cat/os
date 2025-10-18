@@ -1,1 +1,2 @@
-builtin placeholder for touch
+#!bare-script
+builtin touch "$@"

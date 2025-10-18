@@ -41,6 +41,12 @@ pub struct DirEntry {
     pub name: String,
     /// Entry kind.
     pub kind: EntryKind,
+    /// File size in bytes.
+    pub size: u64,
+    /// Raw inode mode bits.
+    pub mode: u16,
+    /// Inode number associated with the entry.
+    pub inode: u32,
 }
 
 /// Entry kind metadata.
@@ -194,6 +200,9 @@ impl<'a> Ext2Fs<'a> {
             entries.push(DirEntry {
                 name: record.name,
                 kind,
+                size: child_inode.size as u64,
+                mode: child_inode.mode,
+                inode: record.inode,
             });
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -408,18 +417,25 @@ mod tests {
     }
 
     #[test]
-    fn bin_contains_command_placeholders() {
+    fn bin_contains_command_scripts() {
         let bytes = include_bytes!("../../assets/rootfs.ext2");
         let fs = Ext2Fs::parse(bytes).expect("parse ext2");
         let entries = fs.list_dir("/bin").expect("list /bin");
         let names: Vec<String> = entries.into_iter().map(|entry| entry.name).collect();
-        for expected in [
-            "cat", "cd", "cp", "echo", "ls", "mkdir", "mv", "pwd", "rm", "rmdir", "reboot",
-            "shutdown", "touch",
+        assert!(names.contains(&"hello.txt".to_string()));
+        for command in [
+            "cat", "cd", "cp", "echo", "help", "history", "ls", "mkdir", "mv", "pwd", "rm",
+            "rmdir", "reboot", "shutdown", "touch",
         ] {
             assert!(
-                names.contains(&expected.to_string()),
-                "missing /bin/{expected}"
+                names.contains(&command.to_string()),
+                "missing /bin/{command} script"
+            );
+            let path = format!("/bin/{command}");
+            let data = fs.read_file(&path).expect("read command script");
+            assert!(
+                data.starts_with(b"#!bare-script"),
+                "{command} script must start with #!bare-script"
             );
         }
     }

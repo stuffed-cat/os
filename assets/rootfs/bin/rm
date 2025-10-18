@@ -1,1 +1,2 @@
-builtin placeholder for rm
+#!bare-script
+builtin rm "$@"

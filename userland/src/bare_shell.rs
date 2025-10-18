@@ -102,6 +102,7 @@ struct LsOptions {
     show_hidden: bool,
     color_mode: ColorMode,
     help: bool,
+    long: bool,
 }
 
 impl Default for LsOptions {
@@ -110,8 +111,56 @@ impl Default for LsOptions {
             show_hidden: false,
             color_mode: ColorMode::Auto,
             help: false,
+            long: false,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuiltinCommand {
+    Help,
+    History,
+    Ls,
+    Pwd,
+    Cd,
+    Cat,
+    Echo,
+    Touch,
+    Mkdir,
+    Rmdir,
+    Rm,
+    Cp,
+    Mv,
+    Reboot,
+    Shutdown,
+}
+
+enum CommandExecutable {
+    Builtin(BuiltinCommand),
+    Script(CommandScript),
+}
+
+enum CommandResolutionError {
+    NotFound,
+    InvalidFormat,
+    Filesystem(FsError),
+}
+
+struct CommandScript {
+    lines: Vec<ScriptLine>,
+}
+
+struct ScriptLine {
+    number: usize,
+    tokens: Vec<ScriptToken>,
+}
+
+#[derive(Clone)]
+enum ScriptToken {
+    Literal(String),
+    AllArgs,
+    Arg(usize),
+    CommandName,
 }
 
 /// Shell-friendly filesystem error type.
@@ -136,6 +185,12 @@ pub struct DirEntry {
     pub name: String,
     /// Entry kind.
     pub kind: EntryKind,
+    /// File size in bytes.
+    pub size: u64,
+    /// Raw inode mode bits.
+    pub mode: u16,
+    /// Inode number associated with the entry.
+    pub inode: u32,
 }
 
 impl<Io, Fs, Sys> BareShell<Io, Fs, Sys>
@@ -197,23 +252,21 @@ where
             let mut parts = trimmed.split_whitespace();
             if let Some(cmd) = parts.next() {
                 let args: Vec<&str> = parts.collect();
-                match cmd {
-                    "help" => self.print_help(),
-                    "history" => self.print_history(),
-                    "ls" => self.command_ls(&args),
-                    "pwd" => self.command_pwd(),
-                    "cd" => self.command_cd(&args),
-                    "cat" => self.command_cat(&args),
-                    "echo" => self.command_echo(&args),
-                    "touch" => self.command_read_only("touch"),
-                    "mkdir" => self.command_read_only("mkdir"),
-                    "rmdir" => self.command_read_only("rmdir"),
-                    "rm" => self.command_read_only("rm"),
-                    "cp" => self.command_read_only("cp"),
-                    "mv" => self.command_read_only("mv"),
-                    "reboot" => self.command_reboot(),
-                    "shutdown" => self.command_shutdown(),
-                    _ => self.println("command not found"),
+                match self.resolve_command(cmd) {
+                    Ok(CommandExecutable::Builtin(builtin)) => self.run_builtin(builtin, &args),
+                    Ok(CommandExecutable::Script(script)) => self.run_script(&script, cmd, &args),
+                    Err(CommandResolutionError::InvalidFormat) => {
+                        self.print("unsupported executable format: ");
+                        self.println(cmd);
+                    }
+                    Err(CommandResolutionError::Filesystem(FsError::Unavailable)) => {
+                        self.println("filesystem unavailable")
+                    }
+                    Err(CommandResolutionError::Filesystem(FsError::Corrupt)) => {
+                        self.println("filesystem corrupt")
+                    }
+                    Err(CommandResolutionError::Filesystem(_)) => self.println("command not found"),
+                    Err(CommandResolutionError::NotFound) => self.println("command not found"),
                 }
             }
         }
@@ -374,6 +427,225 @@ where
     fn command_read_only(&mut self, cmd: &str) {
         self.print(cmd);
         self.println(": filesystem is read-only");
+    }
+
+    fn resolve_command(&mut self, name: &str) -> Result<CommandExecutable, CommandResolutionError> {
+        let path = format!("/bin/{name}");
+        match self.fs.read_file(&path) {
+            Ok(data) => self
+                .parse_command_script(&data)
+                .map(CommandExecutable::Script),
+            Err(FsError::NotFound) | Err(FsError::NotDirectory) | Err(FsError::NotFile) => {
+                Self::builtin_from_str(name)
+                    .map(CommandExecutable::Builtin)
+                    .ok_or(CommandResolutionError::NotFound)
+            }
+            Err(FsError::Unavailable) => {
+                Err(CommandResolutionError::Filesystem(FsError::Unavailable))
+            }
+            Err(FsError::Corrupt) => Err(CommandResolutionError::Filesystem(FsError::Corrupt)),
+        }
+    }
+
+    fn parse_command_script(&self, data: &[u8]) -> Result<CommandScript, CommandResolutionError> {
+        let text = core::str::from_utf8(data).map_err(|_| CommandResolutionError::InvalidFormat)?;
+        let mut lines_iter = text.lines();
+        let shebang = lines_iter
+            .next()
+            .ok_or(CommandResolutionError::InvalidFormat)?
+            .trim();
+        if shebang != "#!bare-script" {
+            return Err(CommandResolutionError::InvalidFormat);
+        }
+
+        let mut lines = Vec::new();
+        for (idx, raw) in lines_iter.enumerate() {
+            let number = idx + 2;
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let tokens = self.tokenize_script_line(trimmed)?;
+            if tokens.is_empty() {
+                continue;
+            }
+            lines.push(ScriptLine { number, tokens });
+        }
+
+        if lines.is_empty() {
+            return Err(CommandResolutionError::InvalidFormat);
+        }
+
+        Ok(CommandScript { lines })
+    }
+
+    fn tokenize_script_line(&self, line: &str) -> Result<Vec<ScriptToken>, CommandResolutionError> {
+        let mut tokens = Vec::new();
+        let mut current = String::new();
+        let mut in_quotes = false;
+
+        for ch in line.chars() {
+            match ch {
+                '"' => {
+                    if in_quotes {
+                        tokens.push(self.classify_script_token(&current)?);
+                        current.clear();
+                        in_quotes = false;
+                    } else {
+                        if !current.is_empty() {
+                            return Err(CommandResolutionError::InvalidFormat);
+                        }
+                        in_quotes = true;
+                    }
+                }
+                ' ' | '\t' if !in_quotes => {
+                    if !current.is_empty() {
+                        tokens.push(self.classify_script_token(&current)?);
+                        current.clear();
+                    }
+                }
+                _ => current.push(ch),
+            }
+        }
+
+        if in_quotes {
+            return Err(CommandResolutionError::InvalidFormat);
+        }
+
+        if !current.is_empty() {
+            tokens.push(self.classify_script_token(&current)?);
+        }
+
+        Ok(tokens)
+    }
+
+    fn classify_script_token(&self, raw: &str) -> Result<ScriptToken, CommandResolutionError> {
+        if raw == "$@" {
+            return Ok(ScriptToken::AllArgs);
+        }
+        if raw == "$0" {
+            return Ok(ScriptToken::CommandName);
+        }
+        if let Some(stripped) = raw.strip_prefix('$') {
+            if stripped.is_empty() {
+                return Err(CommandResolutionError::InvalidFormat);
+            }
+            if let Ok(index) = stripped.parse::<usize>() {
+                return Ok(ScriptToken::Arg(index));
+            } else {
+                return Err(CommandResolutionError::InvalidFormat);
+            }
+        }
+        Ok(ScriptToken::Literal(raw.to_string()))
+    }
+
+    fn run_script(&mut self, script: &CommandScript, command_name: &str, args: &[&str]) {
+        for line in &script.lines {
+            let expanded = self.expand_script_tokens(&line.tokens, command_name, args);
+            if expanded.is_empty() {
+                continue;
+            }
+            let expanded_refs: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
+            match expanded_refs.first().copied() {
+                Some("builtin") => {
+                    if expanded_refs.len() < 2 {
+                        let msg =
+                            format!("script error (line {}): missing builtin name", line.number);
+                        self.println(&msg);
+                        continue;
+                    }
+                    let target = expanded_refs[1];
+                    if let Some(builtin) = Self::builtin_from_str(target) {
+                        self.run_builtin(builtin, &expanded_refs[2..]);
+                    } else {
+                        let msg = format!(
+                            "script error (line {}): unknown builtin {}",
+                            line.number, target
+                        );
+                        self.println(&msg);
+                    }
+                }
+                Some(other) => {
+                    let msg = format!(
+                        "script error (line {}): unsupported command {}",
+                        line.number, other
+                    );
+                    self.println(&msg);
+                }
+                None => {}
+            }
+        }
+    }
+
+    fn expand_script_tokens(
+        &self,
+        tokens: &[ScriptToken],
+        command_name: &str,
+        args: &[&str],
+    ) -> Vec<String> {
+        let mut expanded = Vec::new();
+        for token in tokens {
+            match token {
+                ScriptToken::Literal(text) => expanded.push(text.clone()),
+                ScriptToken::AllArgs => {
+                    for arg in args {
+                        expanded.push((*arg).to_string());
+                    }
+                }
+                ScriptToken::Arg(index) => {
+                    if *index == 0 {
+                        expanded.push(command_name.to_string());
+                    } else if let Some(value) = args.get(index - 1) {
+                        expanded.push((*value).to_string());
+                    } else {
+                        expanded.push(String::new());
+                    }
+                }
+                ScriptToken::CommandName => expanded.push(command_name.to_string()),
+            }
+        }
+        expanded
+    }
+
+    fn builtin_from_str(name: &str) -> Option<BuiltinCommand> {
+        match name {
+            "help" => Some(BuiltinCommand::Help),
+            "history" => Some(BuiltinCommand::History),
+            "ls" => Some(BuiltinCommand::Ls),
+            "pwd" => Some(BuiltinCommand::Pwd),
+            "cd" => Some(BuiltinCommand::Cd),
+            "cat" => Some(BuiltinCommand::Cat),
+            "echo" => Some(BuiltinCommand::Echo),
+            "touch" => Some(BuiltinCommand::Touch),
+            "mkdir" => Some(BuiltinCommand::Mkdir),
+            "rmdir" => Some(BuiltinCommand::Rmdir),
+            "rm" => Some(BuiltinCommand::Rm),
+            "cp" => Some(BuiltinCommand::Cp),
+            "mv" => Some(BuiltinCommand::Mv),
+            "reboot" => Some(BuiltinCommand::Reboot),
+            "shutdown" => Some(BuiltinCommand::Shutdown),
+            _ => None,
+        }
+    }
+
+    fn run_builtin(&mut self, builtin: BuiltinCommand, args: &[&str]) {
+        match builtin {
+            BuiltinCommand::Help => self.print_help(),
+            BuiltinCommand::History => self.print_history(),
+            BuiltinCommand::Ls => self.command_ls(args),
+            BuiltinCommand::Pwd => self.command_pwd(),
+            BuiltinCommand::Cd => self.command_cd(args),
+            BuiltinCommand::Cat => self.command_cat(args),
+            BuiltinCommand::Echo => self.command_echo(args),
+            BuiltinCommand::Touch => self.command_read_only("touch"),
+            BuiltinCommand::Mkdir => self.command_read_only("mkdir"),
+            BuiltinCommand::Rmdir => self.command_read_only("rmdir"),
+            BuiltinCommand::Rm => self.command_read_only("rm"),
+            BuiltinCommand::Cp => self.command_read_only("cp"),
+            BuiltinCommand::Mv => self.command_read_only("mv"),
+            BuiltinCommand::Reboot => self.command_reboot(),
+            BuiltinCommand::Shutdown => self.command_shutdown(),
+        }
     }
 
     fn command_reboot(&mut self) {

@@ -1,1 +1,2 @@
-builtin placeholder for mkdir
+#!bare-script
+builtin mkdir "$@"

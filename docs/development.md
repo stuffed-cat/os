@@ -44,7 +44,7 @@ mke2fs -t ext2 -d assets/rootfs -b 1024 -m 0 assets/rootfs.ext2 1024
 
 #### Bare shell 内置命令
 
-重新生成 `rootfs.ext2` 后，`/bin` 目录会包含一组与裸机 shell 内置命令同名的占位符文件，便于未来在具备进程/exec 能力时直接替换为真实可执行文件。当前版本的 shell 在内核态解释以下命令：
+重新生成 `rootfs.ext2` 后，`/bin` 目录会生成一组 `#!bare-script` 脚本，它们是对裸机 shell 内置命令的独立封装（每个脚本的第一行必须是 `#!bare-script`，后续行可调用 `builtin <name>` 来触发内置实现）。这让命令逻辑存储在镜像中，未来接入真正的 `exec` 时只需替换对应脚本或程序即可。当前版本的 shell 在内核态解释以下命令：
 
 | 命令 | 功能 | 备注 |
 |------|------|------|
@@ -59,7 +59,7 @@ mke2fs -t ext2 -d assets/rootfs -b 1024 -m 0 assets/rootfs.ext2 1024
 | `reboot` | 请求重启 | 在 `hardware` 构建目标上调用 ACPI/键盘复位，其他配置打印提示 |
 | `shutdown` | 请求关机 | 同上 |
 
-> 注意：上述命令的逻辑在 `userland/src/bare_shell.rs` 中实现，并通过 `/bin/<command>` 占位符文件在镜像中暴露，方便后续迁移到可执行文件模型。彩色输出基于 ANSI 转义序列，如需关闭可执行 `ls --color=never`。
+> 注意：脚本解释器位于 `userland/src/bare_shell.rs`，会读取 `/bin/<command>` 的脚本并解析其中的 `builtin` 调用。彩色输出基于 ANSI 转义序列，如需关闭可执行 `ls --color=never`。
 
 ### 构建裸机镜像
 

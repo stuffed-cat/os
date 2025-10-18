@@ -1,1 +1,2 @@
-builtin placeholder for mv
+#!bare-script
+builtin mv "$@"

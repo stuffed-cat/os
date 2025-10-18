@@ -1,1 +1,1 @@
-This is a placeholder binary placeholder.
+This is a sample file inside /bin.
