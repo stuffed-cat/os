@@ -1,4 +1,4 @@
-//! Filesystem services backed by an embedded ext4 image with an in-memory overlay.
+//! Filesystem services backed by an embedded ext2/3/4 image with an in-memory overlay.
 
 use crate::arch::x86_64::serial;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -23,6 +23,7 @@ const PERM_WRITE: u16 = 0b010;
 const PERM_EXECUTE: u16 = 0b001;
 const EXT_FEATURE_INCOMPAT_FILETYPE: u32 = 0x0000_0002;
 const EXT_FEATURE_INCOMPAT_RECOVER: u32 = 0x0000_0004;
+const EXT_FEATURE_INCOMPAT_JOURNAL_DEV: u32 = 0x0000_0008;
 const EXT_FEATURE_INCOMPAT_META_BG: u32 = 0x0000_0010;
 const EXT4_FEATURE_INCOMPAT_EXTENTS: u32 = 0x0000_0040;
 const EXT4_FEATURE_INCOMPAT_64BIT: u32 = 0x0000_0080;
@@ -33,6 +34,7 @@ const EXT_FEATURE_RO_COMPAT_BTREE_DIR: u32 = 0x0000_0004;
 const EXT4_FEATURE_RO_COMPAT_HUGE_FILE: u32 = 0x0000_0008;
 const EXT4_FEATURE_RO_COMPAT_DIR_NLINK: u32 = 0x0000_0020;
 const EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE: u32 = 0x0000_0040;
+const EXT_FEATURE_COMPAT_HAS_JOURNAL: u32 = 0x0000_0004;
 const EXT4_EXTENT_HEADER_MAGIC: u16 = 0xF30A;
 const EXT4_INODE_FLAG_EXTENTS: u32 = 0x0008_0000;
 const S_IFREG: u16 = 0o100000;
@@ -308,6 +310,11 @@ pub fn init_from_ramdisk(ramdisk_addr: u64, len: u64) -> Result<(), FsError> {
     // provided offset and that it remains valid for the lifetime of the kernel.
     let data = unsafe { core::slice::from_raw_parts(virt_start as *const u8, len) };
     let fs = Ext2Fs::parse(data)?;
+    let variant = fs.kind();
+    serial::write_fmt(format_args!(
+        "fs: detected {:?} image\r\n",
+        variant
+    ));
 
     let mut guard = FILESYSTEM.lock();
     *guard = Some(fs);
@@ -826,6 +833,13 @@ pub fn chown_with_credentials(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExtFilesystemKind {
+    Ext2,
+    Ext3,
+    Ext4,
+}
+
 struct Ext2Fs<'a> {
     data: &'a [u8],
     block_size: usize,
@@ -833,10 +847,7 @@ struct Ext2Fs<'a> {
     inodes_per_group: u32,
     block_group_table_offset: usize,
     block_group_count: u32,
-    feature_compat: u32,
-    feature_incompat: u32,
-    feature_ro_compat: u32,
-    revision_level: u32,
+    kind: ExtFilesystemKind,
 }
 
 #[derive(Clone)]
@@ -892,6 +903,7 @@ impl<'a> Ext2Fs<'a> {
 
         let allowed_incompat = EXT_FEATURE_INCOMPAT_FILETYPE
             | EXT_FEATURE_INCOMPAT_RECOVER
+            | EXT_FEATURE_INCOMPAT_JOURNAL_DEV
             | EXT_FEATURE_INCOMPAT_META_BG
             | EXT4_FEATURE_INCOMPAT_EXTENTS;
         if feature_incompat & !allowed_incompat != 0 {
@@ -911,6 +923,14 @@ impl<'a> Ext2Fs<'a> {
             return Err(FsError::Unsupported);
         }
 
+        let kind = detect_ext_filesystem_kind(
+            revision_level,
+            inode_size,
+            feature_compat,
+            feature_incompat,
+            feature_ro_compat,
+        );
+
         let block_group_table_block = if block_size == 1024 { 2 } else { 1 };
         let block_group_table_offset = block_group_table_block * block_size;
         let descriptor_table_size = block_group_count as usize * BLOCK_GROUP_DESC_SIZE;
@@ -925,11 +945,12 @@ impl<'a> Ext2Fs<'a> {
             inodes_per_group,
             block_group_table_offset,
             block_group_count,
-            feature_compat,
-            feature_incompat,
-            feature_ro_compat,
-            revision_level,
+            kind,
         })
+    }
+
+    fn kind(&self) -> ExtFilesystemKind {
+        self.kind
     }
 
     fn list_dir(&self, path: &str, creds: &Credentials) -> Result<Vec<DirEntry>, FsError> {
@@ -1458,6 +1479,30 @@ fn read_u32(data: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes)
 }
 
+fn detect_ext_filesystem_kind(
+    revision_level: u32,
+    inode_size: usize,
+    feature_compat: u32,
+    feature_incompat: u32,
+    feature_ro_compat: u32,
+) -> ExtFilesystemKind {
+    let has_ext4_features = (feature_incompat & EXT4_FEATURE_INCOMPAT_EXTENTS) != 0
+        || (feature_ro_compat
+            & (EXT4_FEATURE_RO_COMPAT_HUGE_FILE
+                | EXT4_FEATURE_RO_COMPAT_DIR_NLINK
+                | EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE)
+            != 0)
+        || (revision_level >= 1 && inode_size > INODE_SIZE_DEFAULT);
+
+    if has_ext4_features {
+        ExtFilesystemKind::Ext4
+    } else if (feature_compat & EXT_FEATURE_COMPAT_HAS_JOURNAL) != 0 {
+        ExtFilesystemKind::Ext3
+    } else {
+        ExtFilesystemKind::Ext2
+    }
+}
+
 #[cfg(test)]
 fn read_u64(data: &[u8], offset: usize) -> u64 {
     let bytes = [
@@ -1481,6 +1526,7 @@ mod tests {
     fn parse_rootfs_image() {
         let bytes = include_bytes!("../../assets/rootfs.ext4");
         let fs = Ext2Fs::parse(bytes).expect("parse ext4");
+        assert!(matches!(fs.kind(), ExtFilesystemKind::Ext4));
         let creds = Credentials::root();
         let entries = fs.list_dir("/", &creds).expect("list root");
         let names: Vec<_> = entries.into_iter().map(|e| e.name).collect();
@@ -1568,6 +1614,23 @@ mod tests {
 
         FILE_OVERLAY.lock().clear();
         FILESYSTEM.lock().take();
+    }
+
+    #[test]
+    fn detect_kind_classifies_ext2_ext3_ext4() {
+        let ext2 = detect_ext_filesystem_kind(0, INODE_SIZE_DEFAULT, 0, 0, 0);
+        assert_eq!(ext2, ExtFilesystemKind::Ext2);
+
+        let ext3 =
+            detect_ext_filesystem_kind(0, INODE_SIZE_DEFAULT, EXT_FEATURE_COMPAT_HAS_JOURNAL, 0, 0);
+        assert_eq!(ext3, ExtFilesystemKind::Ext3);
+
+        let ext4_by_extents =
+            detect_ext_filesystem_kind(1, INODE_SIZE_DEFAULT, 0, EXT4_FEATURE_INCOMPAT_EXTENTS, 0);
+        assert_eq!(ext4_by_extents, ExtFilesystemKind::Ext4);
+
+        let ext4_by_inode = detect_ext_filesystem_kind(1, INODE_SIZE_DEFAULT + 64, 0, 0, 0);
+        assert_eq!(ext4_by_inode, ExtFilesystemKind::Ext4);
     }
 }
 

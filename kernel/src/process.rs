@@ -587,7 +587,7 @@ impl ProcessTable {
             ElfError::NoLoadSegments => SubsystemError::Runtime("executable missing segments"),
         })?;
 
-    if let Some(interpreter_path) = image.interpreter().map(|s| String::from(s)) {
+        if let Some(interpreter_path) = image.interpreter().map(|s| String::from(s)) {
             if interpreter_path == program {
                 return Err(SubsystemError::Runtime("interpreter recursion detected"));
             }
@@ -605,17 +605,32 @@ impl ProcessTable {
                 Err(_) => return Err(SubsystemError::Runtime("interpreter read failure")),
             };
 
-            let interpreter_image = ExecutableImage::parse(&interp_bytes).map_err(|err| match err {
-                ElfError::Truncated => SubsystemError::Runtime("interpreter truncated"),
-                ElfError::BadMagic => SubsystemError::Runtime("interpreter invalid magic"),
-                ElfError::UnsupportedClass => SubsystemError::Runtime("interpreter unsupported class"),
-                ElfError::UnsupportedEndian => SubsystemError::Runtime("interpreter unsupported endian"),
-                ElfError::UnsupportedType => SubsystemError::Runtime("interpreter unsupported type"),
-                ElfError::UnsupportedArch => SubsystemError::Runtime("interpreter unsupported arch"),
-                ElfError::BadProgramHeaderBounds => SubsystemError::Runtime("interpreter corrupt program header"),
-                ElfError::BadSegmentBounds => SubsystemError::Runtime("interpreter corrupt segment"),
-                ElfError::NoLoadSegments => SubsystemError::Runtime("interpreter missing segments"),
-            })?;
+            let interpreter_image =
+                ExecutableImage::parse(&interp_bytes).map_err(|err| match err {
+                    ElfError::Truncated => SubsystemError::Runtime("interpreter truncated"),
+                    ElfError::BadMagic => SubsystemError::Runtime("interpreter invalid magic"),
+                    ElfError::UnsupportedClass => {
+                        SubsystemError::Runtime("interpreter unsupported class")
+                    }
+                    ElfError::UnsupportedEndian => {
+                        SubsystemError::Runtime("interpreter unsupported endian")
+                    }
+                    ElfError::UnsupportedType => {
+                        SubsystemError::Runtime("interpreter unsupported type")
+                    }
+                    ElfError::UnsupportedArch => {
+                        SubsystemError::Runtime("interpreter unsupported arch")
+                    }
+                    ElfError::BadProgramHeaderBounds => {
+                        SubsystemError::Runtime("interpreter corrupt program header")
+                    }
+                    ElfError::BadSegmentBounds => {
+                        SubsystemError::Runtime("interpreter corrupt segment")
+                    }
+                    ElfError::NoLoadSegments => {
+                        SubsystemError::Runtime("interpreter missing segments")
+                    }
+                })?;
 
             proc.set_env(String::from("INTERPRETEE"), program.clone());
             proc.set_env(String::from("INTERPRETER"), interpreter_path.clone());
