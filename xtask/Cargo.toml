@@ -4,8 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "Developer utilities for building and packaging the OS kernel"
 
+[features]
+default = []
+bootimage = ["bootloader"]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-bootloader = { path = "../third_party/bootloader" }
+bootloader = { path = "../third_party/bootloader", optional = true }
 cargo_metadata = "0.18"

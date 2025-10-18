@@ -63,13 +63,17 @@ mke2fs -t ext2 -d assets/rootfs -b 1024 -m 0 assets/rootfs.ext2 1024
 
 ### 构建裸机镜像
 
-使用工作区内置的 `xtask` 可生成 BIOS 镜像（调用 vendored `bootloader`）。由于 bootloader 依赖 nightly toolchain，请在执行命令时显式指定：
+使用工作区内置的 `xtask` 可生成 BIOS 镜像（调用 vendored `bootloader`）。由于 bootloader 依赖 nightly toolchain，需要先安装 nightly（`rustup toolchain install nightly`）。生成镜像时请显式启用 `bootimage` 特性：
 
 ```bash
-RUSTUP_TOOLCHAIN=nightly cargo xtask bootimage
+cargo run -p xtask --features bootimage -- bootimage
 ```
 
 生成的镜像位于 `target/x86_64-unknown-none/debug/bootimage-bios.img`，可配合 `qemu-system-x86_64` 启动验证。
+
+若直接执行 `cargo xtask bootimage`（未启用特性），工具会给出友好的提示信息并指导如何重新运行。
+
+若仅需重新生成根文件系统中的裸机命令与 `assets/rootfs.ext2`，运行 `cargo xtask rootfs` 即可，无需启用额外特性。
 
 ## 代码布局速查
 

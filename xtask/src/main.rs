@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+#[cfg(feature = "bootimage")]
 use bootloader::{BootConfig, DiskImageBuilder};
 use cargo_metadata::MetadataCommand;
 use clap::{Parser, Subcommand};
@@ -18,7 +19,7 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Build a bootable disk image using the vendored bootloader.
+    /// Build a bootable disk image using the vendored bootloader（需启用 `bootimage` feature）。
     Bootimage {
         /// Package to target (defaults to kernel-bin).
         #[arg(short = 'p', long = "package")]
@@ -52,6 +53,7 @@ enum Command {
 fn main() -> Result<()> {
     let args = Args::parse();
     match args.command {
+        #[cfg(feature = "bootimage")]
         Command::Bootimage {
             package,
             manifest_path,
@@ -70,11 +72,18 @@ fn main() -> Result<()> {
             features,
             &extra,
         )?,
+        #[cfg(not(feature = "bootimage"))]
+        Command::Bootimage { .. } => {
+            bail!(
+                "bootimage support is disabled. Re-run with `cargo run -p xtask --features bootimage -- bootimage ...`"
+            );
+        }
         Command::Rootfs => rebuild_rootfs()?,
     }
     Ok(())
 }
 
+#[cfg(feature = "bootimage")]
 fn build_bootimage(
     package: Option<&str>,
     _manifest_path: Option<&Path>,
@@ -366,6 +375,7 @@ fn regenerate_rootfs_image(workspace_root: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "bootimage")]
 fn build_kernel_binary(release: bool, target_triple: &str, features: &[String]) -> Result<()> {
     let mut cmd = ProcessCommand::new("rustup");
     cmd.arg("run").arg("nightly").arg("cargo");

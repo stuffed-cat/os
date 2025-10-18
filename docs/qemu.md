@@ -30,11 +30,11 @@
 
 2. **编译并生成镜像**
    ```bash
-   RUSTUP_TOOLCHAIN=nightly cargo xtask bootimage
+   cargo run -p xtask --features bootimage -- bootimage
    ```
 
    - `xtask` 会调用仓库中 vendored 的 `bootloader` 生成 BIOS 镜像，输出路径为 `target/x86_64-unknown-none/debug/bootimage-bios.img`。
-   - 若出现 “failed to get llvm tools” 或 “the option `Z` is only accepted on the nightly compiler” 等报错，请确认命令前缀中的 `RUSTUP_TOOLCHAIN=nightly` 已添加，且已安装 `llvm-tools-preview` 组件。
+   - 若出现 “failed to get llvm tools” 或 “the option `Z` is only accepted on the nightly compiler” 等报错，请确认已按前置条件安装 nightly toolchain 及 `llvm-tools-preview` 组件。
    - 如需使用原生 `cargo bootimage` 工作流，可参考 `bootloader` 官方文档；此处推荐的 `xtask` 已封装正确的参数与路径。
 
 ## 使用 QEMU 启动
@@ -57,9 +57,9 @@ qemu-system-x86_64 \
 - **查看引导日志**：`kernel` 使用串口输出日志，确保 `-serial stdio` 或指向文件以保存信息。
 - **构建 release 版本**：
    ```bash
-   RUSTUP_TOOLCHAIN=nightly cargo xtask bootimage --release
+   cargo run -p xtask --features bootimage -- bootimage --release
    ```
-- **磁盘镜像路径**：若修改 target 目录或使用自定义目标，可在 `cargo xtask bootimage --help` 查看更多参数。
+- **磁盘镜像路径**：若修改 target 目录或使用自定义目标，可在 `cargo run -p xtask --features bootimage -- bootimage --help` 查看更多参数。
 
 ## 常见问题
 
