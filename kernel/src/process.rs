@@ -575,7 +575,7 @@ impl ProcessTable {
             Err(_) => return Err(SubsystemError::Runtime("exec read failure")),
         };
 
-        let image = ExecutableImage::parse(&data).map_err(|err| match err {
+        let mut image = ExecutableImage::parse(&data).map_err(|err| match err {
             ElfError::Truncated => SubsystemError::Runtime("executable truncated"),
             ElfError::BadMagic => SubsystemError::Runtime("invalid executable magic"),
             ElfError::UnsupportedClass => SubsystemError::Runtime("unsupported elf class"),
@@ -585,12 +585,45 @@ impl ProcessTable {
             ElfError::BadProgramHeaderBounds => SubsystemError::Runtime("corrupt program header"),
             ElfError::BadSegmentBounds => SubsystemError::Runtime("corrupt segment"),
             ElfError::NoLoadSegments => SubsystemError::Runtime("executable missing segments"),
-            ElfError::UnsupportedInterpreter => {
-                SubsystemError::Runtime("unsupported elf interpreter")
-            }
         })?;
 
-        proc.set_program_image(program, image, self.memory_manager())?;
+    if let Some(interpreter_path) = image.interpreter().map(|s| String::from(s)) {
+            if interpreter_path == program {
+                return Err(SubsystemError::Runtime("interpreter recursion detected"));
+            }
+            let interp_bytes = match fs::read_file_with_credentials(&interpreter_path, &creds) {
+                Ok(bytes) => bytes,
+                Err(FsError::NotFound) => {
+                    return Err(SubsystemError::Runtime("interpreter not found"));
+                }
+                Err(FsError::NotInitialized) => {
+                    return Err(SubsystemError::Runtime("filesystem unavailable"));
+                }
+                Err(FsError::PermissionDenied) => {
+                    return Err(SubsystemError::Runtime("permission denied"));
+                }
+                Err(_) => return Err(SubsystemError::Runtime("interpreter read failure")),
+            };
+
+            let interpreter_image = ExecutableImage::parse(&interp_bytes).map_err(|err| match err {
+                ElfError::Truncated => SubsystemError::Runtime("interpreter truncated"),
+                ElfError::BadMagic => SubsystemError::Runtime("interpreter invalid magic"),
+                ElfError::UnsupportedClass => SubsystemError::Runtime("interpreter unsupported class"),
+                ElfError::UnsupportedEndian => SubsystemError::Runtime("interpreter unsupported endian"),
+                ElfError::UnsupportedType => SubsystemError::Runtime("interpreter unsupported type"),
+                ElfError::UnsupportedArch => SubsystemError::Runtime("interpreter unsupported arch"),
+                ElfError::BadProgramHeaderBounds => SubsystemError::Runtime("interpreter corrupt program header"),
+                ElfError::BadSegmentBounds => SubsystemError::Runtime("interpreter corrupt segment"),
+                ElfError::NoLoadSegments => SubsystemError::Runtime("interpreter missing segments"),
+            })?;
+
+            proc.set_env(String::from("INTERPRETEE"), program.clone());
+            proc.set_env(String::from("INTERPRETER"), interpreter_path.clone());
+            image = interpreter_image;
+            proc.set_program_image(interpreter_path, image, self.memory_manager())?;
+        } else {
+            proc.set_program_image(program, image, self.memory_manager())?;
+        }
         Ok(())
     }
 

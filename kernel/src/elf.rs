@@ -4,6 +4,7 @@
 //! little-endian ELF binaries for the x86-64 architecture and extracts the
 //! loadable segments so that the process layer can build an address space.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -45,8 +46,6 @@ pub enum ElfError {
     BadSegmentBounds,
     /// No loadable segments were found.
     NoLoadSegments,
-    /// Executable requests a dynamic interpreter which is not supported yet.
-    UnsupportedInterpreter,
 }
 
 impl fmt::Display for ElfError {
@@ -62,7 +61,6 @@ impl fmt::Display for ElfError {
             BadProgramHeaderBounds => write!(f, "program header table out of bounds"),
             BadSegmentBounds => write!(f, "segment bounds invalid"),
             NoLoadSegments => write!(f, "ELF contains no loadable segments"),
-            UnsupportedInterpreter => write!(f, "ELF requires an unsupported interpreter"),
         }
     }
 }
@@ -75,6 +73,7 @@ impl std::error::Error for ElfError {}
 pub struct ExecutableImage {
     entry_point: u64,
     segments: Vec<ExecutableSegment>,
+    interpreter: Option<String>,
 }
 
 impl ExecutableImage {
@@ -128,12 +127,30 @@ impl ExecutableImage {
         }
 
         let mut segments = Vec::new();
+        let mut interpreter = None;
         for index in 0..e_phnum {
             let offset = e_phoff + index * e_phentsize;
             let header = &data[offset..offset + e_phentsize];
             let p_type = read_u32(header, 0);
             if p_type == PT_INTERP {
-                return Err(ElfError::UnsupportedInterpreter);
+                let p_offset = read_u64(header, 8) as usize;
+                let p_filesz = read_u64(header, 32) as usize;
+                if p_filesz == 0 {
+                    continue;
+                }
+                if p_offset
+                    .checked_add(p_filesz)
+                    .map_or(true, |end| end > data.len())
+                {
+                    return Err(ElfError::BadSegmentBounds);
+                }
+                let raw = &data[p_offset..p_offset + p_filesz];
+                let terminator = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                let bytes = &raw[..terminator];
+                if let Ok(path) = core::str::from_utf8(bytes) {
+                    interpreter = Some(String::from(path));
+                }
+                continue;
             }
             if p_type != PT_LOAD {
                 continue;
@@ -182,6 +199,7 @@ impl ExecutableImage {
         Ok(Self {
             entry_point: e_entry,
             segments,
+            interpreter,
         })
     }
 
@@ -196,6 +214,7 @@ impl ExecutableImage {
         Ok(Self {
             entry_point,
             segments,
+            interpreter: None,
         })
     }
 
@@ -207,6 +226,11 @@ impl ExecutableImage {
     /// Loadable segments extracted from the ELF binary.
     pub fn segments(&self) -> &[ExecutableSegment] {
         &self.segments
+    }
+
+    /// Optional interpreter path extracted from the program headers.
+    pub fn interpreter(&self) -> Option<&str> {
+        self.interpreter.as_deref()
     }
 }
 
@@ -256,4 +280,75 @@ fn read_u64(data: &[u8], offset: usize) -> u64 {
         data[offset + 6],
         data[offset + 7],
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_u16(buf: &mut Vec<u8>, offset: usize, value: u16) {
+        if buf.len() < offset + 2 {
+            buf.resize(offset + 2, 0);
+        }
+        buf[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u32(buf: &mut Vec<u8>, offset: usize, value: u32) {
+        if buf.len() < offset + 4 {
+            buf.resize(offset + 4, 0);
+        }
+        buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u64(buf: &mut Vec<u8>, offset: usize, value: u64) {
+        if buf.len() < offset + 8 {
+            buf.resize(offset + 8, 0);
+        }
+        buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn parse_records_interpreter_path() {
+        let mut elf = vec![0u8; ELF_HDR_LEN];
+        elf[0..4].copy_from_slice(&ELF_MAGIC);
+        elf[4] = ELF_CLASS_64;
+        elf[5] = ELF_DATA_LITTLE;
+        write_u16(&mut elf, 16, ET_EXEC);
+        write_u16(&mut elf, 18, EM_X86_64);
+        write_u64(&mut elf, 24, 0x400000);
+
+        let program_header_offset = ELF_HDR_LEN as u64;
+        write_u64(&mut elf, 32, program_header_offset);
+        write_u16(&mut elf, 54, PHDR_LEN as u16);
+        write_u16(&mut elf, 56, 2);
+
+        let ph_table_len = (PHDR_LEN * 2) as usize;
+        elf.resize(ELF_HDR_LEN + ph_table_len, 0);
+
+        let load_ph = ELF_HDR_LEN;
+        let interp_ph = load_ph + PHDR_LEN as usize;
+
+        let load_data_offset = ELF_HDR_LEN + ph_table_len;
+        write_u32(&mut elf, load_ph, PT_LOAD);
+        write_u32(&mut elf, load_ph + 4, (PF_R | PF_X) as u32);
+        write_u64(&mut elf, load_ph + 8, load_data_offset as u64);
+        write_u64(&mut elf, load_ph + 16, 0x400000);
+        write_u64(&mut elf, load_ph + 32, 4);
+        write_u64(&mut elf, load_ph + 40, 4);
+
+        let interp_path = b"/lib64/ld-linux-x86-64.so.2\0";
+        let interp_data_offset = load_data_offset + 4;
+        write_u32(&mut elf, interp_ph, PT_INTERP);
+        write_u64(&mut elf, interp_ph + 8, interp_data_offset as u64);
+        write_u64(&mut elf, interp_ph + 32, interp_path.len() as u64);
+        write_u64(&mut elf, interp_ph + 40, interp_path.len() as u64);
+
+        elf.resize(interp_data_offset + interp_path.len(), 0);
+        elf[load_data_offset..load_data_offset + 4].copy_from_slice(&[0u8; 4]);
+        elf[interp_data_offset..interp_data_offset + interp_path.len()]
+            .copy_from_slice(interp_path);
+
+        let image = ExecutableImage::parse(&elf).expect("elf parses");
+        assert_eq!(image.interpreter(), Some("/lib64/ld-linux-x86-64.so.2"));
+    }
 }

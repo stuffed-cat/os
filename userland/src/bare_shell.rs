@@ -115,6 +115,8 @@ pub enum SystemError {
     PermissionDenied,
     /// Executable image was malformed or unsupported.
     InvalidExecutable,
+    /// Executable referenced an interpreter that was unavailable.
+    MissingInterpreter,
 }
 
 /// Result returned from launching an external executable via [`ShellSystem::exec`].
@@ -912,6 +914,10 @@ where
             Err(SystemError::FilesystemUnavailable) => self.println("exec: filesystem unavailable"),
             Err(SystemError::NotFound) => {
                 self.print("exec: command not found: ");
+                self.println(display);
+            }
+            Err(SystemError::MissingInterpreter) => {
+                self.print("exec: interpreter not found for ");
                 self.println(display);
             }
             Err(SystemError::PermissionDenied) => {

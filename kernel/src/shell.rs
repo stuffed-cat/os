@@ -360,7 +360,18 @@ fn map_exec_error(err: SubsystemError) -> SystemError {
             | "corrupt segment"
             | "executable truncated"
             | "executable missing segments"
-            | "unsupported elf interpreter" => SystemError::InvalidExecutable,
+            | "interpreter truncated"
+            | "interpreter invalid magic"
+            | "interpreter unsupported class"
+            | "interpreter unsupported endian"
+            | "interpreter unsupported type"
+            | "interpreter unsupported arch"
+            | "interpreter corrupt program header"
+            | "interpreter corrupt segment"
+            | "interpreter missing segments"
+            | "interpreter recursion detected" => SystemError::InvalidExecutable,
+            "interpreter not found" => SystemError::MissingInterpreter,
+            "interpreter read failure" => SystemError::Failed,
             _ => SystemError::Failed,
         },
         SubsystemError::Init(_) | SubsystemError::Resource(_) => SystemError::Failed,
