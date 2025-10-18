@@ -152,6 +152,31 @@ impl Process {
         self.threads.write().insert(tid, state);
     }
 
+    /// Returns a snapshot of the thread state for the provided TID.
+    pub fn thread_state(&self, tid: Tid) -> Option<ThreadState> {
+        self.threads.read().get(&tid).cloned()
+    }
+
+    /// Updates the lifecycle status for the given thread, returning whether it existed.
+    pub fn set_thread_status(&self, tid: Tid, status: ThreadStatus) -> bool {
+        let mut threads = self.threads.write();
+        if let Some(state) = threads.get_mut(&tid) {
+            state.set_status(status);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns the first registered thread for this process, if any.
+    pub fn main_thread(&self) -> Option<(Tid, ThreadState)> {
+        self.threads
+            .read()
+            .iter()
+            .next()
+            .map(|(tid, state)| (*tid, state.clone()))
+    }
+
     /// Allocates a fresh thread identifier.
     pub fn allocate_tid(&self) -> Tid {
         let id = self.next_tid.fetch_add(1, Ordering::SeqCst);

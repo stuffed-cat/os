@@ -90,6 +90,8 @@ pub trait ShellSystem {
     fn reboot(&self) -> Result<(), SystemError>;
     /// Requests a system shutdown/power off.
     fn shutdown(&self) -> Result<(), SystemError>;
+    /// Launches an external executable with the provided arguments in the current working directory.
+    fn exec(&self, path: &str, args: &[&str], cwd: &str) -> Result<ExecResult, SystemError>;
 }
 
 /// Errors returned by platform control hooks.
@@ -99,6 +101,21 @@ pub enum SystemError {
     Unsupported,
     /// Operation failed unexpectedly.
     Failed,
+    /// Requested executable was not found.
+    NotFound,
+    /// Filesystem service is currently unavailable.
+    FilesystemUnavailable,
+    /// Access to the executable was denied.
+    PermissionDenied,
+    /// Executable image was malformed or unsupported.
+    InvalidExecutable,
+}
+
+/// Result returned from launching an external executable via [`ShellSystem::exec`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecResult {
+    /// Process identifier assigned to the spawned program.
+    pub pid: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,7 +176,7 @@ struct CommandBinary {
 
 enum CommandExecutable {
     Builtin(BuiltinCommand),
-    Binary(CommandBinary),
+    External { path: String },
 }
 
 enum CommandResolutionError {
@@ -267,7 +284,7 @@ where
                 let args: Vec<&str> = parts.collect();
                 match self.resolve_command(cmd) {
                     Ok(CommandExecutable::Builtin(builtin)) => self.run_builtin(builtin, &args),
-                    Ok(CommandExecutable::Binary(binary)) => self.run_binary(&binary, &args),
+                    Ok(CommandExecutable::External { path }) => self.run_external(&path, &args),
                     Err(CommandResolutionError::InvalidFormat) => {
                         self.print("unsupported executable format: ");
                         self.println(cmd);
@@ -623,9 +640,13 @@ where
 
         let path = format!("/bin/{name}");
         match self.fs.read_file(&path) {
-            Ok(data) => self
-                .parse_command_binary(&data)
-                .map(CommandExecutable::Binary),
+            Ok(data) => match self.parse_command_binary(&data) {
+                Ok(binary) => Ok(CommandExecutable::Builtin(binary.builtin)),
+                Err(CommandResolutionError::InvalidFormat) => {
+                    Ok(CommandExecutable::External { path })
+                }
+                Err(other) => Err(other),
+            },
             Err(FsError::NotFound) | Err(FsError::NotDirectory) | Err(FsError::NotFile) => {
                 Err(CommandResolutionError::NotFound)
             }
@@ -849,8 +870,34 @@ where
         (value + align - 1) & !(align - 1)
     }
 
-    fn run_binary(&mut self, binary: &CommandBinary, args: &[&str]) {
-        self.run_builtin(binary.builtin, args);
+    fn run_external(&mut self, path: &str, args: &[&str]) {
+        let display = path.rsplit('/').next().unwrap_or(path);
+        match self.sys.exec(path, args, &self.current_dir) {
+            Ok(result) => {
+                self.print("launched process pid ");
+                self.println(&result.pid.to_string());
+            }
+            Err(SystemError::Unsupported) => {
+                self.println("exec: operation not supported on this build")
+            }
+            Err(SystemError::FilesystemUnavailable) => self.println("exec: filesystem unavailable"),
+            Err(SystemError::NotFound) => {
+                self.print("exec: command not found: ");
+                self.println(display);
+            }
+            Err(SystemError::PermissionDenied) => {
+                self.print("exec: permission denied: ");
+                self.println(display);
+            }
+            Err(SystemError::InvalidExecutable) => {
+                self.print("exec: invalid executable: ");
+                self.println(display);
+            }
+            Err(SystemError::Failed) => {
+                self.print("exec: failed to launch ");
+                self.println(display);
+            }
+        }
     }
 
     fn command_reboot(&mut self) {
@@ -861,6 +908,7 @@ where
                     self.println("reboot: operation unsupported on this build")
                 }
                 SystemError::Failed => self.println("reboot: hardware did not respond"),
+                _ => self.println("reboot: unexpected system error"),
             }
         }
     }
@@ -873,6 +921,7 @@ where
                     self.println("shutdown: operation unsupported on this build")
                 }
                 SystemError::Failed => self.println("shutdown: hardware did not respond"),
+                _ => self.println("shutdown: unexpected system error"),
             }
         }
     }
@@ -903,10 +952,8 @@ where
             "sh" => Some(BuiltinCommand::Shell),
             "help" => Some(BuiltinCommand::Help),
             "history" => Some(BuiltinCommand::History),
-            "ls" => Some(BuiltinCommand::Ls),
             "pwd" => Some(BuiltinCommand::Pwd),
             "cd" => Some(BuiltinCommand::Cd),
-            "cat" => Some(BuiltinCommand::Cat),
             "echo" => Some(BuiltinCommand::Echo),
             "touch" => Some(BuiltinCommand::Touch),
             "mkdir" => Some(BuiltinCommand::Mkdir),
@@ -1221,6 +1268,10 @@ mod tests {
         }
 
         fn shutdown(&self) -> Result<(), SystemError> {
+            Err(SystemError::Unsupported)
+        }
+
+        fn exec(&self, _path: &str, _args: &[&str], _cwd: &str) -> Result<ExecResult, SystemError> {
             Err(SystemError::Unsupported)
         }
     }

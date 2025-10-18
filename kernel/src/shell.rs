@@ -4,13 +4,24 @@ use crate::arch::x86_64::serial;
 use crate::core::{KernelContext, Subsystem, SubsystemId};
 use crate::error::SubsystemError;
 use crate::fs::{self, EntryKind as FsEntryKind, FsError as KernelFsError};
+use crate::memory::MemoryManager;
+use crate::process::ProcessTable;
+#[cfg(not(feature = "std"))]
+use crate::scheduler::SchedulingClass;
+use crate::scheduler::{RunQueueEntry, Scheduler, ThreadStatus};
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
+use alloc::string::ToString;
 use alloc::vec::Vec;
+#[cfg(not(feature = "std"))]
+use core::task::Poll;
 use log::info;
+#[cfg(not(feature = "std"))]
+use log::warn;
 use spin::Mutex;
 use userland::{
-    BareShell, DirEntry, EntryKind, FsError as ShellFsError, ShellFs, ShellIo, ShellSystem,
-    SystemError,
+    BareShell, DirEntry, EntryKind, ExecResult, FsError as ShellFsError, ShellFs, ShellIo,
+    ShellSystem, SystemError,
 };
 
 const SCANCODE_QUEUE_CAPACITY: usize = 256;
@@ -20,18 +31,60 @@ static SCANCODE_QUEUE: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
 /// Shell subsystem bridging keyboard interrupts and the userland shell loop.
 pub struct ShellSubsystem {
     shell: BareShell<SerialShellIo, KernelShellFs, KernelShellSystem>,
+    process_table: &'static ProcessTable,
+    #[cfg_attr(feature = "std", allow(dead_code))]
+    scheduler: &'static Scheduler,
 }
 
 impl ShellSubsystem {
     /// Creates a new shell subsystem instance.
     pub fn new() -> Self {
+        let process_table = Box::leak(Box::new(ProcessTable::new()));
+        let scheduler = Box::leak(Box::new(Scheduler::new()));
+        let system = KernelShellSystem::new(process_table, scheduler);
+
         Self {
-            shell: BareShell::new(SerialShellIo, KernelShellFs, KernelShellSystem),
+            shell: BareShell::new(SerialShellIo, KernelShellFs, system),
+            process_table,
+            scheduler,
         }
     }
 
     fn poll_shell(&mut self) {
         self.shell.poll();
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn run_ready_threads(&mut self) {
+        while let Poll::Ready(entry) = self.scheduler.tick() {
+            match entry.class {
+                SchedulingClass::User => {
+                    if let Some(process) = self.process_table.lookup(entry.pid) {
+                        if let Some(thread) = process.thread_state(entry.tid) {
+                            process.set_thread_status(entry.tid, ThreadStatus::Running);
+                            unsafe {
+                                thread.enter_user_mode();
+                            }
+                        } else {
+                            warn!(
+                                "scheduler: missing thread state for pid={} tid={}",
+                                entry.pid.as_u64(),
+                                entry.tid.as_u64()
+                            );
+                        }
+                    } else {
+                        warn!("scheduler: missing process for pid={}", entry.pid.as_u64());
+                    }
+                }
+                SchedulingClass::Kernel => {
+                    warn!(
+                        "scheduler: kernel thread scheduling not implemented (pid={} tid={})",
+                        entry.pid.as_u64(),
+                        entry.tid.as_u64()
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -40,13 +93,20 @@ impl Subsystem for ShellSubsystem {
         SubsystemId("shell")
     }
 
-    fn init(&mut self, _ctx: &KernelContext) -> Result<(), SubsystemError> {
+    fn init(&mut self, ctx: &KernelContext) -> Result<(), SubsystemError> {
+        if let Some(hal) = ctx.hal() {
+            let manager: &'static MemoryManager =
+                unsafe { &*(hal.memory() as *const MemoryManager) };
+            self.process_table.bind_memory_manager(manager);
+        }
         info!("userland shell initialized");
         Ok(())
     }
 
     fn tick(&mut self, _ctx: &KernelContext) -> Result<(), SubsystemError> {
         self.poll_shell();
+        #[cfg(not(feature = "std"))]
+        self.run_ready_threads();
         Ok(())
     }
 }
@@ -67,7 +127,20 @@ impl ShellIo for SerialShellIo {
 
 struct KernelShellFs;
 
-struct KernelShellSystem;
+#[derive(Clone, Copy)]
+struct KernelShellSystem {
+    process_table: &'static ProcessTable,
+    scheduler: &'static Scheduler,
+}
+
+impl KernelShellSystem {
+    fn new(process_table: &'static ProcessTable, scheduler: &'static Scheduler) -> Self {
+        Self {
+            process_table,
+            scheduler,
+        }
+    }
+}
 
 impl ShellFs for KernelShellFs {
     fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>, ShellFsError> {
@@ -222,6 +295,34 @@ impl ShellSystem for KernelShellSystem {
             Err(SystemError::Unsupported)
         }
     }
+
+    fn exec(&self, path: &str, args: &[&str], cwd: &str) -> Result<ExecResult, SystemError> {
+        let process = self.process_table.spawn();
+        let pid = process.pid();
+
+        process.set_cwd(cwd.to_string());
+        process.set_env("PWD".to_string(), cwd.to_string());
+
+        let display = path.rsplit('/').next().unwrap_or(path);
+        process.set_env("ARGV0".to_string(), display.to_string());
+        process.set_env("ARGC".to_string(), (args.len() + 1).to_string());
+        for (index, arg) in args.iter().enumerate() {
+            process.set_env(format!("ARG{}", index + 1), (*arg).to_string());
+        }
+
+        let program = path.to_string();
+        if let Err(err) = self.process_table.exec(pid, program) {
+            return Err(map_exec_error(err));
+        }
+
+        let (tid, _) = process
+            .main_thread()
+            .ok_or(SystemError::InvalidExecutable)?;
+        process.set_thread_status(tid, ThreadStatus::Ready);
+        self.scheduler.enqueue(RunQueueEntry::user(pid, tid));
+
+        Ok(ExecResult { pid: pid.as_u64() })
+    }
 }
 
 /// Enqueues a raw keyboard scancode for shell processing.
@@ -231,4 +332,25 @@ pub fn enqueue_scancode(scancode: u8) {
         queue.pop_front();
     }
     queue.push_back(scancode);
+}
+
+fn map_exec_error(err: SubsystemError) -> SystemError {
+    match err {
+        SubsystemError::Runtime(msg) => match msg {
+            "executable not found" => SystemError::NotFound,
+            "filesystem unavailable" => SystemError::FilesystemUnavailable,
+            "permission denied" => SystemError::PermissionDenied,
+            "invalid executable magic"
+            | "unsupported elf class"
+            | "unsupported elf endian"
+            | "unsupported elf type"
+            | "unsupported elf arch"
+            | "corrupt program header"
+            | "corrupt segment"
+            | "executable truncated"
+            | "executable missing segments" => SystemError::InvalidExecutable,
+            _ => SystemError::Failed,
+        },
+        SubsystemError::Init(_) | SubsystemError::Resource(_) => SystemError::Failed,
+    }
 }

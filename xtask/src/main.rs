@@ -250,7 +250,7 @@ fn copy_userland_execs(workspace_root: &Path, bin_dir: &Path) -> Result<()> {
                 artifact.display()
             );
         }
-        let destination = bin_dir.join(format!("{cmd}.exec"));
+        let destination = bin_dir.join(cmd);
         fs::copy(&artifact, &destination).with_context(|| {
             format!(
                 "failed to copy {} to {}",
@@ -258,6 +258,18 @@ fn copy_userland_execs(workspace_root: &Path, bin_dir: &Path) -> Result<()> {
                 destination.display()
             )
         })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&destination)
+                .with_context(|| format!("failed to stat {}", destination.display()))?
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&destination, permissions).with_context(|| {
+                format!("failed to update permissions for {}", destination.display())
+            })?;
+        }
     }
 
     Ok(())
