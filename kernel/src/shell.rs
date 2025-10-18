@@ -85,6 +85,8 @@ impl ShellFs for KernelShellFs {
                     },
                     size: entry.size,
                     mode: entry.mode,
+                    uid: entry.uid,
+                    gid: entry.gid,
                     inode: entry.inode,
                 })
                 .collect()),
@@ -93,6 +95,7 @@ impl ShellFs for KernelShellFs {
             }
             Err(KernelFsError::InvalidImage) => Err(ShellFsError::Corrupt),
             Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
+            Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
             Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
             Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
         }
@@ -106,6 +109,7 @@ impl ShellFs for KernelShellFs {
             }
             Err(KernelFsError::InvalidImage) => Err(ShellFsError::Corrupt),
             Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
+            Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
             Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
             Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
         }

@@ -165,6 +165,8 @@ pub enum FsError {
     NotFile,
     /// Filesystem image is corrupt or unreadable.
     Corrupt,
+    /// Operation denied due to insufficient permissions.
+    PermissionDenied,
 }
 
 /// Directory entry returned by [`ShellFs`].
@@ -178,6 +180,10 @@ pub struct DirEntry {
     pub size: u64,
     /// Raw inode mode bits.
     pub mode: u16,
+    /// Owning user identifier.
+    pub uid: u32,
+    /// Owning group identifier.
+    pub gid: u32,
     /// Inode number associated with the entry.
     pub inode: u32,
 }
@@ -254,6 +260,9 @@ where
                     Err(CommandResolutionError::Filesystem(FsError::Corrupt)) => {
                         self.println("filesystem corrupt")
                     }
+                    Err(CommandResolutionError::Filesystem(FsError::PermissionDenied)) => {
+                        self.println("permission denied")
+                    }
                     Err(CommandResolutionError::Filesystem(_)) => self.println("command not found"),
                     Err(CommandResolutionError::NotFound) => self.println("command not found"),
                 }
@@ -314,7 +323,12 @@ where
                         self.print(":\r\n");
                     }
                     first_section = false;
-                    self.print_directory_entries(entries, options.color_mode, options.show_hidden);
+                    self.print_directory_entries(
+                        entries,
+                        options.color_mode,
+                        options.show_hidden,
+                        options.long,
+                    );
                 }
                 Err(FsError::Unavailable) => self.println("ls: filesystem unavailable"),
                 Err(FsError::NotFound) => {
@@ -325,6 +339,7 @@ where
                     self.print("ls: not a directory: ");
                     self.println(&display);
                 }
+                Err(FsError::PermissionDenied) => self.println("ls: permission denied"),
                 Err(FsError::Corrupt) => self.println("ls: filesystem corrupt"),
             }
         }
@@ -366,6 +381,7 @@ where
                     self.println("/");
                 }
             }
+            Err(FsError::PermissionDenied) => self.println("cd: permission denied"),
             Err(FsError::Corrupt) => self.println("cd: filesystem corrupt"),
         }
     }
@@ -392,6 +408,7 @@ where
                     self.print("cat: path is not a regular file: ");
                     self.println(arg);
                 }
+                Err(FsError::PermissionDenied) => self.println("cat: permission denied"),
                 Err(FsError::Corrupt) => self.println("cat: filesystem corrupt"),
             }
         }
@@ -440,6 +457,9 @@ where
             Err(FsError::Unavailable) => {
                 Err(CommandResolutionError::Filesystem(FsError::Unavailable))
             }
+            Err(FsError::PermissionDenied) => Err(CommandResolutionError::Filesystem(
+                FsError::PermissionDenied,
+            )),
             Err(FsError::Corrupt) => Err(CommandResolutionError::Filesystem(FsError::Corrupt)),
         }
     }
@@ -762,6 +782,7 @@ where
                     "--help" => options.help = true,
                     "--all" | "--almost-all" => options.show_hidden = true,
                     "--color" => options.color_mode = ColorMode::Always,
+                    "--long" => options.long = true,
                     _ => {
                         if let Some(value) = arg.strip_prefix("--color=") {
                             match value {
@@ -789,6 +810,7 @@ where
                     match ch {
                         'a' | 'A' => options.show_hidden = true,
                         'h' => options.help = true,
+                        'l' => options.long = true,
                         _ => {
                             self.println(&format!("ls: unsupported flag -{ch}"));
                             return Err(());
@@ -808,6 +830,7 @@ where
         self.println("用法: ls [选项]... [路径]");
         self.println("简化版 ls 支持以下选项:");
         self.println("  -a, --all           显示以 '.' 开头的文件");
+        self.println("  -l, --long          以长格式显示权限、所有者和大小");
         self.println("  -h, --help          显示本帮助信息");
         self.println("      --color[=WHEN]  启用彩色输出，WHEN=auto|always|never");
         self.println("");
@@ -819,27 +842,75 @@ where
         entries: Vec<DirEntry>,
         color_mode: ColorMode,
         show_hidden: bool,
+        long_format: bool,
     ) {
-        let mut first = true;
+        let mut printed_any = false;
+
         for entry in entries {
             if !show_hidden && entry.name.starts_with('.') {
                 continue;
             }
-            if !first {
-                self.print("  ");
-            }
-            first = false;
 
-            let mut display_name = entry.name.clone();
-            if matches!(entry.kind, EntryKind::Directory) {
-                display_name.push('/');
+            if long_format {
+                if printed_any {
+                    self.print("\r\n");
+                }
+                let mode_str = Self::format_mode_string(entry.kind, entry.mode);
+                let uid = entry.uid;
+                let gid = entry.gid;
+                let size = entry.size;
+                let mut display_name = entry.name.clone();
+                if matches!(entry.kind, EntryKind::Directory) {
+                    display_name.push('/');
+                }
+                let colored = self.apply_color(&display_name, entry.kind, color_mode);
+                self.print(&format!(
+                    "{} {:>5} {:>5} {:>10} {}",
+                    mode_str, uid, gid, size, colored
+                ));
+            } else {
+                if printed_any {
+                    self.print("  ");
+                }
+                let mut display_name = entry.name.clone();
+                if matches!(entry.kind, EntryKind::Directory) {
+                    display_name.push('/');
+                }
+                let colored = self.apply_color(&display_name, entry.kind, color_mode);
+                self.print(&colored);
             }
-            let colored = self.apply_color(&display_name, entry.kind, color_mode);
-            self.print(&colored);
+
+            printed_any = true;
         }
 
-        if !first {
+        if printed_any {
             self.print("\r\n");
+        }
+    }
+
+    fn format_mode_string(kind: EntryKind, mode: u16) -> String {
+        let mut result = String::with_capacity(10);
+        result.push(match kind {
+            EntryKind::Directory => 'd',
+            EntryKind::File => '-',
+        });
+        result.push(Self::permission_char(mode, 0o400, 'r'));
+        result.push(Self::permission_char(mode, 0o200, 'w'));
+        result.push(Self::permission_char(mode, 0o100, 'x'));
+        result.push(Self::permission_char(mode, 0o040, 'r'));
+        result.push(Self::permission_char(mode, 0o020, 'w'));
+        result.push(Self::permission_char(mode, 0o010, 'x'));
+        result.push(Self::permission_char(mode, 0o004, 'r'));
+        result.push(Self::permission_char(mode, 0o002, 'w'));
+        result.push(Self::permission_char(mode, 0o001, 'x'));
+        result
+    }
+
+    fn permission_char(mode: u16, bit: u16, ch: char) -> char {
+        if (mode & bit) != 0 {
+            ch
+        } else {
+            '-'
         }
     }
 

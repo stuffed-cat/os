@@ -4,11 +4,12 @@ use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use spin::RwLock;
 
-use crate::{error::SubsystemError, memory::Capability, scheduler::ThreadState};
+use crate::{error::SubsystemError, fs::Credentials, memory::Capability, scheduler::ThreadState};
 use log::trace;
 
 /// Process identifier type.
@@ -53,10 +54,14 @@ pub struct Process {
     parent: RwLock<Option<Pid>>,
     program: RwLock<Option<String>>,
     fds: RwLock<BTreeMap<u64, String>>,
+    fd_offsets: RwLock<BTreeMap<u64, usize>>,
     next_fd: AtomicU64,
     cwd: RwLock<String>,
     env: RwLock<BTreeMap<String, String>>,
     pipe_seed: AtomicU64,
+    uid: AtomicU32,
+    gid: AtomicU32,
+    groups: RwLock<Vec<u32>>,
 }
 
 impl Process {
@@ -71,10 +76,14 @@ impl Process {
             parent: RwLock::new(None),
             program: RwLock::new(None),
             fds: RwLock::new(BTreeMap::new()),
+            fd_offsets: RwLock::new(BTreeMap::new()),
             next_fd: AtomicU64::new(3),
             cwd: RwLock::new(String::from("/")),
             env: RwLock::new(BTreeMap::new()),
             pipe_seed: AtomicU64::new(1),
+            uid: AtomicU32::new(0),
+            gid: AtomicU32::new(0),
+            groups: RwLock::new(vec![0]),
         });
 
         process.set_fd(0, String::from("tty:stdin"));
@@ -147,7 +156,13 @@ impl Process {
 
     /// Inserts a descriptor binding.
     pub fn insert_fd(&self, fd: u64, path: String) {
+        let is_path = Self::descriptor_is_path(&path);
         self.fds.write().insert(fd, path);
+        if is_path {
+            self.reset_fd_offset(fd);
+        } else {
+            self.remove_fd_offset(fd);
+        }
         self.ensure_next_fd(fd.saturating_add(1));
     }
 
@@ -158,12 +173,22 @@ impl Process {
 
     /// Removes a descriptor binding, returning whether it existed.
     pub fn remove_fd(&self, fd: u64) -> bool {
-        self.fds.write().remove(&fd).is_some()
+        let removed = self.fds.write().remove(&fd).is_some();
+        if removed {
+            self.remove_fd_offset(fd);
+        }
+        removed
     }
 
     /// Forcefully assigns a descriptor binding, replacing any existing entry.
     pub fn set_fd(&self, fd: u64, descriptor: String) {
+        let is_path = Self::descriptor_is_path(&descriptor);
         self.fds.write().insert(fd, descriptor);
+        if is_path {
+            self.reset_fd_offset(fd);
+        } else {
+            self.remove_fd_offset(fd);
+        }
         self.ensure_next_fd(fd.saturating_add(1));
     }
 
@@ -187,6 +212,44 @@ impl Process {
         self.env.write().insert(key, value);
     }
 
+    fn descriptor_is_path(descriptor: &str) -> bool {
+        descriptor.starts_with('/')
+    }
+
+    fn reset_fd_offset(&self, fd: u64) {
+        self.fd_offsets.write().insert(fd, 0);
+    }
+
+    fn remove_fd_offset(&self, fd: u64) {
+        self.fd_offsets.write().remove(&fd);
+    }
+
+    /// Returns the current offset for the provided descriptor, if tracked.
+    pub fn fd_offset(&self, fd: u64) -> Option<usize> {
+        self.fd_offsets.read().get(&fd).copied()
+    }
+
+    /// Overrides the offset for an existing descriptor.
+    pub fn set_fd_offset(&self, fd: u64, offset: usize) {
+        self.fd_offsets.write().insert(fd, offset);
+    }
+
+    /// Advances the tracked offset for a descriptor.
+    pub fn advance_fd_offset(&self, fd: u64, amount: usize) {
+        let mut offsets = self.fd_offsets.write();
+        let entry = offsets.entry(fd).or_insert(0);
+        *entry = entry.saturating_add(amount);
+    }
+
+    /// Copies the offset from one descriptor to another, if present.
+    pub fn copy_fd_offset(&self, source: u64, target: u64) {
+        if let Some(offset) = self.fd_offset(source) {
+            self.set_fd_offset(target, offset);
+        } else {
+            self.remove_fd_offset(target);
+        }
+    }
+
     /// Returns an iterator snapshot of all environment variables.
     pub fn env_snapshot(&self) -> BTreeMap<String, String> {
         self.env.read().clone()
@@ -195,6 +258,53 @@ impl Process {
     /// Generates a unique identifier for pipe bookkeeping.
     pub fn next_pipe_id(&self) -> u64 {
         self.pipe_seed.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Returns the user identifier associated with this process.
+    pub fn uid(&self) -> u32 {
+        self.uid.load(Ordering::SeqCst)
+    }
+
+    /// Returns the primary group identifier associated with this process.
+    pub fn gid(&self) -> u32 {
+        self.gid.load(Ordering::SeqCst)
+    }
+
+    /// Updates the user identifier for this process.
+    pub fn set_uid(&self, uid: u32) {
+        self.uid.store(uid, Ordering::SeqCst);
+    }
+
+    /// Updates the primary group identifier for this process.
+    pub fn set_gid(&self, gid: u32) {
+        self.gid.store(gid, Ordering::SeqCst);
+    }
+
+    /// Returns the supplemental groups for this process.
+    pub fn supplemental_groups(&self) -> Vec<u32> {
+        self.groups.read().clone()
+    }
+
+    /// Replaces the supplemental groups for this process.
+    pub fn set_groups(&self, groups: Vec<u32>) {
+        *self.groups.write() = groups;
+    }
+
+    /// Replaces all credential information at once.
+    pub fn set_credentials(&self, uid: u32, gid: u32, groups: Vec<u32>) {
+        self.set_uid(uid);
+        self.set_gid(gid);
+        self.set_groups(groups);
+    }
+
+    /// Returns a credential snapshot for filesystem access checks.
+    pub fn credentials(&self) -> Credentials {
+        let mut groups = self.groups.read().clone();
+        let primary_gid = self.gid();
+        if !groups.iter().any(|&g| g == primary_gid) {
+            groups.push(primary_gid);
+        }
+        Credentials::new(self.uid(), primary_gid, groups)
     }
 
     fn ensure_next_fd(&self, candidate: u64) {
@@ -217,6 +327,7 @@ impl Process {
         *target.capabilities.write() = self.capabilities.read().clone();
         *target.program.write() = self.program.read().clone();
         *target.fds.write() = self.fds.read().clone();
+        *target.fd_offsets.write() = self.fd_offsets.read().clone();
         target
             .next_fd
             .store(self.next_fd.load(Ordering::SeqCst), Ordering::SeqCst);
@@ -225,6 +336,13 @@ impl Process {
         target
             .pipe_seed
             .store(self.pipe_seed.load(Ordering::SeqCst), Ordering::SeqCst);
+        target
+            .uid
+            .store(self.uid.load(Ordering::SeqCst), Ordering::SeqCst);
+        target
+            .gid
+            .store(self.gid.load(Ordering::SeqCst), Ordering::SeqCst);
+        *target.groups.write() = self.groups.read().clone();
     }
 }
 
@@ -330,6 +448,7 @@ impl ProcessTable {
             .ok_or(SubsystemError::Runtime("fd not found"))?;
         let new_fd = proc.next_fd();
         proc.insert_fd(new_fd, descriptor);
+        proc.copy_fd_offset(fd, new_fd);
         Ok(new_fd)
     }
 
@@ -342,6 +461,7 @@ impl ProcessTable {
             .get_fd(fd)
             .ok_or(SubsystemError::Runtime("fd not found"))?;
         proc.set_fd(target_fd, descriptor);
+        proc.copy_fd_offset(fd, target_fd);
         Ok(target_fd)
     }
 

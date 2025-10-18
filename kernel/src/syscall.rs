@@ -128,6 +128,10 @@ fn map_errno(errno: Errno, id: SyscallId) -> KernelError {
             id: "posix",
             source: SubsystemError::Runtime("invalid argument"),
         },
+        Errno::NotDir => KernelError::Subsystem {
+            id: "posix",
+            source: SubsystemError::Runtime("not a directory"),
+        },
         Errno::NoImpl => match id {
             SyscallId::Unknown(_) => KernelError::Unimplemented("unknown syscall"),
             _ => KernelError::Unimplemented("syscall not implemented"),

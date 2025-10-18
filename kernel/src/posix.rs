@@ -11,6 +11,7 @@ use spin::RwLock;
 use crate::{
     arch::x86_64::serial,
     error::SubsystemError,
+    fs::{self, FsError},
     process::{Pid, ProcessTable, WaitError},
     syscall::SyscallId,
 };
@@ -38,7 +39,16 @@ pub enum Errno {
     Inval = 22,
     /// Function not implemented.
     NoImpl = 38,
+    /// Not a directory.
+    NotDir = 20,
 }
+
+const O_RDONLY: u64 = 0;
+const O_WRONLY: u64 = 1;
+const O_RDWR: u64 = 2;
+const O_ACCMODE: u64 = 0b11;
+const O_APPEND: u64 = 0o2000;
+const O_TRUNC: u64 = 0o1000;
 
 impl Errno {
     /// Converts to i32.
@@ -92,7 +102,7 @@ impl<'a> PosixLayer<'a> {
                 let fd = args.get(0).copied().unwrap_or_default();
                 let buf = args.get(1).copied().unwrap_or_default();
                 let len = args.get(2).copied().unwrap_or_default();
-                self.write(pid, fd, buf, len).map_err(Errno::from_subsystem)
+                self.write(pid, fd, buf, len)
             }
             SyscallId::Read => {
                 let fd = args.get(0).copied().unwrap_or_default();
@@ -159,18 +169,17 @@ impl<'a> PosixLayer<'a> {
         self.next_handle.fetch_add(1, Ordering::SeqCst)
     }
 
-    fn write(&self, pid: Pid, fd: u64, buf: u64, len: u64) -> Result<u64, SubsystemError> {
+    fn write(&self, pid: Pid, fd: u64, buf: u64, len: u64) -> Result<u64, Errno> {
         if len == 0 {
             return Ok(0);
         }
 
         if buf == 0 {
-            return Err(SubsystemError::Runtime("null buffer"));
+            return Err(Errno::Inval);
         }
 
-        let descriptor = self
-            .descriptor_for(pid, fd)
-            .ok_or(SubsystemError::Runtime("fd not found"))?;
+        let proc = self.process_table.lookup(pid).ok_or(Errno::NoEnt)?;
+        let descriptor = proc.get_fd(fd).ok_or(Errno::Badf)?;
         let data = unsafe { slice::from_raw_parts(buf as *const u8, len as usize) };
 
         match self.classify_descriptor(&descriptor) {
@@ -183,23 +192,33 @@ impl<'a> PosixLayer<'a> {
                 end: PipeEnd::Write,
             } => {
                 let mut pipes = self.pipes.write();
-                let state = pipes
-                    .get_mut(&id)
-                    .ok_or(SubsystemError::Runtime("pipe not found"))?;
+                let state = pipes.get_mut(&id).ok_or(Errno::Inval)?;
                 Ok(state.write(data) as u64)
             }
-            Descriptor::Pipe { .. } => Err(SubsystemError::Runtime("write on read end")),
-            Descriptor::Path => Ok(len),
-            Descriptor::Unknown => Err(SubsystemError::Runtime("unsupported descriptor")),
-            Descriptor::StdIn => Err(SubsystemError::Runtime("write on stdin")),
+            Descriptor::Pipe { .. } => Err(Errno::Badf),
+            Descriptor::Path => {
+                let creds = proc.credentials();
+                let offset = proc.fd_offset(fd).unwrap_or(0);
+                match fs::write_file_with_credentials(&descriptor, &creds, offset, data, false) {
+                    Ok(written) => {
+                        proc.advance_fd_offset(fd, written);
+                        Ok(written as u64)
+                    }
+                    Err(FsError::PermissionDenied) => Err(Errno::Perm),
+                    Err(FsError::NotFound) => Err(Errno::NoEnt),
+                    Err(FsError::NotDirectory) => Err(Errno::NotDir),
+                    Err(FsError::NotFile) => Err(Errno::Inval),
+                    Err(FsError::Unsupported) => Err(Errno::NoImpl),
+                    Err(_) => Err(Errno::NoImpl),
+                }
+            }
+            Descriptor::Unknown => Err(Errno::NoImpl),
+            Descriptor::StdIn => Err(Errno::Badf),
         }
     }
 
     fn read(&self, pid: Pid, fd: u64, buf: u64, len: u64) -> Result<u64, Errno> {
         let proc = self.process_table.lookup(pid).ok_or(Errno::NoEnt)?;
-        if proc.get_fd(fd).is_none() {
-            return Err(Errno::Inval);
-        }
         if len == 0 {
             return Ok(0);
         }
@@ -227,20 +246,78 @@ impl<'a> PosixLayer<'a> {
             Descriptor::Pipe { .. } => Err(Errno::Badf),
             Descriptor::StdOut | Descriptor::StdErr => Err(Errno::Badf),
             Descriptor::Path => {
-                for byte in buffer.iter_mut() {
-                    *byte = 0;
+                let creds = proc.credentials();
+                match fs::read_file_with_credentials(&descriptor, &creds) {
+                    Ok(data) => {
+                        let offset = proc.fd_offset(fd).unwrap_or(0);
+                        if offset >= data.len() {
+                            return Ok(0);
+                        }
+                        let available = &data[offset..];
+                        let to_copy = core::cmp::min(available.len(), buffer.len());
+                        buffer[..to_copy].copy_from_slice(&available[..to_copy]);
+                        proc.advance_fd_offset(fd, to_copy);
+                        Ok(to_copy as u64)
+                    }
+                    Err(FsError::PermissionDenied) => Err(Errno::Perm),
+                    Err(FsError::NotFound) => Err(Errno::NoEnt),
+                    Err(FsError::NotDirectory) => Err(Errno::NotDir),
+                    Err(FsError::NotFile) => Err(Errno::Inval),
+                    Err(_) => Err(Errno::NoImpl),
                 }
-                Ok(len)
             }
             Descriptor::Unknown => Err(Errno::NoImpl),
         }
     }
 
-    fn open(&self, pid: Pid, path: &str, _flags: u64) -> Result<u64, Errno> {
+    fn open(&self, pid: Pid, path: &str, flags: u64) -> Result<u64, Errno> {
         let normalized = Self::normalize_path(path);
-        self.process_table
-            .open(pid, normalized)
-            .map_err(Errno::from_subsystem)
+        let proc = self.process_table.lookup(pid).ok_or(Errno::NoEnt)?;
+        let creds = proc.credentials();
+
+        let accmode = flags & O_ACCMODE;
+        let require_read = accmode == O_RDONLY || accmode == O_RDWR;
+        let require_write = accmode == O_WRONLY || accmode == O_RDWR;
+
+        let mut info = match fs::file_info_with_credentials(
+            &normalized,
+            &creds,
+            require_read,
+            require_write,
+        ) {
+            Ok(info) => info,
+            Err(FsError::PermissionDenied) => return Err(Errno::Perm),
+            Err(FsError::NotFound) => return Err(Errno::NoEnt),
+            Err(FsError::NotDirectory) => return Err(Errno::NotDir),
+            Err(FsError::NotFile) => return Err(Errno::Inval),
+            Err(FsError::Unsupported) => return Err(Errno::NoImpl),
+            Err(_) => return Err(Errno::NoImpl),
+        };
+
+        if (flags & O_TRUNC) != 0 {
+            match fs::truncate_file_with_credentials(&normalized, &creds) {
+                Ok(()) => info.size = 0,
+                Err(FsError::PermissionDenied) => return Err(Errno::Perm),
+                Err(FsError::NotFound) => return Err(Errno::NoEnt),
+                Err(FsError::NotFile) => return Err(Errno::Inval),
+                Err(FsError::Unsupported) => return Err(Errno::NoImpl),
+                Err(_) => return Err(Errno::NoImpl),
+            }
+        }
+
+        let fd = self
+            .process_table
+            .open(pid, normalized.clone())
+            .map_err(Errno::from_subsystem)?;
+
+        if (flags & O_APPEND) != 0 {
+            let capped = core::cmp::min(info.size, usize::MAX as u64) as usize;
+            proc.set_fd_offset(fd, capped);
+        } else {
+            proc.set_fd_offset(fd, 0);
+        }
+
+        Ok(fd)
     }
 
     fn close(&self, pid: Pid, fd: u64) -> Result<(), Errno> {
@@ -341,10 +418,19 @@ impl<'a> PosixLayer<'a> {
 
     fn chdir(&self, pid: Pid, path: String) -> Result<u64, Errno> {
         let normalized = Self::normalize_path(&path);
-        self.process_table
-            .chdir(pid, normalized)
-            .map(|_| 0)
-            .map_err(Errno::from_subsystem)
+        let proc = self.process_table.lookup(pid).ok_or(Errno::NoEnt)?;
+        let creds = proc.credentials();
+        match fs::list_dir_with_credentials(&normalized, &creds) {
+            Ok(_) => self
+                .process_table
+                .chdir(pid, normalized)
+                .map(|_| 0)
+                .map_err(Errno::from_subsystem),
+            Err(FsError::PermissionDenied) => Err(Errno::Perm),
+            Err(FsError::NotFound) => Err(Errno::NoEnt),
+            Err(FsError::NotDirectory) => Err(Errno::NotDir),
+            Err(_) => Err(Errno::NoImpl),
+        }
     }
 
     fn getcwd(&self, pid: Pid) -> Result<u64, Errno> {
