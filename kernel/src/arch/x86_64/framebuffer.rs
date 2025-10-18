@@ -129,7 +129,11 @@ impl FrameBufferWriter {
                     Self::store_color(
                         &info.pixel_format,
                         &mut buffer[offset..offset + bytes_per_pixel],
-                        if pixel_on { Color::FOREGROUND } else { Color::BACKGROUND },
+                        if pixel_on {
+                            Color::FOREGROUND
+                        } else {
+                            Color::BACKGROUND
+                        },
                     );
                 }
             }
@@ -243,5 +247,4 @@ impl Color {
             Color::BACKGROUND => 0x00,
         }
     }
-
 }

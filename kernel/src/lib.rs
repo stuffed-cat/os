@@ -15,6 +15,7 @@ mod core;
 mod error;
 
 pub mod arch;
+pub mod fs;
 pub mod hal;
 pub mod ipc;
 pub mod memory;

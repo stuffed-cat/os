@@ -15,36 +15,63 @@ pub trait ShellIo {
 }
 
 /// Bare minimal shell loop used during bring-up on bare-metal targets.
-pub struct BareShell<Io> {
+pub struct BareShell<Io, Fs> {
     keyboard: Keyboard<Us104Key, ScancodeSet1>,
     input: String,
     history: Vec<String>,
     io: Io,
+    fs: Fs,
 }
 
 const PROMPT: &str = "bare shell ready> ";
 const HELP_ENTRIES: &[(&str, &str)] = &[
     ("help", "Show this help message"),
     ("history", "Display previously executed commands"),
-    ("ls", "List built-in pseudo filesystem entries"),
+    ("ls", "List entries from the mounted filesystem"),
 ];
 
-const ROOT_ENTRIES: &[(&str, EntryKind)] = &[
-    ("bin", EntryKind::Directory),
-    ("dev", EntryKind::Directory),
-    ("tmp", EntryKind::Directory),
-    ("README", EntryKind::File),
-];
+/// Filesystem abstraction exposed to the bare shell.
+pub trait ShellFs {
+    /// Lists directory entries for the provided absolute path.
+    fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError>;
+}
 
-impl<Io: ShellIo> BareShell<Io> {
+/// Shell-friendly filesystem error type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsError {
+    /// Filesystem service not available yet.
+    Unavailable,
+    /// Requested path was not found.
+    NotFound,
+    /// Requested path exists but is not a directory.
+    NotDirectory,
+    /// Filesystem image is corrupt or unreadable.
+    Corrupt,
+}
+
+/// Directory entry returned by [`ShellFs`].
+#[derive(Clone)]
+pub struct DirEntry {
+    /// UTF-8 filename without path separators.
+    pub name: String,
+    /// Entry kind.
+    pub kind: EntryKind,
+}
+
+impl<Io, Fs> BareShell<Io, Fs>
+where
+    Io: ShellIo,
+    Fs: ShellFs,
+{
     /// Creates a new shell instance with the given IO backend.
-    pub fn new(mut io: Io) -> Self {
+    pub fn new(mut io: Io, fs: Fs) -> Self {
         io.write_str(PROMPT);
         Self {
             keyboard: Keyboard::new(ScancodeSet1::new(), Us104Key, HandleControl::Ignore),
             input: String::new(),
             history: Vec::new(),
             io,
+            fs,
         }
     }
 
@@ -115,28 +142,39 @@ impl<Io: ShellIo> BareShell<Io> {
     }
 
     fn command_ls(&mut self, args: &[&str]) {
-        if let Some(arg) = args.first() {
-            if *arg != "/" {
-                self.print("ls: unsupported path: ");
-                self.println(arg);
-                return;
+        let path = args.first().copied().unwrap_or("/");
+        match self.fs.list_dir(path) {
+            Ok(entries) => {
+                if entries.is_empty() {
+                    return;
+                }
+                let mut first = true;
+                for entry in entries {
+                    if !first {
+                        self.print("  ");
+                    }
+                    first = false;
+                    self.print(&entry.name);
+                    if matches!(entry.kind, EntryKind::Directory) {
+                        self.print("/");
+                    }
+                }
+                self.print("\r\n");
             }
-        }
-
-        let mut first = true;
-        for (name, kind) in ROOT_ENTRIES {
-            if !first {
-                self.print("  ");
+            Err(FsError::Unavailable) => {
+                self.println("ls: filesystem unavailable");
             }
-            first = false;
-            self.print(name);
-            if matches!(kind, EntryKind::Directory) {
-                self.print("/");
+            Err(FsError::NotFound) => {
+                self.print("ls: not found: ");
+                self.println(path);
             }
-        }
-
-        if !ROOT_ENTRIES.is_empty() {
-            self.print("\r\n");
+            Err(FsError::NotDirectory) => {
+                self.print("ls: not a directory: ");
+                self.println(path);
+            }
+            Err(FsError::Corrupt) => {
+                self.println("ls: filesystem corrupt");
+            }
         }
     }
 
@@ -156,8 +194,8 @@ impl<Io: ShellIo> BareShell<Io> {
     }
 }
 
-#[derive(Clone, Copy)]
-enum EntryKind {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryKind {
     Directory,
     File,
 }

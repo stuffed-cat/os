@@ -5,6 +5,7 @@ use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 use bootloader_api::BootInfo;
 use kernel::{
     arch::x86_64::{framebuffer, serial},
+    fs,
     hal::HalConfig,
     memory::BootFrameAllocator,
     FrameRange, Hal, KernelBuilder,
@@ -44,6 +45,19 @@ pub fn start(boot_info: &'static mut BootInfo, allocator: &'static LockedHeap) -
 
     unsafe {
         allocator.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
+    }
+
+    if let Some(addr) = boot_info.ramdisk_addr.as_ref().copied() {
+        if boot_info.ramdisk_len > 0 {
+            match fs::init_from_ramdisk(addr, boot_info.ramdisk_len) {
+                Ok(_) => serial::write_str("kernel: filesystem initialized\r\n"),
+                Err(_) => serial::write_str("kernel: failed to initialize filesystem\r\n"),
+            }
+        } else {
+            serial::write_str("kernel: ramdisk length is zero\r\n");
+        }
+    } else {
+        serial::write_str("kernel: no ramdisk provided\r\n");
     }
 
     hal.enable_interrupts();

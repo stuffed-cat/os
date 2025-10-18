@@ -66,8 +66,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 ) {
     panic!(
         "GENERAL PROTECTION FAULT: {:?}\nError Code: {:#x}",
-        stack_frame,
-        error_code
+        stack_frame, error_code
     );
 }
 

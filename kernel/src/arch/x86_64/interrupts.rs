@@ -137,8 +137,8 @@ impl Pics {
 
         let mut wait_port: Port<u8> = Port::new(0x80);
 
-    let mut primary_mask = self.primary.data.read();
-    let secondary_mask = self.secondary.data.read();
+        let mut primary_mask = self.primary.data.read();
+        let secondary_mask = self.secondary.data.read();
 
         self.primary.command.write(0x11);
         wait_port.write(0);

@@ -1,0 +1,4 @@
+Welcome to the hybrid OS root filesystem.
+
+This image is generated for bring-up testing and contains a tiny
+selection of directories to exercise the bare-metal shell.

@@ -13,14 +13,15 @@ pub mod idt {
     /// Stub IDT load used for host testing without hardware features.
     pub fn load() {}
 }
-pub mod interrupts;
-#[cfg(feature = "hardware")]
-pub mod keyboard;
 #[cfg(feature = "hardware")]
 #[doc = "Framebuffer-backed text console for VGA output."]
 pub mod framebuffer;
+pub mod interrupts;
+#[cfg(feature = "hardware")]
+pub mod keyboard;
 #[cfg(not(feature = "hardware"))]
 pub mod framebuffer {
+    //! Stub framebuffer interface for host-side testing when hardware support is disabled.
     use bootloader_api::info::FrameBuffer;
 
     /// Stub framebuffer init for host testing.

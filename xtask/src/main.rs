@@ -105,6 +105,7 @@ fn build_bootimage(
         .exec()
         .context("failed to load cargo metadata")?;
     let target_dir = PathBuf::from(metadata.target_directory);
+    let workspace_root = PathBuf::from(metadata.workspace_root);
     let kernel_path = target_dir
         .join(target_triple)
         .join(profile)
@@ -129,6 +130,14 @@ fn build_bootimage(
     }
 
     let mut builder = DiskImageBuilder::new(kernel_path.clone());
+    let ramdisk_path = workspace_root.join("assets").join("rootfs.ext2");
+    if !ramdisk_path.exists() {
+        bail!(
+            "ramdisk image not found at {}. Run `mke2fs -t ext2 -d assets/rootfs -b 1024 -m 0 assets/rootfs.ext2 1024` to regenerate.",
+            ramdisk_path.display()
+        );
+    }
+    builder.set_ramdisk(ramdisk_path);
     let config = BootConfig::default();
     builder.set_boot_config(&config);
     builder

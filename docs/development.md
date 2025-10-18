@@ -32,6 +32,16 @@
    该命令会同时运行 `kernel` crate 的单测、集成测试以及 `userland` 的测试。
 5. **编写新模块**：请补充相应的文档（如本目录）并在合适位置添加测试用例。
 
+### 重新生成 RAM DISK（ext2 根文件系统）
+
+裸机镜像会自动将 `assets/rootfs.ext2` 作为 `ramdisk` 装载进内核。若需要修改根文件系统内容，可直接编辑 `assets/rootfs/` 目录，然后使用以下命令重新生成 ext2 镜像：
+
+```bash
+mke2fs -t ext2 -d assets/rootfs -b 1024 -m 0 assets/rootfs.ext2 1024
+```
+
+> 提示：上述命令依赖 `mke2fs`（e2fsprogs）工具。镜像大小为 1 MiB；如需更多空间，可调整最后的块数量参数。
+
 ## 代码布局速查
 
 ```
