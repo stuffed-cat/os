@@ -320,6 +320,7 @@ impl FrameBufferWriter {
         if rows == 0 {
             return;
         }
+        let bg = self.bg_color;
         self.with_buffer(|info, buffer| {
             let stride_pixels = info.stride as usize;
             let bytes_per_pixel = info.bytes_per_pixel as usize;
@@ -327,12 +328,10 @@ impl FrameBufferWriter {
             let scroll_bytes = row_bytes * CHAR_HEIGHT;
             let len = buffer.len();
             if scroll_bytes >= len {
-                let bg = self.bg_color;
                 Self::fill_with_color(info, buffer, bg);
                 return;
             }
             buffer.copy_within(scroll_bytes.., 0);
-            let bg = self.bg_color;
             Self::fill_with_color(info, &mut buffer[len - scroll_bytes..], bg);
         });
         if rows > 0 {

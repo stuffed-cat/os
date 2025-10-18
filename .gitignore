@@ -23,5 +23,5 @@ temp/
 third_party/
 
 # system files
-assets/rootfs/bin/
 assets/rootfs.ext2
+assets/rootfs/bin

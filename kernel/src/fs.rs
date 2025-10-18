@@ -126,46 +126,40 @@ impl<'a> Ext2Fs<'a> {
         if data.len() < SUPERBLOCK_OFFSET + SUPERBLOCK_LENGTH {
             return Err(FsError::InvalidImage);
         }
-        let sb = &data[SUPERBLOCK_OFFSET..SUPERBLOCK_OFFSET + SUPERBLOCK_LENGTH];
-        let magic = read_u16(sb, SUPERBLOCK_MAGIC_OFFSET);
-        if magic != SUPERBLOCK_MAGIC {
+
+        let superblock = &data[SUPERBLOCK_OFFSET..SUPERBLOCK_OFFSET + SUPERBLOCK_LENGTH];
+        if read_u16(superblock, SUPERBLOCK_MAGIC_OFFSET) != SUPERBLOCK_MAGIC {
             return Err(FsError::InvalidImage);
         }
 
-        let log_block_size = read_u32(sb, 24);
+        let log_block_size = read_u32(superblock, 24);
         if log_block_size > 4 {
             return Err(FsError::Unsupported);
         }
         let block_size = 1024usize << log_block_size;
 
-        let inodes_per_group = read_u32(sb, 40);
-        let blocks_per_group = read_u32(sb, 32);
-        let inodes_count = read_u32(sb, 0);
-        if inodes_per_group == 0 || blocks_per_group == 0 {
+        let inode_size = match read_u16(superblock, 88) {
+            0 => INODE_SIZE_DEFAULT,
+            size => size as usize,
+        };
+        if inode_size == 0 {
             return Err(FsError::InvalidImage);
         }
 
-        let first_data_block = read_u32(sb, 20);
-        let inode_size_raw = read_u16(sb, 88) as usize;
-        let inode_size = if inode_size_raw == 0 {
-            INODE_SIZE_DEFAULT
-        } else {
-            inode_size_raw
-        };
-        if inode_size < INODE_SIZE_DEFAULT {
-            return Err(FsError::Unsupported);
+        let inodes_per_group = read_u32(superblock, 40);
+        if inodes_per_group == 0 {
+            return Err(FsError::InvalidImage);
         }
-
-        let block_group_count = (inodes_count + inodes_per_group - 1) / inodes_per_group;
+        let total_inodes = read_u32(superblock, 0);
+        let block_group_count = (total_inodes + inodes_per_group - 1) / inodes_per_group;
         if block_group_count == 0 {
             return Err(FsError::InvalidImage);
         }
 
-        let descriptor_block = first_data_block + 1;
-        let block_group_table_offset = descriptor_block as usize * block_size;
-        let descriptor_end =
-            block_group_table_offset + block_group_count as usize * BLOCK_GROUP_DESC_SIZE;
-        if descriptor_end > data.len() {
+        let block_group_table_block = if block_size == 1024 { 2 } else { 1 };
+        let block_group_table_offset = block_group_table_block * block_size;
+        let descriptor_table_size = block_group_count as usize * BLOCK_GROUP_DESC_SIZE;
+        if block_group_table_offset + descriptor_table_size > data.len() {
             return Err(FsError::InvalidImage);
         }
 
@@ -188,58 +182,26 @@ impl<'a> Ext2Fs<'a> {
 
         let mut entries = Vec::new();
         for record in self.read_directory(&inode)? {
-            if record.name == "." || record.name == ".." {
-                continue;
-            }
-            let child_inode = self.load_inode(record.inode)?;
-            let kind = if child_inode.is_directory() {
+            let inode_num = record.inode;
+            let child = self.load_inode(inode_num)?;
+            let kind = if child.is_directory() {
                 EntryKind::Directory
-            } else {
+            } else if child.is_regular_file() {
                 EntryKind::File
+            } else {
+                continue;
             };
+
             entries.push(DirEntry {
                 name: record.name,
                 kind,
-                size: child_inode.size as u64,
-                mode: child_inode.mode,
-                inode: record.inode,
+                size: child.size as u64,
+                mode: child.mode,
+                inode: inode_num,
             });
         }
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
+
         Ok(entries)
-    }
-
-    fn resolve_path(&self, path: &str) -> Result<u32, FsError> {
-        if path.is_empty() || path == "/" {
-            return Ok(ROOT_INODE);
-        }
-        if !path.starts_with('/') {
-            return Err(FsError::Unsupported);
-        }
-
-        let mut current = ROOT_INODE;
-        for component in path.split('/') {
-            if component.is_empty() {
-                continue;
-            }
-            let inode = self.load_inode(current)?;
-            if !inode.is_directory() {
-                return Err(FsError::NotDirectory);
-            }
-            current = self
-                .lookup_child(&inode, component)?
-                .ok_or(FsError::NotFound)?;
-        }
-        Ok(current)
-    }
-
-    fn lookup_child(&self, parent: &Inode, name: &str) -> Result<Option<u32>, FsError> {
-        for record in self.read_directory(parent)? {
-            if record.name == name {
-                return Ok(Some(record.inode));
-            }
-        }
-        Ok(None)
     }
 
     fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError> {
@@ -274,6 +236,52 @@ impl<'a> Ext2Fs<'a> {
 
         data.truncate(inode.size as usize);
         Ok(data)
+    }
+
+    fn resolve_path(&self, path: &str) -> Result<u32, FsError> {
+        if path.is_empty() {
+            return Ok(ROOT_INODE);
+        }
+
+        if !path.starts_with('/') {
+            return Err(FsError::NotFound);
+        }
+
+        let mut stack = Vec::new();
+        stack.push(ROOT_INODE);
+        let mut current = ROOT_INODE;
+
+        for component in path.split('/').filter(|c| !c.is_empty()) {
+            match component {
+                "." => continue,
+                ".." => {
+                    if stack.len() > 1 {
+                        stack.pop();
+                    }
+                    current = *stack.last().unwrap_or(&ROOT_INODE);
+                }
+                name => {
+                    let inode = self.load_inode(current)?;
+                    if !inode.is_directory() {
+                        return Err(FsError::NotDirectory);
+                    }
+                    let next = self.lookup_child(&inode, name)?.ok_or(FsError::NotFound)?;
+                    stack.push(next);
+                    current = next;
+                }
+            }
+        }
+
+        Ok(current)
+    }
+
+    fn lookup_child(&self, parent: &Inode, name: &str) -> Result<Option<u32>, FsError> {
+        for record in self.read_directory(parent)? {
+            if record.name == name {
+                return Ok(Some(record.inode));
+            }
+        }
+        Ok(None)
     }
 
     fn read_directory(&self, inode: &Inode) -> Result<Vec<DirectoryRecord>, FsError> {
@@ -395,6 +403,21 @@ fn read_u32(data: &[u8], offset: usize) -> u32 {
 }
 
 #[cfg(test)]
+fn read_u64(data: &[u8], offset: usize) -> u64 {
+    let bytes = [
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+        data[offset + 4],
+        data[offset + 5],
+        data[offset + 6],
+        data[offset + 7],
+    ];
+    u64::from_le_bytes(bytes)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -422,23 +445,144 @@ mod tests {
         let fs = Ext2Fs::parse(bytes).expect("parse ext2");
         let entries = fs.list_dir("/bin").expect("list /bin");
         let names: Vec<String> = entries.into_iter().map(|entry| entry.name).collect();
-        assert!(names.contains(&"hello.txt".to_string()));
-        for command in [
-            "cat", "cd", "cp", "echo", "help", "history", "ls", "mkdir", "mv", "pwd", "rm",
-            "rmdir", "reboot", "shutdown", "touch",
-        ] {
+        let expected_commands = [
+            ("help", 0u8),
+            ("history", 1u8),
+            ("ls", 2u8),
+            ("pwd", 3u8),
+            ("cd", 4u8),
+            ("cat", 5u8),
+            ("echo", 6u8),
+            ("touch", 7u8),
+            ("mkdir", 8u8),
+            ("rmdir", 9u8),
+            ("rm", 10u8),
+            ("cp", 11u8),
+            ("mv", 12u8),
+            ("reboot", 13u8),
+            ("shutdown", 14u8),
+        ];
+
+        for (command, expected_id) in expected_commands {
             assert!(
                 names.contains(&command.to_string()),
                 "missing /bin/{command} binary"
             );
             let path = format!("/bin/{command}");
             let data = fs.read_file(&path).expect("read command binary");
-            assert!(data.len() >= 8, "{command} binary must be at least 8 bytes");
             assert!(
-                data.starts_with(&[0x7F, b'B', b'C', b'M']),
-                "{command} binary must start with magic header"
+                data.starts_with(&[0x7F, b'E', b'L', b'F']),
+                "{command} must be an ELF binary"
             );
-            assert!(data[4] == 1, "{command} binary must use version 1");
+            let id = parse_command_id(&data).unwrap_or_default();
+            assert_eq!(
+                id, expected_id,
+                "{command} must encode builtin id {expected_id}"
+            );
         }
     }
+}
+
+#[cfg(test)]
+const SHT_NOTE: u32 = 7;
+#[cfg(test)]
+const COMMAND_NOTE_TYPE: u32 = 0x4D43_4221;
+#[cfg(test)]
+const COMMAND_NOTE_MAGIC: u32 = 0x214D_4342;
+
+#[cfg(test)]
+fn parse_command_id(data: &[u8]) -> Option<u8> {
+    if data.len() < 64 || &data[0..4] != b"\x7FELF" {
+        return None;
+    }
+
+    let shoff = read_u64(data, 40) as usize;
+    let shentsize = read_u16(data, 58) as usize;
+    let shnum = read_u16(data, 60) as usize;
+    let shstrndx = read_u16(data, 62) as usize;
+
+    if shentsize == 0 || shnum == 0 || shstrndx >= shnum {
+        return None;
+    }
+
+    if shoff + shentsize * shnum > data.len() {
+        return None;
+    }
+
+    let shstr_header = shoff + shstrndx * shentsize;
+    let shstr_offset = read_u64(data, shstr_header + 24) as usize;
+    let shstr_size = read_u64(data, shstr_header + 32) as usize;
+    if shstr_offset + shstr_size > data.len() {
+        return None;
+    }
+    let shstrtab = &data[shstr_offset..shstr_offset + shstr_size];
+
+    for index in 1..shnum {
+        let header_offset = shoff + index * shentsize;
+        let sh_type = read_u32(data, header_offset + 4);
+        if sh_type != SHT_NOTE {
+            continue;
+        }
+
+        let section_name = read_c_str(shstrtab, read_u32(data, header_offset) as usize)?;
+        if section_name != ".note.bcm" {
+            continue;
+        }
+
+        let note_offset = read_u64(data, header_offset + 24) as usize;
+        let note_size = read_u64(data, header_offset + 32) as usize;
+        if note_offset + note_size > data.len() {
+            return None;
+        }
+        let mut cursor = 0usize;
+        let note = &data[note_offset..note_offset + note_size];
+        while cursor + 12 <= note.len() {
+            let namesz = u32::from_le_bytes(note[cursor..cursor + 4].try_into().ok()?) as usize;
+            let descsz = u32::from_le_bytes(note[cursor + 4..cursor + 8].try_into().ok()?) as usize;
+            let note_type =
+                u32::from_le_bytes(note[cursor + 8..cursor + 12].try_into().ok()?) as u32;
+            cursor += 12;
+
+            let name_end = align_to(cursor + namesz, 4);
+            if name_end > note.len() {
+                break;
+            }
+            let desc_start = name_end;
+            let desc_end = align_to(desc_start + descsz, 4);
+            if desc_end > note.len() {
+                break;
+            }
+
+            if note_type == COMMAND_NOTE_TYPE && descsz >= 12 {
+                let descriptor = &note[desc_start..desc_start + descsz];
+                let magic = u32::from_le_bytes(descriptor[0..4].try_into().ok()?);
+                let version = u32::from_le_bytes(descriptor[4..8].try_into().ok()?);
+                let command_id = u32::from_le_bytes(descriptor[8..12].try_into().ok()?);
+                if magic == COMMAND_NOTE_MAGIC && version == 1 {
+                    return u8::try_from(command_id).ok();
+                }
+            }
+
+            cursor = desc_end;
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
+fn align_to(value: usize, align: usize) -> usize {
+    if align == 0 {
+        return value;
+    }
+    (value + align - 1) & !(align - 1)
+}
+
+#[cfg(test)]
+fn read_c_str<'a>(data: &'a [u8], offset: usize) -> Option<&'a str> {
+    if offset >= data.len() {
+        return None;
+    }
+    let end = data[offset..].iter().position(|&b| b == 0)? + offset;
+    core::str::from_utf8(&data[offset..end]).ok()
 }

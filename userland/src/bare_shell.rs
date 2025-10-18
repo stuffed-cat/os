@@ -435,6 +435,13 @@ where
     }
 
     fn parse_command_binary(&self, data: &[u8]) -> Result<CommandBinary, CommandResolutionError> {
+        if data.len() >= 4 && &data[0..4] == b"\x7FELF" {
+            return Self::parse_elf_command(data);
+        }
+        Self::parse_legacy_command(data)
+    }
+
+    fn parse_legacy_command(data: &[u8]) -> Result<CommandBinary, CommandResolutionError> {
         const COMMAND_MAGIC: [u8; 4] = [0x7F, b'B', b'C', b'M'];
         const COMMAND_VERSION: u8 = 1;
         const HEADER_SIZE: usize = 8;
@@ -447,8 +454,7 @@ where
             return Err(CommandResolutionError::InvalidFormat);
         }
 
-        let version = data[4];
-        if version != COMMAND_VERSION {
+        if data[4] != COMMAND_VERSION {
             return Err(CommandResolutionError::InvalidFormat);
         }
 
@@ -468,6 +474,173 @@ where
             Self::builtin_from_id(builtin_id).ok_or(CommandResolutionError::InvalidFormat)?;
 
         Ok(CommandBinary { builtin })
+    }
+
+    fn parse_elf_command(data: &[u8]) -> Result<CommandBinary, CommandResolutionError> {
+        const ELF_HEADER_SIZE: usize = 64;
+        const SHT_NOTE: u32 = 7;
+        const COMMAND_NOTE_TYPE: u32 = 0x4D43_4221; // '!BCB' magic type
+        const COMMAND_NOTE_MAGIC: u32 = 0x214D_4342; // '!BCM' descriptor magic
+
+        if data.len() < ELF_HEADER_SIZE {
+            return Err(CommandResolutionError::InvalidFormat);
+        }
+
+        if data[4] != 2 || data[5] != 1 || data[6] != 1 {
+            return Err(CommandResolutionError::InvalidFormat);
+        }
+
+        let e_shoff = Self::read_u64(data, 40)? as usize;
+        let e_shentsize = Self::read_u16(data, 58)? as usize;
+        let e_shnum = Self::read_u16(data, 60)? as usize;
+        let e_shstrndx = Self::read_u16(data, 62)? as usize;
+
+        if e_shentsize == 0 || e_shnum == 0 {
+            return Err(CommandResolutionError::InvalidFormat);
+        }
+
+        let sh_table_size = e_shentsize
+            .checked_mul(e_shnum)
+            .ok_or(CommandResolutionError::InvalidFormat)?;
+        if e_shoff
+            .checked_add(sh_table_size)
+            .filter(|&end| end <= data.len())
+            .is_none()
+        {
+            return Err(CommandResolutionError::InvalidFormat);
+        }
+
+        if e_shstrndx >= e_shnum {
+            return Err(CommandResolutionError::InvalidFormat);
+        }
+
+        let shstr_header_offset = e_shoff + e_shstrndx * e_shentsize;
+        let shstr_offset = Self::read_u64(data, shstr_header_offset + 24)? as usize;
+        let shstr_size = Self::read_u64(data, shstr_header_offset + 32)? as usize;
+        if shstr_offset
+            .checked_add(shstr_size)
+            .filter(|&end| end <= data.len())
+            .is_none()
+        {
+            return Err(CommandResolutionError::InvalidFormat);
+        }
+        let shstrtab = &data[shstr_offset..shstr_offset + shstr_size];
+
+        for index in 1..e_shnum {
+            let header_offset = e_shoff + index * e_shentsize;
+            let sh_type = Self::read_u32(data, header_offset + 4)?;
+            if sh_type != SHT_NOTE {
+                continue;
+            }
+
+            let name_offset = Self::read_u32(data, header_offset)? as usize;
+            let section_name = Self::read_c_string(shstrtab, name_offset)
+                .ok_or(CommandResolutionError::InvalidFormat)?;
+            if section_name != ".note.bcm" {
+                continue;
+            }
+
+            let note_offset = Self::read_u64(data, header_offset + 24)? as usize;
+            let note_size = Self::read_u64(data, header_offset + 32)? as usize;
+            if note_offset
+                .checked_add(note_size)
+                .filter(|&end| end <= data.len())
+                .is_none()
+            {
+                return Err(CommandResolutionError::InvalidFormat);
+            }
+            let mut cursor = 0usize;
+            let note = &data[note_offset..note_offset + note_size];
+            while cursor + 12 <= note.len() {
+                let namesz =
+                    u32::from_le_bytes(note[cursor..cursor + 4].try_into().unwrap()) as usize;
+                let descsz =
+                    u32::from_le_bytes(note[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+                let note_type =
+                    u32::from_le_bytes(note[cursor + 8..cursor + 12].try_into().unwrap());
+                cursor += 12;
+
+                let name_end = Self::align_to(cursor + namesz, 4);
+                if name_end > note.len() {
+                    break;
+                }
+                let desc_start = name_end;
+                let desc_end = Self::align_to(desc_start + descsz, 4);
+                if desc_end > note.len() {
+                    break;
+                }
+
+                let descriptor = &note[desc_start..desc_start + descsz];
+                if note_type == COMMAND_NOTE_TYPE && descriptor.len() >= 12 {
+                    let magic = u32::from_le_bytes(descriptor[0..4].try_into().unwrap());
+                    let version = u32::from_le_bytes(descriptor[4..8].try_into().unwrap());
+                    let command_id = u32::from_le_bytes(descriptor[8..12].try_into().unwrap());
+                    if magic == COMMAND_NOTE_MAGIC && version == 1 {
+                        if let Some(builtin) = Self::builtin_from_id(command_id as u8) {
+                            return Ok(CommandBinary { builtin });
+                        }
+                        return Err(CommandResolutionError::InvalidFormat);
+                    }
+                }
+
+                cursor = desc_end;
+            }
+        }
+
+        Err(CommandResolutionError::InvalidFormat)
+    }
+
+    fn read_u16(data: &[u8], offset: usize) -> Result<u16, CommandResolutionError> {
+        if offset + 2 > data.len() {
+            return Err(CommandResolutionError::InvalidFormat);
+        }
+        Ok(u16::from_le_bytes([data[offset], data[offset + 1]]))
+    }
+
+    fn read_u32(data: &[u8], offset: usize) -> Result<u32, CommandResolutionError> {
+        if offset + 4 > data.len() {
+            return Err(CommandResolutionError::InvalidFormat);
+        }
+        Ok(u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]))
+    }
+
+    fn read_u64(data: &[u8], offset: usize) -> Result<u64, CommandResolutionError> {
+        if offset + 8 > data.len() {
+            return Err(CommandResolutionError::InvalidFormat);
+        }
+        Ok(u64::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
+        ]))
+    }
+
+    fn read_c_string<'a>(data: &'a [u8], offset: usize) -> Option<&'a str> {
+        if offset >= data.len() {
+            return None;
+        }
+        let end = data[offset..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|idx| offset + idx)?;
+        core::str::from_utf8(&data[offset..end]).ok()
+    }
+
+    fn align_to(value: usize, align: usize) -> usize {
+        if align == 0 {
+            return value;
+        }
+        (value + align - 1) & !(align - 1)
     }
 
     fn run_binary(&mut self, binary: &CommandBinary, args: &[&str]) {

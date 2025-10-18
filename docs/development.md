@@ -44,7 +44,7 @@ mke2fs -t ext2 -d assets/rootfs -b 1024 -m 0 assets/rootfs.ext2 1024
 
 #### Bare shell 内置命令
 
-重新生成 `rootfs.ext2` 后，`/bin` 目录会包含一组“裸机命令二进制”（Bare Command Module，扩展名可自行决定）。文件格式如下：开头四个字节为魔数 `0x7F 42 43 4D`（即 `\x7fBCM`），随后一个字节版本号（当前为 `1`），一个字节表示命令编号，接着是一个 16 位小端长度字段以及同等长度的 UTF-8 命令名。命令编号与 `userland/src/bare_shell.rs` 中的 `BuiltinCommand` 枚举一一对应。二进制主体仅用于鉴别命令，真正的行为由内核内置实现完成——因此未来接入 `exec` 时，只需用真实可执行文件替换这些二进制封装。当前版本的 shell 在内核态解释以下命令：
+重新生成 `rootfs.ext2` 后，`/bin` 目录会包含一组“裸机命令二进制”（Bare Command Module，BCM）文件。每个命令对应一个最小化的 64 位 ELF，可通过 `.note.bcm` 段携带元数据：`namesz = 0`、`descsz = 12`，`type = 0x4D43_4221`，描述符内容分别是魔数 `0x214D_4342`、版本 `1` 和命令编号（同 `BuiltinCommand` 枚举）。shell 仅依赖这段 note 来解析命令身份，真正的行为仍由内核内置实现——未来引入 `exec` 时，可把这些占位 ELF 替换成真实可执行文件。当前版本的 shell 在内核态解释以下命令：
 
 | 命令 | 功能 | 备注 |
 |------|------|------|
