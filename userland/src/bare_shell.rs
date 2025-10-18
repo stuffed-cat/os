@@ -7,6 +7,8 @@ use alloc::vec::Vec;
 use pc_keyboard::layouts::Us104Key;
 use pc_keyboard::{DecodedKey, HandleControl, Keyboard, ScancodeSet1};
 
+mod commands;
+
 /// IO abstraction that platform glue must implement for the bare shell.
 pub trait ShellIo {
     /// Returns the next raw scancode if available.
@@ -59,24 +61,12 @@ const HELP_ENTRIES: &[(&str, &str)] = &[
         "cttyhack",
         "Attach to controlling tty before running command (placeholder)",
     ),
-    (
-        "touch",
-        "Create an empty file (overlay-backed; shell wiring WIP)",
-    ),
-    (
-        "mkdir",
-        "Create a directory (overlay-backed; shell wiring WIP)",
-    ),
-    (
-        "rmdir",
-        "Remove a directory (overlay-backed; shell wiring WIP)",
-    ),
-    ("rm", "Remove a file (overlay-backed; shell wiring WIP)"),
+    ("touch", "Create empty files"),
+    ("mkdir", "Create directories"),
+    ("rmdir", "Remove empty directories"),
+    ("rm", "Remove files"),
     ("cp", "Copy a file"),
-    (
-        "mv",
-        "Move or rename a file (overlay-backed; shell wiring WIP)",
-    ),
+    ("mv", "Move or rename files"),
     ("reboot", "Reboot the system"),
     ("shutdown", "Power off the system"),
 ];
@@ -89,8 +79,12 @@ pub trait ShellFs {
     fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError>;
     /// Creates a regular file with the requested permissions.
     fn create_file(&self, path: &str, mode: u16) -> Result<(), FsError>;
+    /// Creates a directory with the requested permissions.
+    fn create_dir(&self, path: &str, mode: u16) -> Result<(), FsError>;
     /// Removes a filesystem node.
     fn remove_file(&self, path: &str) -> Result<(), FsError>;
+    /// Removes an empty directory at the provided absolute path.
+    fn remove_dir(&self, path: &str) -> Result<(), FsError>;
     /// Writes bytes to a path at the given offset, optionally truncating first.
     fn write_file(
         &self,
@@ -301,6 +295,8 @@ pub enum FsError {
     NotFile,
     /// Target already exists.
     AlreadyExists,
+    /// Directory could not be removed because it still contains entries.
+    DirectoryNotEmpty,
     /// Filesystem image is corrupt or unreadable.
     Corrupt,
     /// Operation denied due to insufficient permissions.
@@ -595,161 +591,28 @@ where
         self.print("\r\n");
     }
 
-    fn command_cp(&mut self, args: &[&str]) {
-        if args.is_empty() {
-            self.println("cp: missing file operand");
-            return;
-        }
-        if args.len() == 1 {
-            self.print("cp: missing destination file operand after '");
-            self.print(args[0]);
-            self.println("'");
-            return;
-        }
-        if args.len() > 2 {
-            self.println("cp: multiple sources are not supported in the bare shell yet");
-            return;
-        }
-
-        let src_arg = args[0];
-        let dest_arg = args[1];
-        let src_path = self.make_absolute_path(Some(src_arg));
-        let mut dest_path = self.make_absolute_path(Some(dest_arg));
-
-        let data = match self.fs.read_file(&src_path) {
-            Ok(bytes) => bytes,
-            Err(FsError::Unavailable) => {
-                self.println("cp: filesystem unavailable");
-                return;
-            }
-            Err(FsError::NotFound) => {
-                self.print("cp: no such file: ");
-                self.println(src_arg);
-                return;
-            }
-            Err(FsError::NotFile) | Err(FsError::NotDirectory) => {
-                self.print("cp: not a regular file: ");
-                self.println(src_arg);
-                return;
-            }
-            Err(FsError::PermissionDenied) => {
-                self.println("cp: permission denied");
-                return;
-            }
-            Err(FsError::Corrupt) => {
-                self.println("cp: filesystem corrupt");
-                return;
-            }
-            Err(_) => {
-                self.println("cp: filesystem error");
-                return;
-            }
-        };
-
-        let dest_is_directory = match self.fs.list_dir(&dest_path) {
-            Ok(_) => Some(true),
-            Err(FsError::NotFound) | Err(FsError::NotDirectory) | Err(FsError::NotFile) => {
-                Some(false)
-            }
-            Err(FsError::Unavailable) => {
-                self.println("cp: filesystem unavailable");
-                None
-            }
-            Err(FsError::PermissionDenied) => {
-                self.println("cp: permission denied");
-                None
-            }
-            Err(FsError::Corrupt) => {
-                self.println("cp: filesystem corrupt");
-                None
-            }
-            Err(_) => {
-                self.println("cp: filesystem error");
-                None
-            }
-        };
-
-        let Some(dest_is_directory) = dest_is_directory else {
-            return;
-        };
-
-        if dest_is_directory {
-            let Some(name) = src_path.rsplit('/').find(|component| !component.is_empty()) else {
-                self.println("cp: invalid source path");
-                return;
-            };
-            let combined = if dest_path == "/" {
-                format!("/{name}")
-            } else {
-                format!("{dest_path}/{name}")
-            };
-            dest_path = self.normalize_path(&combined);
-        }
-
-        if src_path == dest_path {
-            self.println("cp: source and destination are the same file");
-            return;
-        }
-
-        match self.fs.create_file(&dest_path, 0o644) {
-            Ok(()) | Err(FsError::AlreadyExists) => {}
-            Err(FsError::Unavailable) => {
-                self.println("cp: filesystem unavailable");
-                return;
-            }
-            Err(FsError::NotFound) => {
-                self.print("cp: destination directory not found: ");
-                self.println(&dest_path);
-                return;
-            }
-            Err(FsError::NotDirectory) => {
-                self.print("cp: destination parent is not a directory: ");
-                self.println(&dest_path);
-                return;
-            }
-            Err(FsError::NotFile) => {
-                self.print("cp: destination is not a regular file: ");
-                self.println(&dest_path);
-                return;
-            }
-            Err(FsError::PermissionDenied) => {
-                self.println("cp: permission denied");
-                return;
-            }
-            Err(FsError::Corrupt) => {
-                self.println("cp: filesystem corrupt");
-                return;
-            }
-        }
-
-        match self.fs.write_file(&dest_path, 0, &data, true) {
-            Ok(written) => {
-                if written != data.len() {
-                    self.println("cp: incomplete write");
-                }
-            }
-            Err(FsError::Unavailable) => self.println("cp: filesystem unavailable"),
-            Err(FsError::NotFound) => {
-                self.print("cp: destination not found: ");
-                self.println(&dest_path);
-            }
-            Err(FsError::NotDirectory) => {
-                self.print("cp: destination parent is not a directory: ");
-                self.println(&dest_path);
-            }
-            Err(FsError::NotFile) => {
-                self.print("cp: destination is not a regular file: ");
-                self.println(&dest_path);
-            }
-            Err(FsError::PermissionDenied) => self.println("cp: permission denied"),
-            Err(FsError::Corrupt) => self.println("cp: filesystem corrupt"),
-            Err(FsError::AlreadyExists) => self.println("cp: filesystem error"),
-        }
+    fn command_touch(&mut self, args: &[&str]) {
+        commands::touch(self, args);
     }
 
-    fn command_read_only(&mut self, cmd: &str) {
-        self.print(cmd);
-        self.println(": write support not wired into the bare shell yet");
+    fn command_mkdir(&mut self, args: &[&str]) {
+        commands::mkdir(self, args);
+    }
+
+    fn command_rmdir(&mut self, args: &[&str]) {
+        commands::rmdir(self, args);
+    }
+
+    fn command_rm(&mut self, args: &[&str]) {
+        commands::rm(self, args);
+    }
+
+    fn command_cp(&mut self, args: &[&str]) {
+        commands::cp(self, args);
+    }
+
+    fn command_mv(&mut self, args: &[&str]) {
+        commands::mv(self, args);
     }
 
     fn command_chmod(&mut self, args: &[&str]) {
@@ -780,7 +643,7 @@ where
             }
             Err(FsError::PermissionDenied) => self.println("chmod: permission denied"),
             Err(FsError::Corrupt) => self.println("chmod: filesystem corrupt"),
-            Err(FsError::AlreadyExists) => {}
+            Err(FsError::AlreadyExists | FsError::DirectoryNotEmpty) => {}
         }
     }
 
@@ -816,7 +679,7 @@ where
             }
             Err(FsError::PermissionDenied) => self.println("chown: permission denied"),
             Err(FsError::Corrupt) => self.println("chown: filesystem corrupt"),
-            Err(FsError::AlreadyExists) => {}
+            Err(FsError::AlreadyExists | FsError::DirectoryNotEmpty) => {}
         }
     }
 
@@ -1414,12 +1277,12 @@ where
             BuiltinCommand::Cd => self.command_cd(args),
             BuiltinCommand::Cat => self.command_cat(args),
             BuiltinCommand::Echo => self.command_echo(args),
-            BuiltinCommand::Touch => self.command_read_only("touch"),
-            BuiltinCommand::Mkdir => self.command_read_only("mkdir"),
-            BuiltinCommand::Rmdir => self.command_read_only("rmdir"),
-            BuiltinCommand::Rm => self.command_read_only("rm"),
+            BuiltinCommand::Touch => self.command_touch(args),
+            BuiltinCommand::Mkdir => self.command_mkdir(args),
+            BuiltinCommand::Rmdir => self.command_rmdir(args),
+            BuiltinCommand::Rm => self.command_rm(args),
             BuiltinCommand::Cp => self.command_cp(args),
-            BuiltinCommand::Mv => self.command_read_only("mv"),
+            BuiltinCommand::Mv => self.command_mv(args),
             BuiltinCommand::Reboot => self.command_reboot(),
             BuiltinCommand::Shutdown => self.command_shutdown(),
             BuiltinCommand::Chmod => self.command_chmod(args),
@@ -1923,6 +1786,13 @@ mod tests {
                 .get(&normalize_test_path(path))
                 .cloned()
         }
+
+        fn has_dir(&self, path: &str) -> bool {
+            self.state
+                .borrow()
+                .dirs
+                .contains(&normalize_test_path(path))
+        }
     }
 
     impl ShellFs for TestFs {
@@ -2007,6 +1877,28 @@ mod tests {
             Ok(())
         }
 
+        fn create_dir(&self, path: &str, _mode: u16) -> Result<(), FsError> {
+            let path = normalize_test_path(path);
+            if path == "/" {
+                return Err(FsError::AlreadyExists);
+            }
+            let mut state = self.state.borrow_mut();
+            if state.dirs.contains(&path) {
+                return Err(FsError::AlreadyExists);
+            }
+            if state.files.contains_key(&path) {
+                return Err(FsError::NotFile);
+            }
+            let Some(parent) = test_parent_of(&path) else {
+                return Err(FsError::NotDirectory);
+            };
+            if !state.dirs.contains(&parent) {
+                return Err(FsError::NotFound);
+            }
+            state.dirs.insert(path);
+            Ok(())
+        }
+
         fn remove_file(&self, path: &str) -> Result<(), FsError> {
             let path = normalize_test_path(path);
             let mut state = self.state.borrow_mut();
@@ -2017,6 +1909,46 @@ mod tests {
             } else {
                 Err(FsError::NotFound)
             }
+        }
+
+        fn remove_dir(&self, path: &str) -> Result<(), FsError> {
+            let path = normalize_test_path(path);
+            if path == "/" {
+                return Err(FsError::DirectoryNotEmpty);
+            }
+            let mut state = self.state.borrow_mut();
+            if !state.dirs.contains(&path) {
+                if state.files.contains_key(&path) {
+                    return Err(FsError::NotDirectory);
+                }
+                return Err(FsError::NotFound);
+            }
+
+            let mut has_children = false;
+            for file_path in state.files.keys() {
+                if test_parent_of(file_path.as_str()) == Some(path.clone()) {
+                    has_children = true;
+                    break;
+                }
+            }
+            if !has_children {
+                for dir_path in state.dirs.iter() {
+                    if dir_path == &path {
+                        continue;
+                    }
+                    if test_parent_of(dir_path.as_str()) == Some(path.clone()) {
+                        has_children = true;
+                        break;
+                    }
+                }
+            }
+
+            if has_children {
+                return Err(FsError::DirectoryNotEmpty);
+            }
+
+            state.dirs.remove(&path);
+            Ok(())
         }
 
         fn write_file(
@@ -2132,5 +2064,59 @@ mod tests {
             shell.fs.file_contents("/dest/src.bin"),
             Some(b"payload".to_vec())
         );
+    }
+
+    #[test]
+    fn touch_creates_files() {
+        let fs = TestFs::new();
+        let mut shell = BareShell::new(TestIo::default(), fs, TestSystem);
+
+        shell.command_touch(&["/new.txt"]);
+
+        assert_eq!(shell.fs.file_contents("/new.txt"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn mkdir_creates_directories() {
+        let fs = TestFs::new();
+        let mut shell = BareShell::new(TestIo::default(), fs, TestSystem);
+
+        shell.command_mkdir(&["/newdir"]);
+
+        assert!(shell.fs.has_dir("/newdir"));
+    }
+
+    #[test]
+    fn rmdir_removes_empty_directories() {
+        let fs = TestFs::new();
+        let mut shell = BareShell::new(TestIo::default(), fs, TestSystem);
+        shell.fs.add_dir("/toremove");
+
+        shell.command_rmdir(&["/toremove"]);
+
+        assert!(!shell.fs.has_dir("/toremove"));
+    }
+
+    #[test]
+    fn rm_removes_files() {
+        let fs = TestFs::new();
+        let mut shell = BareShell::new(TestIo::default(), fs, TestSystem);
+        shell.fs.add_file("/temp", b"data".to_vec());
+
+        shell.command_rm(&["/temp"]);
+
+        assert!(shell.fs.file_contents("/temp").is_none());
+    }
+
+    #[test]
+    fn mv_moves_file() {
+        let fs = TestFs::new();
+        let mut shell = BareShell::new(TestIo::default(), fs, TestSystem);
+        shell.fs.add_file("/src", b"payload".to_vec());
+
+        shell.command_mv(&["/src", "/dest"]);
+
+        assert_eq!(shell.fs.file_contents("/dest"), Some(b"payload".to_vec()));
+        assert!(shell.fs.file_contents("/src").is_none());
     }
 }

@@ -582,9 +582,22 @@ impl ProcessTable {
             ElfError::UnsupportedEndian => SubsystemError::Runtime("unsupported elf endian"),
             ElfError::UnsupportedType => SubsystemError::Runtime("unsupported elf type"),
             ElfError::UnsupportedArch => SubsystemError::Runtime("unsupported elf arch"),
+            ElfError::UnsupportedAbi => SubsystemError::Runtime("unsupported elf abi"),
+            ElfError::UnsupportedVersion => SubsystemError::Runtime("unsupported elf version"),
             ElfError::BadProgramHeaderBounds => SubsystemError::Runtime("corrupt program header"),
+            ElfError::BadProgramHeaderSize => {
+                SubsystemError::Runtime("unexpected program header size")
+            }
             ElfError::BadSegmentBounds => SubsystemError::Runtime("corrupt segment"),
+            ElfError::BadSegmentAlignment => SubsystemError::Runtime("segment alignment invalid"),
+            ElfError::BadSegmentAddress => SubsystemError::Runtime("segment address invalid"),
+            ElfError::SegmentOverlap => {
+                SubsystemError::Runtime("segments overlap in address space")
+            }
             ElfError::NoLoadSegments => SubsystemError::Runtime("executable missing segments"),
+            ElfError::EntryNotLoadable => {
+                SubsystemError::Runtime("entry point missing from loadable segments")
+            }
         })?;
 
         if let Some(interpreter_path) = image.interpreter().map(|s| String::from(s)) {
@@ -621,15 +634,36 @@ impl ProcessTable {
                     ElfError::UnsupportedArch => {
                         SubsystemError::Runtime("interpreter unsupported arch")
                     }
+                    ElfError::UnsupportedAbi => {
+                        SubsystemError::Runtime("interpreter unsupported abi")
+                    }
+                    ElfError::UnsupportedVersion => {
+                        SubsystemError::Runtime("interpreter unsupported version")
+                    }
                     ElfError::BadProgramHeaderBounds => {
                         SubsystemError::Runtime("interpreter corrupt program header")
+                    }
+                    ElfError::BadProgramHeaderSize => {
+                        SubsystemError::Runtime("interpreter unexpected program header size")
                     }
                     ElfError::BadSegmentBounds => {
                         SubsystemError::Runtime("interpreter corrupt segment")
                     }
+                    ElfError::BadSegmentAlignment => {
+                        SubsystemError::Runtime("interpreter segment alignment invalid")
+                    }
+                    ElfError::BadSegmentAddress => {
+                        SubsystemError::Runtime("interpreter segment address invalid")
+                    }
+                    ElfError::SegmentOverlap => {
+                        SubsystemError::Runtime("interpreter segments overlap")
+                    }
                     ElfError::NoLoadSegments => {
                         SubsystemError::Runtime("interpreter missing segments")
                     }
+                    ElfError::EntryNotLoadable => SubsystemError::Runtime(
+                        "interpreter entry point missing from loadable segments",
+                    ),
                 })?;
 
             proc.set_env(String::from("INTERPRETEE"), program.clone());

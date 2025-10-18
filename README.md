@@ -35,7 +35,7 @@ The kernel crate (`kernel/src`) is organized into cohesive modules:
 - `syscall`: Syscall dispatcher that bridges userland entrypoints to POSIX operations.
 
 ```
-+-------------------------+          +-----------------------------+
++-------------------------+          +------------------------------+
 |         userland        |  syscalls|            kernel            |
 |  POSIX apps, libc, CLI  | <------> | dispatcher -> POSIX layer    |
 +-------------------------+          |   |            |             |
@@ -43,7 +43,7 @@ The kernel crate (`kernel/src`) is organized into cohesive modules:
                                      | scheduler   process table    |
                                      |   |             |            |
                                      |   +--> memory, IPC, services |
-                                     +-----------------------------+
+                                     +------------------------------+
 ```
 
 #### Hybrid Design Principles
@@ -77,23 +77,27 @@ cargo test
 
 ## 🛣️ Roadmap
 
-- [ ] Bootable x86-64 image (GRUB/multiboot) with minimal `no_std` runtime.
-- [ ] Memory management unit (paging structures, frame allocator).
-- [ ] Preemptive scheduler integrated with hardware timer interrupts.
-- [ ] IPC capability security policies and userland channel binding.
-- [ ] Filesystem service (initially ramfs) exposing POSIX file descriptors.
-- [ ] Expand syscall surface (`fork`, `exec`, `open`, `read`, `wait`, etc.).
+- [x] Bootable x86-64 image (GRUB/multiboot) with minimal `no_std` runtime.
+- [x] Memory management unit (paging structures, frame allocator).
+- [x] Preemptive scheduler integrated with hardware timer interrupts.
+- [x] IPC capability security policies and userland channel binding.
+- [x] Filesystem service (initially ramfs) exposing POSIX file descriptors.
+- [x] Expand syscall surface (`fork`, `exec`, `open`, `read`, `wait`, etc.).
+- [x] Document module responsibilities and cross-crate boundaries (`docs/modules.md`).
+- [x] Harden ELF64 loader validation (stack flags, TLS templates, canonical address checks).
 
-## � 文档进一步阅读
+## 📚 文档进一步阅读
 
 更详细的设计、开发流程以及 QEMU 运行指南整理在 [`docs/`](docs/README.md) 目录：
 
 - [`architecture.md`](docs/architecture.md)：混合内核结构与模块拆分。
 - [`development.md`](docs/development.md)：开发环境、命令速查与代码规范。
 - [`filesystem.md`](docs/filesystem.md)：ext 系列镜像支持、overlay 与写入日志。
+- [`modules.md`](docs/modules.md)：内核与用户态模块的职责划分与关键类型梳理。
+- [`elf.md`](docs/elf.md)：ELF64 加载器的解析流程、验证规则与线程局部存储处理。
 - [`qemu.md`](docs/qemu.md)：构建裸机镜像并在 QEMU 中运行的完整流程。
 - [`troubleshooting.md`](docs/troubleshooting.md)：常见问题与排查建议。
 
-## �🔐 Licensing
+## 🔐 Licensing
 
 Licensed under the MIT license. See [`LICENSE`](LICENSE) for details.

@@ -6,6 +6,8 @@
 
 - [`architecture.md`](architecture.md)：系统架构、关键模块与混合内核设计要点。
 - [`development.md`](development.md)：开发环境准备、常用命令与测试策略。
+- [`modules.md`](modules.md)：内核与用户态各模块的职责、关键类型以及交互关系。
+- [`elf.md`](elf.md)：ELF64 加载流程、段校验逻辑、TLS 模板与栈权限处理。
 - [`filesystem.md`](filesystem.md)：ext2/3/4 解析、overlay 与写入日志设计细节。
 - [`qemu.md`](qemu.md)：在本地构建可启动镜像并通过 QEMU 运行的完整步骤。
 - [`troubleshooting.md`](troubleshooting.md)：常见问题与解决方案，尤其是裸机构建过程中可能遇到的坑。

@@ -48,6 +48,9 @@ fn posix_fork_exec_open_read_flow() {
 
     let stub_segment = ExecutableSegment {
         virtual_addr: 0x4000_0000,
+        mem_size: 1,
+        file_size: 1,
+        align: 0x1000,
         data: vec![0xC3], // ret
         flags: SegmentFlags {
             readable: true,

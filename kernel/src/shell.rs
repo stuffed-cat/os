@@ -174,6 +174,7 @@ impl ShellFs for KernelShellFs {
             Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
             Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
             Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
+            Err(KernelFsError::DirectoryNotEmpty) => Err(ShellFsError::DirectoryNotEmpty),
         }
     }
 
@@ -189,6 +190,7 @@ impl ShellFs for KernelShellFs {
             Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
             Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
             Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
+            Err(KernelFsError::DirectoryNotEmpty) => Err(ShellFsError::DirectoryNotEmpty),
         }
     }
 
@@ -204,6 +206,23 @@ impl ShellFs for KernelShellFs {
             Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
             Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
             Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
+            Err(KernelFsError::DirectoryNotEmpty) => Err(ShellFsError::DirectoryNotEmpty),
+        }
+    }
+
+    fn create_dir(&self, path: &str, mode: u16) -> Result<(), ShellFsError> {
+        match fs::create_dir(path, mode) {
+            Ok(_) => Ok(()),
+            Err(KernelFsError::NotInitialized | KernelFsError::Unsupported) => {
+                Err(ShellFsError::Unavailable)
+            }
+            Err(KernelFsError::InvalidImage) => Err(ShellFsError::Corrupt),
+            Err(KernelFsError::AlreadyExists) => Err(ShellFsError::AlreadyExists),
+            Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
+            Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
+            Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
+            Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
+            Err(KernelFsError::DirectoryNotEmpty) => Err(ShellFsError::DirectoryNotEmpty),
         }
     }
 
@@ -219,6 +238,23 @@ impl ShellFs for KernelShellFs {
             Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
             Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
             Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
+            Err(KernelFsError::DirectoryNotEmpty) => Err(ShellFsError::DirectoryNotEmpty),
+        }
+    }
+
+    fn remove_dir(&self, path: &str) -> Result<(), ShellFsError> {
+        match fs::remove_dir(path) {
+            Ok(_) => Ok(()),
+            Err(KernelFsError::NotInitialized | KernelFsError::Unsupported) => {
+                Err(ShellFsError::Unavailable)
+            }
+            Err(KernelFsError::InvalidImage) => Err(ShellFsError::Corrupt),
+            Err(KernelFsError::AlreadyExists) => Err(ShellFsError::Corrupt),
+            Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
+            Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
+            Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
+            Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
+            Err(KernelFsError::DirectoryNotEmpty) => Err(ShellFsError::DirectoryNotEmpty),
         }
     }
 
@@ -240,6 +276,7 @@ impl ShellFs for KernelShellFs {
             Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
             Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
             Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
+            Err(KernelFsError::DirectoryNotEmpty) => Err(ShellFsError::DirectoryNotEmpty),
         }
     }
 
@@ -255,6 +292,7 @@ impl ShellFs for KernelShellFs {
             Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
             Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
             Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
+            Err(KernelFsError::DirectoryNotEmpty) => Err(ShellFsError::DirectoryNotEmpty),
         }
     }
 
@@ -270,6 +308,7 @@ impl ShellFs for KernelShellFs {
             Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
             Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
             Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
+            Err(KernelFsError::DirectoryNotEmpty) => Err(ShellFsError::DirectoryNotEmpty),
         }
     }
 }

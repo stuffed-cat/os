@@ -77,11 +77,21 @@ impl SegmentMapping {
 pub struct Stack {
     base: u64,
     size: usize,
+    permissions: MemoryFlags,
 }
 
 impl Stack {
     /// Creates a new stack with the provided top address and size.
     pub fn new(top: u64, size: usize) -> Self {
+        Self::with_permissions(
+            top,
+            size,
+            MemoryFlags::READ | MemoryFlags::WRITE | MemoryFlags::USER,
+        )
+    }
+
+    /// Creates a new stack with custom permissions.
+    pub fn with_permissions(top: u64, size: usize, permissions: MemoryFlags) -> Self {
         assert!(size > 0, "stack size must be non-zero");
         let aligned_top = align_up(top, PAGE_SIZE);
         let aligned_size = align_up(size as u64, PAGE_SIZE) as usize;
@@ -93,6 +103,7 @@ impl Stack {
         Self {
             base,
             size: aligned_size,
+            permissions,
         }
     }
 
@@ -110,6 +121,11 @@ impl Stack {
     pub fn top(&self) -> u64 {
         self.base + self.size as u64
     }
+
+    /// Permissions configured for the stack mapping.
+    pub fn permissions(&self) -> MemoryFlags {
+        self.permissions
+    }
 }
 
 /// Configuration used when constructing an address space for a process.
@@ -117,12 +133,17 @@ impl Stack {
 pub struct StackConfig {
     top: u64,
     size: usize,
+    permissions: MemoryFlags,
 }
 
 impl StackConfig {
     /// Creates a new stack configuration.
-    pub const fn new(top: u64, size: usize) -> Self {
-        Self { top, size }
+    pub fn new(top: u64, size: usize) -> Self {
+        Self {
+            top,
+            size,
+            permissions: MemoryFlags::READ | MemoryFlags::WRITE | MemoryFlags::USER,
+        }
     }
 
     /// Returns the stack top address.
@@ -134,14 +155,22 @@ impl StackConfig {
     pub fn size(self) -> usize {
         self.size
     }
+
+    /// Returns the configured stack permissions.
+    pub fn permissions(self) -> MemoryFlags {
+        self.permissions
+    }
+
+    /// Overrides the default stack permissions.
+    pub fn with_permissions(mut self, permissions: MemoryFlags) -> Self {
+        self.permissions = permissions;
+        self
+    }
 }
 
 impl Default for StackConfig {
     fn default() -> Self {
-        Self {
-            top: DEFAULT_STACK_TOP,
-            size: DEFAULT_STACK_SIZE,
-        }
+        Self::new(DEFAULT_STACK_TOP, DEFAULT_STACK_SIZE)
     }
 }
 
@@ -162,7 +191,10 @@ impl AddressSpace {
             .map(|segment| segment_mapping(segment))
             .collect();
         segments.sort_by_key(|segment| segment.base);
-        let stack = Stack::new(stack_config.top, stack_config.size);
+        let stack_permissions =
+            stack_config.permissions() | MemoryFlags::from_segment(image.stack_flags());
+        let stack =
+            Stack::with_permissions(stack_config.top(), stack_config.size(), stack_permissions);
         Self {
             entry_point: image.entry_point(),
             segments,
@@ -190,7 +222,7 @@ fn segment_mapping(segment: &ExecutableSegment) -> SegmentMapping {
     let payload = segment.data.clone();
     SegmentMapping {
         base: segment.virtual_addr,
-        length: payload.len(),
+        length: segment.mem_size,
         permissions: MemoryFlags::from_segment(segment.flags),
         payload,
     }
@@ -297,6 +329,9 @@ mod tests {
     fn address_space_from_executable_maps_segments() {
         let segments = vec![ExecutableSegment {
             virtual_addr: 0x400000,
+            mem_size: 16,
+            file_size: 16,
+            align: 0x1000,
             data: vec![0x90; 16],
             flags: SegmentFlags {
                 readable: true,
@@ -318,6 +353,10 @@ mod tests {
             layout.stack().top(),
             Stack::new(DEFAULT_STACK_TOP, DEFAULT_STACK_SIZE).top()
         );
+        let stack_perms = layout.stack().permissions();
+        assert!(stack_perms.contains(MemoryFlags::READ));
+        assert!(stack_perms.contains(MemoryFlags::WRITE));
+        assert!(!stack_perms.contains(MemoryFlags::EXEC));
     }
 
     #[test]

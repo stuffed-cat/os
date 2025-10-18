@@ -424,7 +424,7 @@ fn regenerate_rootfs_image(workspace_root: &Path) -> Result<()> {
     cmd.arg("-t")
         .arg("ext4")
         .arg("-O")
-    .arg("^has_journal,^metadata_csum")
+        .arg("^has_journal,^metadata_csum")
         .arg("-d")
         .arg(&rootfs_dir)
         .arg("-b")

@@ -55,7 +55,12 @@ mke2fs -t ext4 -O ^has_journal,^metadata_csum -d assets/rootfs -b 1024 -m 0 asse
 | `cd [PATH]` | 切换工作目录 | 多参数报错 |
 | `cat FILE...` | 打印文件内容 | 仅支持 ext4 镜像中的常规文件 |
 | `echo ARGS...` | 原样回显参数 | |
-| `touch`/`mkdir`/`rmdir`/`rm`/`cp`/`mv` | 预留命令 | 内核 overlay 已支持写入路径，shell 侧仍在对接（目前提示功能未完成） |
+| `touch PATH...` | 创建或更新文件 | 支持多路径参数，若文件不存在则创建 |
+| `mkdir DIR...` | 创建目录 | 父目录需已存在，支持一次创建多个目录 |
+| `rmdir DIR...` | 删除空目录 | 目录必须为空，当前不递归 |
+| `rm FILE...` | 删除常规文件 | 支持多个目标，仅作用于文件 |
+| `cp SRC DEST` | 复制文件 | 可复制到已有目录或指定新文件名 |
+| `mv SRC DEST` | 移动/重命名文件 | 仅针对常规文件，目录移动仍在规划 |
 | `chmod MODE PATH` | 修改权限位 | 支持八进制模式（如 `0644`） |
 | `chown USER[:GROUP] PATH` | 调整所有者 | 仅 root 可调用，组名可留空默认同用户 |
 | `whoami` | 显示当前用户名 | |
