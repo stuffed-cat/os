@@ -1,6 +1,6 @@
 //! Minimal shell support for bare-metal boot while the full shell is feature-gated to `std` builds.
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use pc_keyboard::layouts::Us104Key;
@@ -22,10 +22,24 @@ pub struct BareShell<Io> {
     io: Io,
 }
 
+const PROMPT: &str = "bare shell ready> ";
+const HELP_ENTRIES: &[(&str, &str)] = &[
+    ("help", "Show this help message"),
+    ("history", "Display previously executed commands"),
+    ("ls", "List built-in pseudo filesystem entries"),
+];
+
+const ROOT_ENTRIES: &[(&str, EntryKind)] = &[
+    ("bin", EntryKind::Directory),
+    ("dev", EntryKind::Directory),
+    ("tmp", EntryKind::Directory),
+    ("README", EntryKind::File),
+];
+
 impl<Io: ShellIo> BareShell<Io> {
     /// Creates a new shell instance with the given IO backend.
     pub fn new(mut io: Io) -> Self {
-        io.write_str("bare shell ready> ");
+        io.write_str(PROMPT);
         Self {
             keyboard: Keyboard::new(ScancodeSet1::new(), Us104Key, HandleControl::Ignore),
             input: String::new(),
@@ -64,22 +78,66 @@ impl<Io: ShellIo> BareShell<Io> {
     }
 
     fn execute_command(&mut self) {
-        let command = core::mem::take(&mut self.input);
+        let command_line = core::mem::take(&mut self.input);
         self.print("\r\n");
-        if !command.trim().is_empty() {
-            self.history.push(command.clone());
-            match command.trim() {
-                "help" => self.println("Commands: help, history"),
-                "history" => {
-                    let entries: Vec<String> = self.history.iter().cloned().collect();
-                    for entry in entries {
-                        self.println(&entry);
-                    }
+        let trimmed = command_line.trim();
+        if !trimmed.is_empty() {
+            self.history.push(trimmed.to_string());
+            let mut parts = trimmed.split_whitespace();
+            if let Some(cmd) = parts.next() {
+                let args: Vec<&str> = parts.collect();
+                match cmd {
+                    "help" => self.print_help(),
+                    "history" => self.print_history(),
+                    "ls" => self.command_ls(&args),
+                    _ => self.println("command not found"),
                 }
-                _ => self.println("command not found"),
             }
         }
-        self.print("bare shell ready> ");
+        self.print(PROMPT);
+    }
+
+    fn print_help(&mut self) {
+        self.println("Built-in commands:");
+        for (command, description) in HELP_ENTRIES {
+            self.print("  ");
+            self.print(command);
+            self.print(": ");
+            self.println(description);
+        }
+    }
+
+    fn print_history(&mut self) {
+        let entries: Vec<String> = self.history.iter().cloned().collect();
+        for entry in entries {
+            self.println(&entry);
+        }
+    }
+
+    fn command_ls(&mut self, args: &[&str]) {
+        if let Some(arg) = args.first() {
+            if *arg != "/" {
+                self.print("ls: unsupported path: ");
+                self.println(arg);
+                return;
+            }
+        }
+
+        let mut first = true;
+        for (name, kind) in ROOT_ENTRIES {
+            if !first {
+                self.print("  ");
+            }
+            first = false;
+            self.print(name);
+            if matches!(kind, EntryKind::Directory) {
+                self.print("/");
+            }
+        }
+
+        if !ROOT_ENTRIES.is_empty() {
+            self.print("\r\n");
+        }
     }
 
     fn print(&mut self, msg: &str) {
@@ -96,4 +154,10 @@ impl<Io: ShellIo> BareShell<Io> {
         self.print(msg);
         self.print("\r\n");
     }
+}
+
+#[derive(Clone, Copy)]
+enum EntryKind {
+    Directory,
+    File,
 }
