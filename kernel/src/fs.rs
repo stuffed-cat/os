@@ -1,13 +1,14 @@
 //! Filesystem services backed by an embedded ext2/3/4 image with an in-memory overlay.
 
 use crate::arch::x86_64::serial;
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp;
 use core::str;
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
 const SUPERBLOCK_OFFSET: usize = 1024;
@@ -42,6 +43,9 @@ const MODE_PERMS_MASK: u16 = 0o7777;
 
 static FILESYSTEM: Mutex<Option<Ext2Fs<'static>>> = Mutex::new(None);
 static FILE_OVERLAY: Mutex<BTreeMap<String, OverlayEntry>> = Mutex::new(BTreeMap::new());
+const JOURNAL_CAPACITY: usize = 256;
+static FILESYSTEM_JOURNAL: Mutex<VecDeque<JournalEntry>> = Mutex::new(VecDeque::new());
+static JOURNAL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 enum OverlayEntry {
@@ -63,6 +67,68 @@ struct OverlayFile {
 enum OverlaySource {
     Created,
     Shadowed,
+}
+
+/// Filesystem journal operation kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JournalOp {
+    /// Overlay write.
+    Write,
+    /// File creation.
+    Create,
+    /// File removal.
+    Remove,
+    /// Permission change.
+    Chmod,
+    /// Ownership change.
+    Chown,
+}
+
+/// Additional metadata recorded for a journal entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JournalInfo {
+    /// Information recorded for write operations.
+    Write {
+        /// Write offset relative to file start.
+        offset: usize,
+        /// Number of bytes written.
+        len: usize,
+        /// Whether the call requested truncation before writing.
+        truncated: bool,
+    },
+    /// Target mode after a chmod operation.
+    Chmod {
+        /// Updated mode bits applied to the file.
+        mode: u16,
+    },
+    /// Target owner/group after a chown operation.
+    Chown {
+        /// Updated user identifier applied to the file.
+        uid: u32,
+        /// Updated group identifier applied to the file.
+        gid: u32,
+    },
+    /// Generic marker when no extra metadata is needed.
+    Generic,
+}
+
+/// Single filesystem journal entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JournalEntry {
+    /// Monotonic sequence number starting at 1.
+    pub sequence: u64,
+    /// Operation performed.
+    pub op: JournalOp,
+    /// Canonical absolute path affected.
+    pub path: String,
+    /// Additional metadata specific to the operation.
+    pub info: JournalInfo,
+}
+
+/// Returns a snapshot of the in-memory filesystem journal.
+pub fn journal_snapshot() -> Vec<JournalEntry> {
+    let journal = FILESYSTEM_JOURNAL.lock();
+    journal.iter().cloned().collect()
 }
 
 #[derive(Clone, Copy)]
@@ -246,6 +312,27 @@ fn join_path(parent: &str, name: &str) -> String {
     }
 }
 
+fn record_journal(op: JournalOp, path: &str, info: JournalInfo) {
+    let sequence = JOURNAL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut journal = FILESYSTEM_JOURNAL.lock();
+    if journal.len() >= JOURNAL_CAPACITY {
+        journal.pop_front();
+    }
+    journal.push_back(JournalEntry {
+        sequence,
+        op,
+        path: String::from(path),
+        info,
+    });
+}
+
+/// Resets the in-memory journal state for unit tests.
+#[cfg(test)]
+pub fn __clear_journal_for_tests() {
+    FILESYSTEM_JOURNAL.lock().clear();
+    JOURNAL_SEQUENCE.store(1, Ordering::Relaxed);
+}
+
 fn has_permission(mode: u16, creds: &Credentials, owner: u32, group: u32, mask: u16) -> bool {
     if creds.is_root() {
         return true;
@@ -311,10 +398,7 @@ pub fn init_from_ramdisk(ramdisk_addr: u64, len: u64) -> Result<(), FsError> {
     let data = unsafe { core::slice::from_raw_parts(virt_start as *const u8, len) };
     let fs = Ext2Fs::parse(data)?;
     let variant = fs.kind();
-    serial::write_fmt(format_args!(
-        "fs: detected {:?} image\r\n",
-        variant
-    ));
+    serial::write_fmt(format_args!("fs: detected {:?} image\r\n", variant));
 
     let mut guard = FILESYSTEM.lock();
     *guard = Some(fs);
@@ -505,7 +589,17 @@ pub fn write_file_with_credentials(
                             }
                             buffer[offset..offset + data.len()].copy_from_slice(data);
                             file.size = buffer.len() as u64;
-                            return Ok(data.len());
+                            let written = data.len();
+                            record_journal(
+                                JournalOp::Write,
+                                &normalized,
+                                JournalInfo::Write {
+                                    offset,
+                                    len: written,
+                                    truncated: truncate,
+                                },
+                            );
+                            return Ok(written);
                         }
                     }
                 }
@@ -539,7 +633,17 @@ pub fn write_file_with_credentials(
                         source: OverlaySource::Shadowed,
                     };
                     vacant.insert(OverlayEntry::File(overlay_file));
-                    return Ok(data.len());
+                    let written = data.len();
+                    record_journal(
+                        JournalOp::Write,
+                        &normalized,
+                        JournalInfo::Write {
+                            offset,
+                            len: written,
+                            truncated: truncate,
+                        },
+                    );
+                    return Ok(written);
                 }
             }
         }
@@ -654,6 +758,7 @@ pub fn create_file_with_credentials(
                     source: OverlaySource::Created,
                 };
                 overlay.insert(normalized.clone(), OverlayEntry::File(overlay_file));
+                record_journal(JournalOp::Create, &normalized, JournalInfo::Generic);
                 return Ok(());
             }
             None => {
@@ -677,6 +782,7 @@ pub fn create_file_with_credentials(
                         FILE_OVERLAY
                             .lock()
                             .insert(normalized.clone(), OverlayEntry::File(overlay_file));
+                        record_journal(JournalOp::Create, &normalized, JournalInfo::Generic);
                         return Ok(());
                     }
                     Err(other) => return Err(other),
@@ -721,10 +827,12 @@ pub fn remove_file_with_credentials(path: &str, creds: &Credentials) -> Result<(
             match overlay.get(&normalized) {
                 Some(OverlayEntry::File(file)) if file.source == OverlaySource::Created => {
                     overlay.remove(&normalized);
+                    record_journal(JournalOp::Remove, &normalized, JournalInfo::Generic);
                     return Ok(());
                 }
                 Some(OverlayEntry::File(_)) => {
-                    overlay.insert(normalized, OverlayEntry::Tombstone);
+                    overlay.insert(normalized.clone(), OverlayEntry::Tombstone);
+                    record_journal(JournalOp::Remove, &normalized, JournalInfo::Generic);
                     return Ok(());
                 }
                 Some(OverlayEntry::Tombstone) => return Err(FsError::NotFound),
@@ -738,9 +846,11 @@ pub fn remove_file_with_credentials(path: &str, creds: &Credentials) -> Result<(
     match overlay.get(&normalized) {
         Some(OverlayEntry::File(file)) if file.source == OverlaySource::Created => {
             overlay.remove(&normalized);
+            record_journal(JournalOp::Remove, &normalized, JournalInfo::Generic);
         }
         _ => {
-            overlay.insert(normalized, OverlayEntry::Tombstone);
+            overlay.insert(normalized.clone(), OverlayEntry::Tombstone);
+            record_journal(JournalOp::Remove, &normalized, JournalInfo::Generic);
         }
     }
     Ok(())
@@ -759,6 +869,11 @@ pub fn chmod_with_credentials(path: &str, creds: &Credentials, mode: u16) -> Res
                     return Err(FsError::PermissionDenied);
                 }
                 file.mode = desired_mode;
+                record_journal(
+                    JournalOp::Chmod,
+                    &normalized,
+                    JournalInfo::Chmod { mode: desired_mode },
+                );
                 return Ok(());
             }
             OverlayEntry::Tombstone => return Err(FsError::NotFound),
@@ -782,9 +897,15 @@ pub fn chmod_with_credentials(path: &str, creds: &Credentials, mode: u16) -> Res
         gid: metadata.gid,
         source: OverlaySource::Shadowed,
     };
+    let log_path = normalized.clone();
     FILE_OVERLAY
         .lock()
         .insert(normalized, OverlayEntry::File(overlay_file));
+    record_journal(
+        JournalOp::Chmod,
+        &log_path,
+        JournalInfo::Chmod { mode: desired_mode },
+    );
     Ok(())
 }
 
@@ -807,6 +928,11 @@ pub fn chown_with_credentials(
             OverlayEntry::File(file) => {
                 file.uid = uid;
                 file.gid = gid;
+                record_journal(
+                    JournalOp::Chown,
+                    &normalized,
+                    JournalInfo::Chown { uid, gid },
+                );
                 return Ok(());
             }
             OverlayEntry::Tombstone => return Err(FsError::NotFound),
@@ -827,9 +953,11 @@ pub fn chown_with_credentials(
         gid,
         source: OverlaySource::Shadowed,
     };
+    let log_path = normalized.clone();
     FILE_OVERLAY
         .lock()
         .insert(normalized, OverlayEntry::File(overlay_file));
+    record_journal(JournalOp::Chown, &log_path, JournalInfo::Chown { uid, gid });
     Ok(())
 }
 
@@ -1521,6 +1649,9 @@ fn read_u64(data: &[u8], offset: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spin::Mutex as SpinMutex;
+
+    static TEST_FS_GUARD: SpinMutex<()> = SpinMutex::new(());
 
     #[test]
     fn parse_rootfs_image() {
@@ -1598,6 +1729,7 @@ mod tests {
 
     #[test]
     fn overlay_write_roundtrip() {
+        let _guard = TEST_FS_GUARD.lock();
         let bytes = include_bytes!("../../assets/rootfs.ext4");
         let fs = Ext2Fs::parse(bytes).expect("parse ext4");
         {
@@ -1612,6 +1744,38 @@ mod tests {
         let data = read_file_with_credentials("/README", &creds).expect("read overlay");
         assert!(data.starts_with(payload));
 
+        FILE_OVERLAY.lock().clear();
+        FILESYSTEM.lock().take();
+    }
+
+    #[test]
+    fn journal_records_overlay_operations() {
+        let _guard = TEST_FS_GUARD.lock();
+        __clear_journal_for_tests();
+        FILE_OVERLAY.lock().clear();
+        FILESYSTEM.lock().take();
+
+        let bytes = include_bytes!("../../assets/rootfs.ext4");
+        let fs = Ext2Fs::parse(bytes).expect("parse ext4");
+        {
+            let mut guard = FILESYSTEM.lock();
+            *guard = Some(fs);
+        }
+
+        let creds = Credentials::root();
+        let path = "/journal.log";
+        create_file_with_credentials(path, &creds, 0o644).expect("create overlay file");
+        write_file_with_credentials(path, &creds, 0, b"hello", true).expect("write overlay file");
+
+        let entries = journal_snapshot();
+        assert!(entries
+            .iter()
+            .any(|entry| entry.op == JournalOp::Create && entry.path == path));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.op == JournalOp::Write && entry.path == path));
+
+        __clear_journal_for_tests();
         FILE_OVERLAY.lock().clear();
         FILESYSTEM.lock().take();
     }

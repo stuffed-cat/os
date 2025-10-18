@@ -90,6 +90,7 @@ cargo test
 
 - [`architecture.md`](docs/architecture.md)：混合内核结构与模块拆分。
 - [`development.md`](docs/development.md)：开发环境、命令速查与代码规范。
+- [`filesystem.md`](docs/filesystem.md)：ext 系列镜像支持、overlay 与写入日志。
 - [`qemu.md`](docs/qemu.md)：构建裸机镜像并在 QEMU 中运行的完整流程。
 - [`troubleshooting.md`](docs/troubleshooting.md)：常见问题与排查建议。
 
