@@ -23,5 +23,6 @@ pub use syscall::{to_hex, Runtime, SyscallRequest};
 pub mod bare_shell;
 #[cfg(feature = "baremetal")]
 pub use bare_shell::{
-    BareShell, DirEntry, EntryKind, ExecResult, FsError, ShellFs, ShellIo, ShellSystem, SystemError,
+    AuthError, BareShell, DirEntry, EntryKind, ExecResult, FsError, ShellFs, ShellIo, ShellSystem,
+    SystemError, UserAdminError, UserIdentity,
 };

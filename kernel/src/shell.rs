@@ -20,9 +20,11 @@ use log::info;
 #[cfg(not(feature = "std"))]
 use log::warn;
 use spin::Mutex;
+use crate::session::{self, UserSession};
+use crate::users::{self, UserError, UserProfile};
 use userland::{
-    BareShell, DirEntry, EntryKind, ExecResult, FsError as ShellFsError, ShellFs, ShellIo,
-    ShellSystem, SystemError,
+    AuthError, BareShell, DirEntry, EntryKind, ExecResult, FsError as ShellFsError, ShellFs,
+    ShellIo, ShellSystem, SystemError, UserAdminError, UserIdentity,
 };
 
 const SCANCODE_QUEUE_CAPACITY: usize = 256;
@@ -132,6 +134,7 @@ struct KernelShellFs;
 struct KernelShellSystem {
     process_table: &'static ProcessTable,
     scheduler: &'static Scheduler,
+    hostname: &'static str,
 }
 
 impl KernelShellSystem {
@@ -139,6 +142,7 @@ impl KernelShellSystem {
         Self {
             process_table,
             scheduler,
+            hostname: "nexa-os",
         }
     }
 }
@@ -334,6 +338,61 @@ impl ShellSystem for KernelShellSystem {
 
         Ok(ExecResult { pid: pid.as_u64() })
     }
+
+    fn current_user(&self) -> UserIdentity {
+        session_to_identity(session::current_session())
+    }
+
+    fn authenticate(&self, username: &str, password: &str) -> Result<UserIdentity, AuthError> {
+        match users::authenticate(username, password) {
+            Ok(profile) => Ok(profile_to_identity(&profile)),
+            Err(err) => Err(map_user_error_to_auth(err)),
+        }
+    }
+
+    fn set_session(&self, user: &UserIdentity) -> Result<UserIdentity, AuthError> {
+        match users::get_user(&user.username) {
+            Some(profile) => {
+                session::set_session(&profile);
+                Ok(session_to_identity(session::current_session()))
+            }
+            None => Err(AuthError::NotFound),
+        }
+    }
+
+    fn create_user(
+        &self,
+        username: &str,
+        password: &str,
+        home: Option<&str>,
+    ) -> Result<UserIdentity, UserAdminError> {
+        match users::add_user(username, password, home, None) {
+            Ok(profile) => Ok(profile_to_identity(&profile)),
+            Err(err) => Err(map_user_error_to_admin(err)),
+        }
+    }
+
+    fn set_password(&self, username: &str, password: &str) -> Result<(), UserAdminError> {
+        match users::set_password(username, password) {
+            Ok(()) => Ok(()),
+            Err(err) => Err(map_user_error_to_admin(err)),
+        }
+    }
+
+    fn list_users(&self) -> Result<Vec<UserIdentity>, UserAdminError> {
+        Ok(users::list_users()
+            .into_iter()
+            .map(|profile| profile_to_identity(&profile))
+            .collect())
+    }
+
+    fn lookup_user(&self, username: &str) -> Option<UserIdentity> {
+        users::get_user(username).map(|profile| profile_to_identity(&profile))
+    }
+
+    fn hostname(&self) -> &str {
+        self.hostname
+    }
 }
 
 /// Enqueues a raw keyboard scancode for shell processing.
@@ -375,5 +434,44 @@ fn map_exec_error(err: SubsystemError) -> SystemError {
             _ => SystemError::Failed,
         },
         SubsystemError::Init(_) | SubsystemError::Resource(_) => SystemError::Failed,
+    }
+}
+
+fn profile_to_identity(profile: &UserProfile) -> UserIdentity {
+    UserIdentity {
+        username: profile.username.clone(),
+        uid: profile.uid,
+        gid: profile.gid,
+        groups: profile.groups.clone(),
+        home: profile.home.clone(),
+        shell: profile.shell.clone(),
+    }
+}
+
+fn session_to_identity(session: UserSession) -> UserIdentity {
+    UserIdentity {
+        username: session.username,
+        uid: session.uid,
+        gid: session.gid,
+        groups: session.groups,
+        home: session.home,
+        shell: session.shell,
+    }
+}
+
+fn map_user_error_to_auth(err: UserError) -> AuthError {
+    match err {
+        UserError::AlreadyExists => AuthError::Unsupported,
+        UserError::NotFound => AuthError::NotFound,
+        UserError::InvalidPassword | UserError::AuthenticationFailed => AuthError::InvalidPassword,
+    }
+}
+
+fn map_user_error_to_admin(err: UserError) -> UserAdminError {
+    match err {
+        UserError::AlreadyExists => UserAdminError::AlreadyExists,
+        UserError::NotFound => UserAdminError::NotFound,
+        UserError::InvalidPassword => UserAdminError::InvalidPassword,
+        UserError::AuthenticationFailed => UserAdminError::PermissionDenied,
     }
 }

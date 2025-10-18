@@ -21,12 +21,14 @@ pub struct BareShell<Io, Fs, Sys> {
     input: String,
     history: Vec<String>,
     current_dir: String,
+    current_user: UserIdentity,
+    hostname: String,
     io: Io,
     fs: Fs,
     sys: Sys,
 }
 
-const PROMPT_PREFIX: &str = "bare shell";
+const HOSTNAME_DEFAULT: &str = "nexa-os";
 const COLOR_BLUE: &str = "\x1b[1;34m";
 const COLOR_RESET: &str = "\x1b[0m";
 const HELP_ENTRIES: &[(&str, &str)] = &[
@@ -38,6 +40,23 @@ const HELP_ENTRIES: &[(&str, &str)] = &[
     ("cd", "Change the current working directory"),
     ("cat", "Display file contents"),
     ("echo", "Print arguments back to the console"),
+    ("chmod", "Update file permissions: chmod 644 path"),
+    (
+        "chown",
+        "Change file owner: chown user[:group] path (root only)",
+    ),
+    ("whoami", "Print the active username"),
+    ("id", "Show uid/gid and group membership"),
+    ("users", "List registered users"),
+    ("su", "Switch user: su name password"),
+    (
+        "useradd",
+        "Create a user: useradd name password [--home PATH]",
+    ),
+    (
+        "passwd",
+        "Update password: passwd [name] newpassword",
+    ),
     (
         "touch",
         "Create an empty file (overlay-backed; shell wiring WIP)",
@@ -98,6 +117,27 @@ pub trait ShellSystem {
         cwd: &str,
         env: &[(&str, &str)],
     ) -> Result<ExecResult, SystemError>;
+    /// Returns the current session user information.
+    fn current_user(&self) -> UserIdentity;
+    /// Authenticates a user by username and password.
+    fn authenticate(&self, username: &str, password: &str) -> Result<UserIdentity, AuthError>;
+    /// Updates the active session to the provided user profile.
+    fn set_session(&self, user: &UserIdentity) -> Result<UserIdentity, AuthError>;
+    /// Creates a new user account.
+    fn create_user(
+        &self,
+        username: &str,
+        password: &str,
+        home: Option<&str>,
+    ) -> Result<UserIdentity, UserAdminError>;
+    /// Updates the password for an existing user.
+    fn set_password(&self, username: &str, password: &str) -> Result<(), UserAdminError>;
+    /// Returns all registered user identities.
+    fn list_users(&self) -> Result<Vec<UserIdentity>, UserAdminError>;
+    /// Looks up a single user by name.
+    fn lookup_user(&self, username: &str) -> Option<UserIdentity>;
+    /// Returns the hostname displayed by the prompt.
+    fn hostname(&self) -> &str;
 }
 
 /// Errors returned by platform control hooks.
@@ -124,6 +164,49 @@ pub enum SystemError {
 pub struct ExecResult {
     /// Process identifier assigned to the spawned program.
     pub pid: u64,
+}
+
+/// Public identity information shared between kernel and shell subsystems.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserIdentity {
+    /// Login/username.
+    pub username: String,
+    /// Primary numeric user identifier.
+    pub uid: u32,
+    /// Primary group identifier.
+    pub gid: u32,
+    /// Supplemental group identifiers.
+    pub groups: Vec<u32>,
+    /// Preferred home directory path.
+    pub home: String,
+    /// Preferred login shell path.
+    pub shell: String,
+}
+
+/// Authentication outcomes returned by [`ShellSystem::authenticate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthError {
+    /// Referenced user does not exist.
+    NotFound,
+    /// Password mismatch.
+    InvalidPassword,
+    /// Authentication backend unavailable.
+    Unsupported,
+}
+
+/// Errors surfaced when managing user accounts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserAdminError {
+    /// Username already exists.
+    AlreadyExists,
+    /// User not found.
+    NotFound,
+    /// Password rejected (e.g., too short).
+    InvalidPassword,
+    /// Caller lacks required privileges.
+    PermissionDenied,
+    /// Operation not supported by backend.
+    Unsupported,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,6 +259,14 @@ enum BuiltinCommand {
     Mv,
     Reboot,
     Shutdown,
+    Chmod,
+    Chown,
+    Whoami,
+    Id,
+    Users,
+    Su,
+    UserAdd,
+    Passwd,
 }
 
 struct CommandBinary {
@@ -239,11 +330,27 @@ where
 {
     /// Creates a new shell instance with the given IO backend.
     pub fn new(io: Io, fs: Fs, sys: Sys) -> Self {
+        let session = sys.current_user();
+        let hostname = {
+            let reported = sys.hostname();
+            if reported.is_empty() {
+                HOSTNAME_DEFAULT.to_string()
+            } else {
+                reported.to_string()
+            }
+        };
+        let starting_dir = if session.home.is_empty() {
+            String::from("/")
+        } else {
+            session.home.clone()
+        };
         let mut shell = Self {
             keyboard: Keyboard::new(ScancodeSet1::new(), Us104Key, HandleControl::Ignore),
             input: String::new(),
             history: Vec::new(),
-            current_dir: "/".to_string(),
+            current_dir: starting_dir,
+            current_user: session,
+            hostname,
             io,
             fs,
             sys,
@@ -402,7 +509,11 @@ where
         let target = if let Some(first) = args.first() {
             self.make_absolute_path(Some(first))
         } else {
-            "/".to_string()
+            if self.current_user.home.is_empty() {
+                "/".to_string()
+            } else {
+                self.current_user.home.clone()
+            }
         };
         match self.fs.list_dir(&target) {
             Ok(_) => {
@@ -631,6 +742,296 @@ where
     fn command_read_only(&mut self, cmd: &str) {
         self.print(cmd);
         self.println(": write support not wired into the bare shell yet");
+    }
+
+    fn command_chmod(&mut self, args: &[&str]) {
+        if args.len() != 2 {
+            self.println("usage: chmod MODE PATH");
+            return;
+        }
+        let mode_str = args[0];
+        let mode = match u16::from_str_radix(mode_str, 8) {
+            Ok(value) => value,
+            Err(_) => {
+                self.print("chmod: invalid mode: ");
+                self.println(mode_str);
+                return;
+            }
+        };
+        let path = self.make_absolute_path(Some(args[1]));
+        match self.fs.chmod(&path, mode) {
+            Ok(()) => {}
+            Err(FsError::Unavailable) => self.println("chmod: filesystem unavailable"),
+            Err(FsError::NotFound) => {
+                self.print("chmod: no such file or directory: ");
+                self.println(&path);
+            }
+            Err(FsError::NotDirectory) | Err(FsError::NotFile) => {
+                self.print("chmod: invalid target: ");
+                self.println(&path);
+            }
+            Err(FsError::PermissionDenied) => self.println("chmod: permission denied"),
+            Err(FsError::Corrupt) => self.println("chmod: filesystem corrupt"),
+            Err(FsError::AlreadyExists) => {}
+        }
+    }
+
+    fn command_chown(&mut self, args: &[&str]) {
+        if !self.require_root("chown") {
+            return;
+        }
+        if args.len() != 2 {
+            self.println("usage: chown USER[:GROUP] PATH");
+            return;
+        }
+        let spec = args[0];
+        let path = self.make_absolute_path(Some(args[1]));
+        let (uid, gid) = match self.parse_owner_spec(spec) {
+            Ok(pair) => pair,
+            Err(message) => {
+                self.print("chown: ");
+                self.println(&message);
+                return;
+            }
+        };
+
+        match self.fs.chown(&path, uid, gid) {
+            Ok(()) => {}
+            Err(FsError::Unavailable) => self.println("chown: filesystem unavailable"),
+            Err(FsError::NotFound) => {
+                self.print("chown: no such file or directory: ");
+                self.println(&path);
+            }
+            Err(FsError::NotDirectory) | Err(FsError::NotFile) => {
+                self.print("chown: invalid target: ");
+                self.println(&path);
+            }
+            Err(FsError::PermissionDenied) => self.println("chown: permission denied"),
+            Err(FsError::Corrupt) => self.println("chown: filesystem corrupt"),
+            Err(FsError::AlreadyExists) => {}
+        }
+    }
+
+    fn command_whoami(&mut self) {
+        let username = self.current_user.username.clone();
+        self.println(&username);
+    }
+
+    fn command_id(&mut self) {
+        let mut line = format!(
+            "uid={}({}) gid={}({})",
+            self.current_user.uid, self.current_user.username, self.current_user.gid, self.current_user.gid
+        );
+        if !self.current_user.groups.is_empty() {
+            let groups = self
+                .current_user
+                .groups
+                .iter()
+                .map(|gid| gid.to_string())
+                .collect::<Vec<String>>()
+                .join(",");
+            line.push_str(&format!(" groups={groups}"));
+        }
+        self.println(&line);
+    }
+
+    fn command_users(&mut self) {
+        match self.sys.list_users() {
+            Ok(users) => {
+                let mut first = true;
+                for user in users {
+                    if !first {
+                        self.print(" ");
+                    }
+                    first = false;
+                    self.print(&user.username);
+                }
+                self.print("\r\n");
+            }
+            Err(UserAdminError::Unsupported) => self.println("users: user database not available"),
+            Err(UserAdminError::PermissionDenied) => self.println("users: permission denied"),
+            Err(_) => self.println("users: failed to retrieve user list"),
+        }
+    }
+
+    fn command_su(&mut self, args: &[&str]) {
+        if args.is_empty() || args.len() > 2 {
+            self.println("usage: su USERNAME [PASSWORD]");
+            return;
+        }
+
+        let username = args[0];
+        let target_identity = if self.is_root() && args.len() == 1 {
+            match self.sys.lookup_user(username) {
+                Some(user) => user,
+                None => {
+                    self.print("su: unknown user ");
+                    self.println(username);
+                    return;
+                }
+            }
+        } else {
+            let Some(password) = args.get(1) else {
+                self.println("su: password required");
+                return;
+            };
+            match self.sys.authenticate(username, password) {
+                Ok(user) => user,
+                Err(AuthError::NotFound) => {
+                    self.print("su: unknown user ");
+                    self.println(username);
+                    return;
+                }
+                Err(AuthError::InvalidPassword) => {
+                    self.println("su: authentication failure");
+                    return;
+                }
+                Err(AuthError::Unsupported) => {
+                    self.println("su: authentication backend unavailable");
+                    return;
+                }
+            }
+        };
+
+        match self.sys.set_session(&target_identity) {
+            Ok(updated) => {
+                self.current_user = updated;
+                if !self.current_user.home.is_empty() {
+                    self.current_dir = self.current_user.home.clone();
+                }
+                self.println(&format!("now logged in as {}", self.current_user.username));
+            }
+            Err(AuthError::Unsupported) => self.println("su: session switching unsupported"),
+            Err(AuthError::NotFound) => self.println("su: user not found"),
+            Err(AuthError::InvalidPassword) => self.println("su: authentication failure"),
+        }
+    }
+
+    fn command_useradd(&mut self, args: &[&str]) {
+        if !self.require_root("useradd") {
+            return;
+        }
+        if args.len() < 2 {
+            self.println("usage: useradd USER PASSWORD [--home PATH]");
+            return;
+        }
+
+        let username = args[0];
+        let password = args[1];
+        let mut home: Option<String> = None;
+        let mut idx = 2;
+        while idx < args.len() {
+            match args[idx] {
+                "--home" => {
+                    if idx + 1 >= args.len() {
+                        self.println("useradd: missing argument for --home");
+                        return;
+                    }
+                    let value = args[idx + 1];
+                    let resolved = if value.starts_with('/') {
+                        value.to_string()
+                    } else {
+                        self.make_absolute_path(Some(value))
+                    };
+                    home = Some(resolved);
+                    idx += 2;
+                }
+                other => {
+                    self.print("useradd: unknown option ");
+                    self.println(other);
+                    return;
+                }
+            }
+        }
+
+        match self
+            .sys
+            .create_user(username, password, home.as_deref())
+        {
+            Ok(identity) => {
+                self.println(&format!("user {} created (uid={})", identity.username, identity.uid));
+            }
+            Err(UserAdminError::AlreadyExists) => self.println("useradd: user already exists"),
+            Err(UserAdminError::InvalidPassword) => self.println("useradd: password rejected"),
+            Err(UserAdminError::PermissionDenied) => self.println("useradd: permission denied"),
+            Err(UserAdminError::Unsupported) => self.println("useradd: operation unsupported"),
+            Err(UserAdminError::NotFound) => self.println("useradd: backend missing prerequisite"),
+        }
+    }
+
+    fn command_passwd(&mut self, args: &[&str]) {
+        if args.is_empty() || args.len() > 2 {
+            self.println("usage: passwd [USER] NEWPASSWORD");
+            return;
+        }
+
+        let (username, new_password) = if args.len() == 1 {
+            (self.current_user.username.as_str(), args[0])
+        } else {
+            let target = args[0];
+            if !self.is_root() && target != self.current_user.username {
+                self.println("passwd: permission denied");
+                return;
+            }
+            (target, args[1])
+        };
+
+        match self.sys.set_password(username, new_password) {
+            Ok(()) => self.println("password updated"),
+            Err(UserAdminError::NotFound) => self.println("passwd: user not found"),
+            Err(UserAdminError::InvalidPassword) => self.println("passwd: password rejected"),
+            Err(UserAdminError::PermissionDenied) => self.println("passwd: permission denied"),
+            Err(UserAdminError::Unsupported) => self.println("passwd: operation unsupported"),
+            Err(UserAdminError::AlreadyExists) => {}
+        }
+    }
+
+    fn parse_owner_spec(&mut self, spec: &str) -> Result<(u32, u32), String> {
+        let (user_part, group_part) = match spec.split_once(':') {
+            Some((user, group)) if !user.is_empty() => (user, Some(group)),
+            _ => (spec, None),
+        };
+
+        let (uid, default_gid) = self.parse_user_token(user_part)?;
+        let gid = match group_part {
+            Some(group) if !group.is_empty() => self.parse_group_token(group)?,
+            _ => default_gid.unwrap_or(uid),
+        };
+        Ok((uid, gid))
+    }
+
+    fn parse_user_token(&mut self, token: &str) -> Result<(u32, Option<u32>), String> {
+        if let Ok(id) = token.parse::<u32>() {
+            Ok((id, None))
+        } else if let Some(user) = self.sys.lookup_user(token) {
+            Ok((user.uid, Some(user.gid)))
+        } else {
+            Err(format!("unknown user '{token}'"))
+        }
+    }
+
+    fn parse_group_token(&mut self, token: &str) -> Result<u32, String> {
+        if let Ok(id) = token.parse::<u32>() {
+            Ok(id)
+        } else if let Some(user) = self.sys.lookup_user(token) {
+            Ok(user.gid)
+        } else {
+            Err(format!("unknown group '{token}'"))
+        }
+    }
+
+    fn require_root(&mut self, command: &str) -> bool {
+        if self.is_root() {
+            true
+        } else {
+            self.print(command);
+            self.println(": permission denied (requires root)");
+            false
+        }
+    }
+
+    fn is_root(&self) -> bool {
+        self.current_user.uid == 0
     }
 
     fn command_sh(&mut self, args: &[&str]) {
@@ -884,21 +1285,39 @@ where
 
     fn run_external(&mut self, path: &str, args: &[&str]) {
         let display = path.rsplit('/').next().unwrap_or(path);
-        let mut env_pairs: Vec<(&str, &str)> = Vec::new();
-        let mut history_blob = None;
-        let mut history_count = None;
-
+        let mut owned_env: Vec<(String, String)> = Vec::new();
         if !self.history.is_empty() {
-            history_blob = Some(self.history.join("\n"));
-            history_count = Some(self.history.len().to_string());
+            owned_env.push((
+                "SHELL_HISTORY".to_string(),
+                self.history.join("\n"),
+            ));
+            owned_env.push((
+                "SHELL_HISTORY_COUNT".to_string(),
+                self.history.len().to_string(),
+            ));
         }
 
-        if let Some(ref blob) = history_blob {
-            env_pairs.push(("SHELL_HISTORY", blob.as_str()));
+        owned_env.push(("USER".to_string(), self.current_user.username.clone()));
+        owned_env.push(("HOME".to_string(), self.current_user.home.clone()));
+        owned_env.push(("UID".to_string(), self.current_user.uid.to_string()));
+        owned_env.push(("GID".to_string(), self.current_user.gid.to_string()));
+        owned_env.push(("HOSTNAME".to_string(), self.hostname.clone()));
+        owned_env.push(("PWD".to_string(), self.current_dir.clone()));
+        if !self.current_user.groups.is_empty() {
+            let groups = self
+                .current_user
+                .groups
+                .iter()
+                .map(|gid| gid.to_string())
+                .collect::<Vec<String>>()
+                .join(",");
+            owned_env.push(("GROUPS".to_string(), groups));
         }
-        if let Some(ref count) = history_count {
-            env_pairs.push(("SHELL_HISTORY_COUNT", count.as_str()));
-        }
+
+        let env_pairs: Vec<(&str, &str)> = owned_env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         match self
             .sys
@@ -979,6 +1398,14 @@ where
             BuiltinCommand::Mv => self.command_read_only("mv"),
             BuiltinCommand::Reboot => self.command_reboot(),
             BuiltinCommand::Shutdown => self.command_shutdown(),
+            BuiltinCommand::Chmod => self.command_chmod(args),
+            BuiltinCommand::Chown => self.command_chown(args),
+            BuiltinCommand::Whoami => self.command_whoami(),
+            BuiltinCommand::Id => self.command_id(),
+            BuiltinCommand::Users => self.command_users(),
+            BuiltinCommand::Su => self.command_su(args),
+            BuiltinCommand::UserAdd => self.command_useradd(args),
+            BuiltinCommand::Passwd => self.command_passwd(args),
         }
     }
 
@@ -1000,6 +1427,14 @@ where
             "mv" => Some(BuiltinCommand::Mv),
             "reboot" => Some(BuiltinCommand::Reboot),
             "shutdown" => Some(BuiltinCommand::Shutdown),
+            "chmod" => Some(BuiltinCommand::Chmod),
+            "chown" => Some(BuiltinCommand::Chown),
+            "whoami" => Some(BuiltinCommand::Whoami),
+            "id" => Some(BuiltinCommand::Id),
+            "users" => Some(BuiltinCommand::Users),
+            "su" => Some(BuiltinCommand::Su),
+            "useradd" => Some(BuiltinCommand::UserAdd),
+            "passwd" => Some(BuiltinCommand::Passwd),
             _ => None,
         }
     }
@@ -1022,6 +1457,14 @@ where
             13 => Some(BuiltinCommand::Reboot),
             14 => Some(BuiltinCommand::Shutdown),
             15 => Some(BuiltinCommand::Shell),
+            16 => Some(BuiltinCommand::Chmod),
+            17 => Some(BuiltinCommand::Chown),
+            18 => Some(BuiltinCommand::Whoami),
+            19 => Some(BuiltinCommand::Id),
+            20 => Some(BuiltinCommand::Users),
+            21 => Some(BuiltinCommand::Su),
+            22 => Some(BuiltinCommand::UserAdd),
+            23 => Some(BuiltinCommand::Passwd),
             _ => None,
         }
     }
@@ -1193,7 +1636,34 @@ where
     }
 
     fn normalize_path(&self, path: &str) -> String {
-        let mut stack: Vec<String> = if path.starts_with('/') {
+        let mut expanded = if path == "~" {
+            if self.current_user.home.is_empty() {
+                "/".to_string()
+            } else {
+                self.current_user.home.clone()
+            }
+        } else if let Some(rest) = path.strip_prefix("~/") {
+            let mut base = if self.current_user.home.is_empty() {
+                "/".to_string()
+            } else {
+                self.current_user.home.clone()
+            };
+            if !rest.is_empty() && !base.ends_with('/') {
+                base.push('/');
+            }
+            base.push_str(rest);
+            base
+        } else {
+            path.to_string()
+        };
+
+        if expanded.starts_with('~') {
+            expanded = path.to_string();
+        }
+
+        let effective = expanded.as_str();
+
+        let mut stack: Vec<String> = if effective.starts_with('/') {
             Vec::new()
         } else if self.current_dir == "/" {
             Vec::new()
@@ -1206,7 +1676,7 @@ where
                 .collect()
         };
 
-        for component in path.split('/') {
+        for component in effective.split('/') {
             match component {
                 "" | "." => {}
                 ".." => {
@@ -1258,14 +1728,16 @@ where
     }
 
     fn print_prompt(&mut self) {
-        let current = self.current_dir.clone();
-        self.print(PROMPT_PREFIX);
-        self.print(":");
-        self.print(&current);
-        if current != "/" {
-            self.print(" ");
-        }
-        self.print("> ");
+        let current = if self.current_dir.is_empty() {
+            "/".to_string()
+        } else {
+            self.current_dir.clone()
+        };
+        let prompt = format!(
+            "{}@{}:{}$ ",
+            self.current_user.username, self.hostname, current
+        );
+        self.print(&prompt);
     }
 }
 
@@ -1299,6 +1771,19 @@ mod tests {
 
     struct TestSystem;
 
+    impl TestSystem {
+        fn root_identity() -> UserIdentity {
+            UserIdentity {
+                username: "root".to_string(),
+                uid: 0,
+                gid: 0,
+                groups: Vec::new(),
+                home: "/".to_string(),
+                shell: "/bin/sh".to_string(),
+            }
+        }
+    }
+
     impl ShellSystem for TestSystem {
         fn reboot(&self) -> Result<(), SystemError> {
             Err(SystemError::Unsupported)
@@ -1316,6 +1801,55 @@ mod tests {
             _env: &[(&str, &str)],
         ) -> Result<ExecResult, SystemError> {
             Err(SystemError::Unsupported)
+        }
+
+        fn current_user(&self) -> UserIdentity {
+            Self::root_identity()
+        }
+
+        fn authenticate(
+            &self,
+            username: &str,
+            password: &str,
+        ) -> Result<UserIdentity, AuthError> {
+            if username == "root" && password == "root" {
+                Ok(Self::root_identity())
+            } else {
+                Err(AuthError::InvalidPassword)
+            }
+        }
+
+        fn set_session(&self, user: &UserIdentity) -> Result<UserIdentity, AuthError> {
+            Ok(user.clone())
+        }
+
+        fn create_user(
+            &self,
+            _username: &str,
+            _password: &str,
+            _home: Option<&str>,
+        ) -> Result<UserIdentity, UserAdminError> {
+            Err(UserAdminError::Unsupported)
+        }
+
+        fn set_password(&self, _username: &str, _password: &str) -> Result<(), UserAdminError> {
+            Err(UserAdminError::Unsupported)
+        }
+
+        fn list_users(&self) -> Result<Vec<UserIdentity>, UserAdminError> {
+            Ok(vec![Self::root_identity()])
+        }
+
+        fn lookup_user(&self, username: &str) -> Option<UserIdentity> {
+            if username == "root" {
+                Some(Self::root_identity())
+            } else {
+                None
+            }
+        }
+
+        fn hostname(&self) -> &str {
+            "test-host"
         }
     }
 
