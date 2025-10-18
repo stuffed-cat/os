@@ -1,17 +1,13 @@
 //! Userland shell coordinator running inside the kernel event loop.
 
-use alloc::collections::VecDeque;
-use log::info;
-use spin::Mutex;
 use crate::arch::x86_64::serial;
 use crate::core::{KernelContext, Subsystem, SubsystemId};
 use crate::error::SubsystemError;
-use crate::fs::{
-    self,
-    EntryKind as FsEntryKind,
-    FsError as KernelFsError,
-};
+use crate::fs::{self, EntryKind as FsEntryKind, FsError as KernelFsError};
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use log::info;
+use spin::Mutex;
 use userland::{
     BareShell, DirEntry, EntryKind, FsError as ShellFsError, ShellFs, ShellIo, ShellSystem,
     SystemError,

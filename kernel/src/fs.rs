@@ -389,7 +389,12 @@ pub fn read_file(path: &str) -> Result<Vec<u8>, FsError> {
 }
 
 /// Writes data to a file as the superuser using the overlay layer.
-pub fn write_file(path: &str, offset: usize, data: &[u8], truncate: bool) -> Result<usize, FsError> {
+pub fn write_file(
+    path: &str,
+    offset: usize,
+    data: &[u8],
+    truncate: bool,
+) -> Result<usize, FsError> {
     write_file_with_credentials(path, &Credentials::root(), offset, data, truncate)
 }
 
@@ -606,7 +611,11 @@ pub fn file_info_with_credentials(
 }
 
 /// Creates an empty file in the overlay if it does not exist.
-pub fn create_file_with_credentials(path: &str, creds: &Credentials, mode: u16) -> Result<(), FsError> {
+pub fn create_file_with_credentials(
+    path: &str,
+    creds: &Credentials,
+    mode: u16,
+) -> Result<(), FsError> {
     let normalized = normalize_path(path)?;
     if normalized == "/" {
         return Err(FsError::AlreadyExists);
@@ -1423,8 +1432,8 @@ mod tests {
 
     #[test]
     fn parse_rootfs_image() {
-    let bytes = include_bytes!("../../assets/rootfs.ext4");
-    let fs = Ext2Fs::parse(bytes).expect("parse ext4");
+        let bytes = include_bytes!("../../assets/rootfs.ext4");
+        let fs = Ext2Fs::parse(bytes).expect("parse ext4");
         let creds = Credentials::root();
         let entries = fs.list_dir("/", &creds).expect("list root");
         let names: Vec<_> = entries.into_iter().map(|e| e.name).collect();
@@ -1434,8 +1443,8 @@ mod tests {
 
     #[test]
     fn read_readme_file() {
-    let bytes = include_bytes!("../../assets/rootfs.ext4");
-    let fs = Ext2Fs::parse(bytes).expect("parse ext4");
+        let bytes = include_bytes!("../../assets/rootfs.ext4");
+        let fs = Ext2Fs::parse(bytes).expect("parse ext4");
         let creds = Credentials::root();
         let data = fs.read_file("/README", &creds).expect("read README");
         assert!(!data.is_empty());
@@ -1443,8 +1452,8 @@ mod tests {
 
     #[test]
     fn bin_contains_command_binaries() {
-    let bytes = include_bytes!("../../assets/rootfs.ext4");
-    let fs = Ext2Fs::parse(bytes).expect("parse ext4");
+        let bytes = include_bytes!("../../assets/rootfs.ext4");
+        let fs = Ext2Fs::parse(bytes).expect("parse ext4");
         let creds = Credentials::root();
         let entries = fs.list_dir("/bin", &creds).expect("list /bin");
         let names: Vec<String> = entries.into_iter().map(|entry| entry.name).collect();
@@ -1488,8 +1497,8 @@ mod tests {
 
     #[test]
     fn overlay_write_roundtrip() {
-    let bytes = include_bytes!("../../assets/rootfs.ext4");
-    let fs = Ext2Fs::parse(bytes).expect("parse ext4");
+        let bytes = include_bytes!("../../assets/rootfs.ext4");
+        let fs = Ext2Fs::parse(bytes).expect("parse ext4");
         {
             let mut guard = FILESYSTEM.lock();
             *guard = Some(fs);

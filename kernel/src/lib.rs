@@ -35,7 +35,7 @@ pub use crate::error::{KernelError, SubsystemError};
 pub use crate::hal::{Hal, HalConfig};
 
 #[cfg(any(feature = "alloc", feature = "std"))]
-pub use crate::memory::{BootFrameAllocator, FrameRange, MemoryManager};
+pub use crate::memory::{BootFrameAllocator, FrameRange, MemoryManager, PageTableHandle};
 
 #[cfg(test)]
 mod tests;

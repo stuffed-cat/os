@@ -85,8 +85,11 @@ impl Stack {
         assert!(size > 0, "stack size must be non-zero");
         let aligned_top = align_up(top, PAGE_SIZE);
         let aligned_size = align_up(size as u64, PAGE_SIZE) as usize;
-    assert!(aligned_top >= aligned_size as u64, "stack top must exceed size");
-    let base = aligned_top - aligned_size as u64;
+        assert!(
+            aligned_top >= aligned_size as u64,
+            "stack top must exceed size"
+        );
+        let base = aligned_top - aligned_size as u64;
         Self {
             base,
             size: aligned_size,
@@ -278,7 +281,11 @@ impl UserContext {
 
 impl fmt::Display for UserContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "UserContext[rip={:#x}, rsp={:#x}]", self.frame.rip, self.frame.rsp)
+        write!(
+            f,
+            "UserContext[rip={:#x}, rsp={:#x}]",
+            self.frame.rip, self.frame.rsp
+        )
     }
 }
 
@@ -307,7 +314,10 @@ mod tests {
         assert!(segment.permissions().contains(MemoryFlags::READ));
         assert!(segment.permissions().contains(MemoryFlags::EXEC));
         assert!(!segment.permissions().contains(MemoryFlags::WRITE));
-        assert_eq!(layout.stack().top(), Stack::new(DEFAULT_STACK_TOP, DEFAULT_STACK_SIZE).top());
+        assert_eq!(
+            layout.stack().top(),
+            Stack::new(DEFAULT_STACK_TOP, DEFAULT_STACK_SIZE).top()
+        );
     }
 
     #[test]

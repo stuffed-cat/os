@@ -7,7 +7,14 @@ use spin::RwLock;
 use crate::error::SubsystemError;
 
 #[cfg(any(feature = "alloc", feature = "std"))]
+use crate::user::{AddressSpace, MemoryFlags, SegmentMapping, Stack};
+
+#[cfg(any(feature = "alloc", feature = "std"))]
+use alloc::vec::Vec;
+#[cfg(any(feature = "alloc", feature = "std"))]
 use arrayvec::ArrayVec;
+#[cfg(any(feature = "alloc", feature = "std"))]
+use core::ptr::{self, NonNull};
 #[cfg(any(feature = "alloc", feature = "std"))]
 use spin::Mutex;
 #[cfg(any(feature = "alloc", feature = "std"))]
@@ -193,12 +200,139 @@ unsafe impl FrameAllocator<Size4KiB> for BootFrameAllocator {
     }
 }
 
+#[cfg(any(feature = "alloc", feature = "std"))]
+struct FramePool {
+    base: BootFrameAllocator,
+    recycled: Vec<PhysFrame>,
+}
+
+#[cfg(any(feature = "alloc", feature = "std"))]
+impl FramePool {
+    fn new(base: BootFrameAllocator) -> Self {
+        Self {
+            base,
+            recycled: Vec::new(),
+        }
+    }
+
+    fn allocate(&mut self) -> Option<PhysFrame> {
+        if let Some(frame) = self.recycled.pop() {
+            return Some(frame);
+        }
+        self.base.allocate()
+    }
+
+    fn recycle(&mut self, frame: PhysFrame) {
+        self.recycled.push(frame);
+    }
+
+    fn recycle_many<I>(&mut self, frames: I)
+    where
+        I: IntoIterator<Item = PhysFrame>,
+    {
+        self.recycled.extend(frames);
+    }
+}
+
+/// Page table entries reserved for kernel space (upper canonical half).
+#[cfg(any(feature = "alloc", feature = "std"))]
+const KERNEL_PML4_SLOT_START: usize = 256;
+
+#[cfg(any(feature = "alloc", feature = "std"))]
+struct FrameAllocatorAdapter<'a> {
+    manager: &'a MemoryManager,
+    recorder: Option<NonNull<PageTableHandle>>,
+}
+
+#[cfg(any(feature = "alloc", feature = "std"))]
+impl<'a> FrameAllocatorAdapter<'a> {
+    fn new(manager: &'a MemoryManager) -> Self {
+        Self {
+            manager,
+            recorder: None,
+        }
+    }
+
+    fn with_recorder(manager: &'a MemoryManager, handle: NonNull<PageTableHandle>) -> Self {
+        Self {
+            manager,
+            recorder: Some(handle),
+        }
+    }
+}
+
+#[cfg(any(feature = "alloc", feature = "std"))]
+unsafe impl<'a> FrameAllocator<Size4KiB> for FrameAllocatorAdapter<'a> {
+    fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
+        let frame = self.manager.allocate_zeroed_frame()?;
+        if let Some(mut handle) = self.recorder {
+            unsafe {
+                handle.as_mut().record_page_table(frame);
+            }
+        }
+        Some(frame)
+    }
+}
+
+/// Handle owning the root and intermediate page table frames for a process.
+#[cfg(any(feature = "alloc", feature = "std"))]
+pub struct PageTableHandle {
+    manager: NonNull<MemoryManager>,
+    root: PhysFrame,
+    tables: Vec<PhysFrame>,
+    mappings: Vec<PhysFrame>,
+}
+
+#[cfg(any(feature = "alloc", feature = "std"))]
+impl PageTableHandle {
+    fn new(manager: &MemoryManager, root: PhysFrame) -> Self {
+        Self {
+            manager: NonNull::from(manager),
+            root,
+            tables: Vec::new(),
+            mappings: Vec::new(),
+        }
+    }
+
+    /// Returns the physical frame associated with the root PML4 table.
+    pub fn root(&self) -> PhysFrame {
+        self.root
+    }
+
+    /// Tracks an intermediate page table frame allocated while mapping regions.
+    pub fn record_page_table(&mut self, frame: PhysFrame) {
+        self.tables.push(frame);
+    }
+
+    /// Tracks a data frame mapped into the address space.
+    pub fn record_mapping(&mut self, frame: PhysFrame) {
+        self.mappings.push(frame);
+    }
+}
+
+#[cfg(any(feature = "alloc", feature = "std"))]
+impl Drop for PageTableHandle {
+    fn drop(&mut self) {
+        let manager = unsafe { self.manager.as_ref() };
+        if !self.tables.is_empty() {
+            let tables = core::mem::take(&mut self.tables);
+            manager.recycle_frames(tables);
+        }
+        if !self.mappings.is_empty() {
+            let mappings = core::mem::take(&mut self.mappings);
+            manager.recycle_frames(mappings);
+        }
+        manager.recycle_frame(self.root);
+    }
+}
+
 /// Controller for paging using an offset page table and boot-time allocator.
 #[cfg(any(feature = "alloc", feature = "std"))]
 pub struct MemoryManager {
     mapper: Mutex<OffsetPageTable<'static>>,
-    frames: Mutex<BootFrameAllocator>,
+    frames: Mutex<FramePool>,
     phys_offset: VirtAddr,
+    kernel_root: PhysFrame,
 }
 
 #[cfg(any(feature = "alloc", feature = "std"))]
@@ -206,10 +340,12 @@ impl MemoryManager {
     /// Creates a new memory manager instance.
     pub unsafe fn new(phys_mem_offset: VirtAddr, allocator: BootFrameAllocator) -> Self {
         let mapper = init_offset_page_table(phys_mem_offset);
+        let (kernel_root, _) = Cr3::read();
         Self {
             mapper: Mutex::new(mapper),
-            frames: Mutex::new(allocator),
+            frames: Mutex::new(FramePool::new(allocator)),
             phys_offset: phys_mem_offset,
+            kernel_root,
         }
     }
 
@@ -222,22 +358,155 @@ impl MemoryManager {
     ) -> Result<(), MapToError<Size4KiB>> {
         assert!(size > 0, "region size must be non-zero");
         let mut mapper = self.mapper.lock();
-        let mut allocator = self.frames.lock();
+        let mut table_allocator = FrameAllocatorAdapter::new(self);
 
         let start_page = Page::containing_address(start);
         let end_page = Page::containing_address(start + (size as u64 - 1));
 
         for page in Page::range_inclusive(start_page, end_page) {
-            let frame = allocator
-                .allocate_frame()
+            let frame = self
+                .allocate_zeroed_frame()
                 .ok_or(MapToError::FrameAllocationFailed)?;
             unsafe {
-                mapper.map_to(page, frame, flags, &mut *allocator)?.flush();
+                mapper
+                    .map_to(page, frame, flags, &mut table_allocator)?
+                    .flush();
             }
         }
         Ok(())
     }
 
+    /// Builds a user address space by cloning kernel mappings and inserting user segments.
+    pub fn map_address_space(
+        &self,
+        layout: &AddressSpace,
+    ) -> Result<PageTableHandle, SubsystemError> {
+        let mut handle = self.clone_kernel_page_table()?;
+        let handle_ptr = NonNull::from(&mut handle);
+        let root_virt = self.phys_offset + handle.root().start_address().as_u64();
+        let root_table: &mut PageTable = unsafe { &mut *(root_virt.as_mut_ptr::<PageTable>()) };
+        let mut mapper = unsafe { OffsetPageTable::new(root_table, self.phys_offset) };
+        let mut allocator = FrameAllocatorAdapter::with_recorder(self, handle_ptr);
+        for segment in layout.segments() {
+            self.map_segment_into(&mut mapper, &mut allocator, handle_ptr, segment)?;
+        }
+        self.map_stack_into(&mut mapper, &mut allocator, handle_ptr, layout.stack())?;
+        Ok(handle)
+    }
+
+    fn map_segment_into(
+        &self,
+        mapper: &mut OffsetPageTable<'static>,
+        allocator: &mut FrameAllocatorAdapter<'_>,
+        mut handle: NonNull<PageTableHandle>,
+        segment: &SegmentMapping,
+    ) -> Result<(), SubsystemError> {
+        if segment.length() == 0 {
+            return Ok(());
+        }
+
+        let start = VirtAddr::new(segment.base());
+        let end_addr = segment.base() + segment.length() as u64 - 1;
+        let end = VirtAddr::new(end_addr);
+        let start_page = Page::containing_address(start);
+        let end_page = Page::containing_address(end);
+        let flags = Self::flags_from_memory(segment.permissions());
+
+        for page in Page::range_inclusive(start_page, end_page) {
+            let frame = self
+                .allocate_zeroed_frame()
+                .ok_or(SubsystemError::Resource("out of physical frames"))?;
+            unsafe {
+                mapper
+                    .map_to(page, frame, flags, allocator)
+                    .map_err(|_| SubsystemError::Runtime("page mapping failed"))?
+                    .flush();
+                handle.as_mut().record_mapping(frame);
+            }
+            self.copy_segment_into_frame(frame, segment, page);
+        }
+        Ok(())
+    }
+
+    fn map_stack_into(
+        &self,
+        mapper: &mut OffsetPageTable<'static>,
+        allocator: &mut FrameAllocatorAdapter<'_>,
+        mut handle: NonNull<PageTableHandle>,
+        stack: &Stack,
+    ) -> Result<(), SubsystemError> {
+        let start = VirtAddr::new(stack.base());
+        let end_addr = stack.top().saturating_sub(1);
+        if end_addr < stack.base() {
+            return Ok(());
+        }
+        let end = VirtAddr::new(end_addr);
+        let start_page = Page::containing_address(start);
+        let end_page = Page::containing_address(end);
+        let flags = Self::stack_flags();
+
+        for page in Page::range_inclusive(start_page, end_page) {
+            let frame = self
+                .allocate_zeroed_frame()
+                .ok_or(SubsystemError::Resource("out of physical frames"))?;
+            unsafe {
+                mapper
+                    .map_to(page, frame, flags, allocator)
+                    .map_err(|_| SubsystemError::Runtime("stack mapping failed"))?
+                    .flush();
+                handle.as_mut().record_mapping(frame);
+            }
+        }
+        Ok(())
+    }
+
+    fn copy_segment_into_frame(
+        &self,
+        frame: PhysFrame,
+        segment: &SegmentMapping,
+        page: Page<Size4KiB>,
+    ) {
+        let page_start = page.start_address().as_u64();
+        let page_end = page_start + Size4KiB::SIZE; // exclusive upper bound
+        let seg_start = segment.base();
+        let seg_end = segment.base() + segment.length() as u64;
+
+        let copy_start = core::cmp::max(seg_start, page_start);
+        let copy_end = core::cmp::min(seg_end, page_end);
+        if copy_end <= copy_start {
+            return;
+        }
+
+        let payload_offset = (copy_start - seg_start) as usize;
+        let copy_len = (copy_end - copy_start) as usize;
+        let dest_offset = (copy_start - page_start) as usize;
+
+        let phys = frame.start_address().as_u64();
+        let virt = self.phys_offset + phys;
+        unsafe {
+            let dest = virt.as_mut_ptr::<u8>().add(dest_offset);
+            let src = segment.payload()[payload_offset..payload_offset + copy_len].as_ptr();
+            ptr::copy_nonoverlapping(src, dest, copy_len);
+        }
+    }
+
+    fn flags_from_memory(flags: MemoryFlags) -> PageTableFlags {
+        let mut result = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        if flags.contains(MemoryFlags::WRITE) {
+            result |= PageTableFlags::WRITABLE;
+        }
+        if !flags.contains(MemoryFlags::EXEC) {
+            result |= PageTableFlags::NO_EXECUTE;
+        }
+        result
+    }
+
+    fn stack_flags() -> PageTableFlags {
+        PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE
+    }
     /// Maps a single page to the given frame.
     pub fn map_to(
         &self,
@@ -246,9 +515,11 @@ impl MemoryManager {
         flags: PageTableFlags,
     ) -> Result<(), MapToError<Size4KiB>> {
         let mut mapper = self.mapper.lock();
-        let mut allocator = self.frames.lock();
+        let mut table_allocator = FrameAllocatorAdapter::new(self);
         unsafe {
-            mapper.map_to(page, frame, flags, &mut *allocator)?.flush();
+            mapper
+                .map_to(page, frame, flags, &mut table_allocator)?
+                .flush();
         }
         Ok(())
     }
@@ -256,6 +527,80 @@ impl MemoryManager {
     /// Returns the physical memory offset used by the mapper.
     pub fn physical_memory_offset(&self) -> VirtAddr {
         self.phys_offset
+    }
+
+    /// Returns the physical frame for the kernel's active PML4 table.
+    pub fn kernel_root_frame(&self) -> PhysFrame {
+        self.kernel_root
+    }
+
+    /// Creates a new page table hierarchy seeded with kernel-space mappings.
+    pub fn clone_kernel_page_table(&self) -> Result<PageTableHandle, SubsystemError> {
+        let root = self
+            .allocate_zeroed_frame()
+            .ok_or(SubsystemError::Resource("out of physical frames"))?;
+
+        self.with_page_table(root, |new_root| {
+            self.with_page_table_read(self.kernel_root, |kernel_root| {
+                for index in KERNEL_PML4_SLOT_START..512 {
+                    new_root[index] = kernel_root[index].clone();
+                }
+            });
+        });
+
+        Ok(PageTableHandle::new(self, root))
+    }
+
+    fn allocate_zeroed_frame(&self) -> Option<PhysFrame> {
+        let frame = {
+            let mut pool = self.frames.lock();
+            pool.allocate()
+        }?;
+        self.zero_frame(frame);
+        Some(frame)
+    }
+
+    fn recycle_frame(&self, frame: PhysFrame) {
+        let mut pool = self.frames.lock();
+        pool.recycle(frame);
+    }
+
+    fn recycle_frames<I>(&self, frames: I)
+    where
+        I: IntoIterator<Item = PhysFrame>,
+    {
+        let mut pool = self.frames.lock();
+        pool.recycle_many(frames);
+    }
+
+    fn zero_frame(&self, frame: PhysFrame) {
+        let virt = self.phys_offset + frame.start_address().as_u64();
+        unsafe {
+            let ptr = virt.as_u64() as *mut u8;
+            ptr::write_bytes(ptr, 0, Size4KiB::SIZE as usize);
+        }
+    }
+
+    fn with_page_table<F, T>(&self, frame: PhysFrame, f: F) -> T
+    where
+        F: FnOnce(&mut PageTable) -> T,
+    {
+        let virt = self.phys_offset + frame.start_address().as_u64();
+        unsafe {
+            let table: &mut PageTable = &mut *(virt.as_u64() as *mut PageTable);
+            f(table)
+        }
+    }
+
+    fn with_page_table_read<F, T>(&self, frame: PhysFrame, f: F) -> T
+    where
+        F: FnOnce(&PageTable) -> T,
+    {
+        let virt = self.phys_offset + frame.start_address().as_u64();
+        unsafe {
+            let table: &PageTable = &*(virt.as_u64() as *const PageTable);
+            f(table)
+        }
     }
 }
 

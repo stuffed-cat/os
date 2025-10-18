@@ -6,14 +6,16 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use spin::RwLock;
+use x86_64::structures::paging::PhysFrame;
 
 use crate::{
-    elf::{ExecutableImage, ElfError},
+    elf::{ElfError, ExecutableImage},
     error::SubsystemError,
     fs::{self, Credentials, FsError},
-    memory::Capability,
+    memory::{Capability, MemoryManager, PageTableHandle},
     scheduler::ThreadState,
     user::{AddressSpace, StackConfig, UserContext},
 };
@@ -62,6 +64,7 @@ pub struct Process {
     program: RwLock<Option<String>>,
     executable: RwLock<Option<ExecutableImage>>,
     address_space: RwLock<Option<AddressSpace>>,
+    page_table: RwLock<Option<PageTableHandle>>,
     user_context: RwLock<Option<UserContext>>,
     fds: RwLock<BTreeMap<u64, String>>,
     fd_offsets: RwLock<BTreeMap<u64, usize>>,
@@ -87,6 +90,7 @@ impl Process {
             program: RwLock::new(None),
             executable: RwLock::new(None),
             address_space: RwLock::new(None),
+            page_table: RwLock::new(None),
             user_context: RwLock::new(None),
             fds: RwLock::new(BTreeMap::new()),
             fd_offsets: RwLock::new(BTreeMap::new()),
@@ -153,14 +157,28 @@ impl Process {
     }
 
     /// Records the currently executing program.
-    pub fn set_program_image(&self, program: String, image: ExecutableImage) {
+    pub fn set_program_image(
+        &self,
+        program: String,
+        image: ExecutableImage,
+        memory: Option<&MemoryManager>,
+    ) -> Result<(), SubsystemError> {
         let address_space = AddressSpace::from_executable(&image, StackConfig::default());
         let stack_top = address_space.stack().top();
         let context = UserContext::for_entry(address_space.entry_point(), stack_top);
+
+        if let Some(manager) = memory {
+            let handle = manager.map_address_space(&address_space)?;
+            *self.page_table.write() = Some(handle);
+        } else {
+            self.page_table.write().take();
+        }
+
         *self.program.write() = Some(program);
         *self.executable.write() = Some(image);
         *self.address_space.write() = Some(address_space);
         *self.user_context.write() = Some(context);
+        Ok(())
     }
 
     /// Retrieves the program string.
@@ -181,6 +199,11 @@ impl Process {
     /// Returns the user context (register snapshot) if one has been built for the process.
     pub fn user_context(&self) -> Option<UserContext> {
         self.user_context.read().clone()
+    }
+
+    /// Returns the physical frame for the process's root page table, if mapped.
+    pub fn page_table_root(&self) -> Option<PhysFrame> {
+        self.page_table.read().as_ref().map(|handle| handle.root())
     }
 
     /// Replaces the stored user context.
@@ -366,8 +389,9 @@ impl Process {
         *target.capabilities.write() = self.capabilities.read().clone();
         *target.program.write() = self.program.read().clone();
         *target.executable.write() = self.executable.read().clone();
-    *target.address_space.write() = self.address_space.read().clone();
-    *target.user_context.write() = self.user_context.read().clone();
+        *target.address_space.write() = self.address_space.read().clone();
+        target.page_table.write().take();
+        *target.user_context.write() = self.user_context.read().clone();
         *target.fds.write() = self.fds.read().clone();
         *target.fd_offsets.write() = self.fd_offsets.read().clone();
         target
@@ -393,6 +417,7 @@ pub struct ProcessTable {
     next_pid: AtomicU64,
     processes: RwLock<BTreeMap<Pid, Arc<Process>>>,
     exec_overrides: RwLock<BTreeMap<String, ExecutableImage>>,
+    memory: RwLock<Option<NonNull<MemoryManager>>>,
 }
 
 /// Errors returned when waiting on child processes.
@@ -412,6 +437,7 @@ impl Default for ProcessTable {
             next_pid: AtomicU64::new(100),
             processes: RwLock::new(BTreeMap::new()),
             exec_overrides: RwLock::new(BTreeMap::new()),
+            memory: RwLock::new(None),
         }
     }
 }
@@ -424,6 +450,18 @@ impl ProcessTable {
 
     fn allocate_pid(&self) -> Pid {
         Pid(self.next_pid.fetch_add(1, Ordering::SeqCst))
+    }
+
+    /// Associates the kernel memory manager with the process table.
+    pub fn bind_memory_manager(&self, manager: &'static MemoryManager) {
+        *self.memory.write() = Some(NonNull::from(manager));
+    }
+
+    fn memory_manager(&self) -> Option<&'static MemoryManager> {
+        self.memory
+            .read()
+            .as_ref()
+            .map(|ptr| unsafe { ptr.as_ref() })
     }
 
     /// Spawns a new process.
@@ -463,7 +501,7 @@ impl ProcessTable {
             .ok_or(SubsystemError::Runtime("process not found"))?;
 
         if let Some(image) = self.exec_overrides.read().get(&program).cloned() {
-            proc.set_program_image(program, image);
+            proc.set_program_image(program, image, self.memory_manager())?;
             return Ok(());
         }
 
@@ -494,7 +532,7 @@ impl ProcessTable {
             ElfError::NoLoadSegments => SubsystemError::Runtime("executable missing segments"),
         })?;
 
-        proc.set_program_image(program, image);
+        proc.set_program_image(program, image, self.memory_manager())?;
         Ok(())
     }
 

@@ -50,14 +50,8 @@ const HELP_ENTRIES: &[(&str, &str)] = &[
         "rmdir",
         "Remove a directory (overlay-backed; shell wiring WIP)",
     ),
-    (
-        "rm",
-        "Remove a file (overlay-backed; shell wiring WIP)",
-    ),
-    (
-        "cp",
-        "Copy a file",
-    ),
+    ("rm", "Remove a file (overlay-backed; shell wiring WIP)"),
+    ("cp", "Copy a file"),
     (
         "mv",
         "Move or rename a file (overlay-backed; shell wiring WIP)",
@@ -77,8 +71,13 @@ pub trait ShellFs {
     /// Removes a filesystem node.
     fn remove_file(&self, path: &str) -> Result<(), FsError>;
     /// Writes bytes to a path at the given offset, optionally truncating first.
-    fn write_file(&self, path: &str, offset: usize, data: &[u8], truncate: bool)
-        -> Result<usize, FsError>;
+    fn write_file(
+        &self,
+        path: &str,
+        offset: usize,
+        data: &[u8],
+        truncate: bool,
+    ) -> Result<usize, FsError>;
     /// Updates an inode's permission bits.
     fn chmod(&self, path: &str, mode: u16) -> Result<(), FsError>;
     /// Updates an inode's owner/group identifiers.
@@ -1242,7 +1241,10 @@ mod tests {
             let mut dirs = BTreeSet::new();
             dirs.insert("/".to_string());
             Self {
-                state: Rc::new(RefCell::new(TestFsState { dirs, files: BTreeMap::new() })),
+                state: Rc::new(RefCell::new(TestFsState {
+                    dirs,
+                    files: BTreeMap::new(),
+                })),
             }
         }
 
@@ -1460,10 +1462,7 @@ mod tests {
         let mut shell = BareShell::new(TestIo::default(), fs, TestSystem);
         shell.command_cp(&["/src.txt", "/copy.txt"]);
 
-        assert_eq!(
-            shell.fs.file_contents("/copy.txt"),
-            Some(b"hello".to_vec())
-        );
+        assert_eq!(shell.fs.file_contents("/copy.txt"), Some(b"hello".to_vec()));
     }
 
     #[test]

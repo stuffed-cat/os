@@ -113,8 +113,13 @@ impl ExecutableImage {
             return Err(ElfError::BadProgramHeaderBounds);
         }
 
-        let header_table_len = e_phentsize.checked_mul(e_phnum).ok_or(ElfError::BadProgramHeaderBounds)?;
-        if e_phoff.checked_add(header_table_len).map_or(true, |end| end > data.len()) {
+        let header_table_len = e_phentsize
+            .checked_mul(e_phnum)
+            .ok_or(ElfError::BadProgramHeaderBounds)?;
+        if e_phoff
+            .checked_add(header_table_len)
+            .map_or(true, |end| end > data.len())
+        {
             return Err(ElfError::BadProgramHeaderBounds);
         }
 
@@ -137,7 +142,10 @@ impl ExecutableImage {
                 return Err(ElfError::BadSegmentBounds);
             }
 
-            if p_offset.checked_add(p_filesz).map_or(true, |end| end > data.len()) {
+            if p_offset
+                .checked_add(p_filesz)
+                .map_or(true, |end| end > data.len())
+            {
                 return Err(ElfError::BadSegmentBounds);
             }
 
@@ -164,15 +172,24 @@ impl ExecutableImage {
             return Err(ElfError::NoLoadSegments);
         }
 
-        Ok(Self { entry_point: e_entry, segments })
+        Ok(Self {
+            entry_point: e_entry,
+            segments,
+        })
     }
 
     /// Builds an executable image from already prepared segments.
-    pub fn from_parts(entry_point: u64, segments: Vec<ExecutableSegment>) -> Result<Self, ElfError> {
+    pub fn from_parts(
+        entry_point: u64,
+        segments: Vec<ExecutableSegment>,
+    ) -> Result<Self, ElfError> {
         if segments.is_empty() {
             return Err(ElfError::NoLoadSegments);
         }
-        Ok(Self { entry_point, segments })
+        Ok(Self {
+            entry_point,
+            segments,
+        })
     }
 
     /// Entry point address specified by the ELF header.
