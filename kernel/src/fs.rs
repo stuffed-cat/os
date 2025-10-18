@@ -414,19 +414,13 @@ mod tests {
         let entries = fs.list_dir("/bin").expect("list /bin");
         let names: Vec<String> = entries.into_iter().map(|entry| entry.name).collect();
         for expected in [
-            "cat",
-            "cd",
-            "cp",
-            "echo",
-            "ls",
-            "mkdir",
-            "mv",
-            "pwd",
-            "rm",
-            "rmdir",
-            "touch",
+            "cat", "cd", "cp", "echo", "ls", "mkdir", "mv", "pwd", "rm", "rmdir", "reboot",
+            "shutdown", "touch",
         ] {
-            assert!(names.contains(&expected.to_string()), "missing /bin/{expected}");
+            assert!(
+                names.contains(&expected.to_string()),
+                "missing /bin/{expected}"
+            );
         }
     }
 }

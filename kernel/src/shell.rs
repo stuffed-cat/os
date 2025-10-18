@@ -9,7 +9,10 @@ use crate::core::{KernelContext, Subsystem, SubsystemId};
 use crate::error::SubsystemError;
 use crate::fs::{self, EntryKind as FsEntryKind, FsError as KernelFsError};
 use alloc::vec::Vec;
-use userland::{BareShell, DirEntry, EntryKind, FsError as ShellFsError, ShellFs, ShellIo};
+use userland::{
+    BareShell, DirEntry, EntryKind, FsError as ShellFsError, ShellFs, ShellIo, ShellSystem,
+    SystemError,
+};
 
 const SCANCODE_QUEUE_CAPACITY: usize = 256;
 
@@ -17,14 +20,14 @@ static SCANCODE_QUEUE: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
 
 /// Shell subsystem bridging keyboard interrupts and the userland shell loop.
 pub struct ShellSubsystem {
-    shell: BareShell<SerialShellIo, KernelShellFs>,
+    shell: BareShell<SerialShellIo, KernelShellFs, KernelShellSystem>,
 }
 
 impl ShellSubsystem {
     /// Creates a new shell subsystem instance.
     pub fn new() -> Self {
         Self {
-            shell: BareShell::new(SerialShellIo, KernelShellFs),
+            shell: BareShell::new(SerialShellIo, KernelShellFs, KernelShellSystem),
         }
     }
 
@@ -65,6 +68,8 @@ impl ShellIo for SerialShellIo {
 
 struct KernelShellFs;
 
+struct KernelShellSystem;
+
 impl ShellFs for KernelShellFs {
     fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>, ShellFsError> {
         match fs::list_dir(path) {
@@ -98,6 +103,34 @@ impl ShellFs for KernelShellFs {
             Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
             Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
             Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
+        }
+    }
+}
+
+impl ShellSystem for KernelShellSystem {
+    fn reboot(&self) -> Result<(), SystemError> {
+        #[cfg(feature = "hardware")]
+        {
+            crate::arch::x86_64::power::reboot();
+            return Ok(());
+        }
+
+        #[cfg(not(feature = "hardware"))]
+        {
+            Err(SystemError::Unsupported)
+        }
+    }
+
+    fn shutdown(&self) -> Result<(), SystemError> {
+        #[cfg(feature = "hardware")]
+        {
+            crate::arch::x86_64::power::shutdown();
+            return Ok(());
+        }
+
+        #[cfg(not(feature = "hardware"))]
+        {
+            Err(SystemError::Unsupported)
         }
     }
 }

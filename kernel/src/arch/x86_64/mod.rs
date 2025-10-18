@@ -30,6 +30,7 @@ pub mod framebuffer {
     /// Stub framebuffer writer for host testing.
     pub fn write_str(_: &str) {}
 }
+pub mod power;
 pub mod serial;
 
 pub use boot::ArchBootstrap;

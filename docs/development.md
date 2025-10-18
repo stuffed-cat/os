@@ -50,14 +50,16 @@ mke2fs -t ext2 -d assets/rootfs -b 1024 -m 0 assets/rootfs.ext2 1024
 |------|------|------|
 | `help` | 显示帮助 | |
 | `history` | 查看历史命令 | |
-| `ls [PATH]` | 列出目录内容 | 支持相对/绝对路径 |
+| `ls [PATH]` | 列出目录内容 | 支持相对/绝对路径，可使用 `-a`/`--all`、`--color[=WHEN]` |
 | `pwd` | 显示当前工作目录 | |
 | `cd [PATH]` | 切换工作目录 | 多参数报错 |
 | `cat FILE...` | 打印文件内容 | 仅支持 ext2 中的常规文件 |
 | `echo ARGS...` | 原样回显参数 | |
 | `touch`/`mkdir`/`rmdir`/`rm`/`cp`/`mv` | 预留命令 | 当前根文件系统为只读，这些命令会提示只读限制 |
+| `reboot` | 请求重启 | 在 `hardware` 构建目标上调用 ACPI/键盘复位，其他配置打印提示 |
+| `shutdown` | 请求关机 | 同上 |
 
-> 注意：上述命令的逻辑在 `userland/src/bare_shell.rs` 中实现，并通过 `/bin/<command>` 占位符文件在镜像中暴露，方便后续迁移到可执行文件模型。
+> 注意：上述命令的逻辑在 `userland/src/bare_shell.rs` 中实现，并通过 `/bin/<command>` 占位符文件在镜像中暴露，方便后续迁移到可执行文件模型。彩色输出基于 ANSI 转义序列，如需关闭可执行 `ls --color=never`。
 
 ### 构建裸机镜像
 

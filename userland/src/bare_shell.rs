@@ -1,5 +1,6 @@
 //! Minimal shell support for bare-metal boot while the full shell is feature-gated to `std` builds.
 
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
@@ -15,16 +16,19 @@ pub trait ShellIo {
 }
 
 /// Bare minimal shell loop used during bring-up on bare-metal targets.
-pub struct BareShell<Io, Fs> {
+pub struct BareShell<Io, Fs, Sys> {
     keyboard: Keyboard<Us104Key, ScancodeSet1>,
     input: String,
     history: Vec<String>,
     current_dir: String,
     io: Io,
     fs: Fs,
+    sys: Sys,
 }
 
 const PROMPT_PREFIX: &str = "bare shell";
+const COLOR_BLUE: &str = "\x1b[1;34m";
+const COLOR_RESET: &str = "\x1b[0m";
 const HELP_ENTRIES: &[(&str, &str)] = &[
     ("help", "Show this help message"),
     ("history", "Display previously executed commands"),
@@ -51,6 +55,8 @@ const HELP_ENTRIES: &[(&str, &str)] = &[
         "mv",
         "Move or rename a file (not supported on read-only FS)",
     ),
+    ("reboot", "Reboot the system"),
+    ("shutdown", "Power off the system"),
 ];
 
 /// Filesystem abstraction exposed to the bare shell.
@@ -59,6 +65,53 @@ pub trait ShellFs {
     fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError>;
     /// Reads a regular file from the provided absolute path.
     fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError>;
+}
+
+/// Platform control hooks exposed to the shell.
+pub trait ShellSystem {
+    /// Requests a system reboot.
+    fn reboot(&self) -> Result<(), SystemError>;
+    /// Requests a system shutdown/power off.
+    fn shutdown(&self) -> Result<(), SystemError>;
+}
+
+/// Errors returned by platform control hooks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemError {
+    /// Operation is not supported by the current backend.
+    Unsupported,
+    /// Operation failed unexpectedly.
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColorMode {
+    Auto,
+    Always,
+    Never,
+}
+
+impl ColorMode {
+    fn uses_color(self) -> bool {
+        matches!(self, ColorMode::Auto | ColorMode::Always)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LsOptions {
+    show_hidden: bool,
+    color_mode: ColorMode,
+    help: bool,
+}
+
+impl Default for LsOptions {
+    fn default() -> Self {
+        Self {
+            show_hidden: false,
+            color_mode: ColorMode::Auto,
+            help: false,
+        }
+    }
 }
 
 /// Shell-friendly filesystem error type.
@@ -85,13 +138,14 @@ pub struct DirEntry {
     pub kind: EntryKind,
 }
 
-impl<Io, Fs> BareShell<Io, Fs>
+impl<Io, Fs, Sys> BareShell<Io, Fs, Sys>
 where
     Io: ShellIo,
     Fs: ShellFs,
+    Sys: ShellSystem,
 {
     /// Creates a new shell instance with the given IO backend.
-    pub fn new(io: Io, fs: Fs) -> Self {
+    pub fn new(io: Io, fs: Fs, sys: Sys) -> Self {
         let mut shell = Self {
             keyboard: Keyboard::new(ScancodeSet1::new(), Us104Key, HandleControl::Ignore),
             input: String::new(),
@@ -99,6 +153,7 @@ where
             current_dir: "/".to_string(),
             io,
             fs,
+            sys,
         };
         shell.print_prompt();
         shell
@@ -156,6 +211,8 @@ where
                     "rm" => self.command_read_only("rm"),
                     "cp" => self.command_read_only("cp"),
                     "mv" => self.command_read_only("mv"),
+                    "reboot" => self.command_reboot(),
+                    "shutdown" => self.command_shutdown(),
                     _ => self.println("command not found"),
                 }
             }
@@ -181,36 +238,53 @@ where
     }
 
     fn command_ls(&mut self, args: &[&str]) {
-        let target = self.make_absolute_path(args.first().copied());
-        let display = args.first().copied().unwrap_or(".");
-        match self.fs.list_dir(&target) {
-            Ok(entries) => {
-                if entries.is_empty() {
-                    return;
-                }
-                let mut first = true;
-                for entry in entries {
-                    if !first {
-                        self.print("  ");
+        let (options, paths) = match self.parse_ls_args(args) {
+            Ok(result) => result,
+            Err(()) => return,
+        };
+
+        if options.help {
+            self.print_ls_help();
+            return;
+        }
+
+        let mut targets = Vec::new();
+        if paths.is_empty() {
+            targets.push((String::from("."), self.current_dir.clone()));
+        } else {
+            for path in paths {
+                let absolute = self.make_absolute_path(Some(path));
+                targets.push((path.to_string(), absolute));
+            }
+        }
+
+        let multiple = targets.len() > 1;
+        let mut first_section = true;
+
+        for (display, absolute) in targets {
+            match self.fs.list_dir(&absolute) {
+                Ok(entries) => {
+                    if multiple {
+                        if !first_section {
+                            self.print("\r\n");
+                        }
+                        self.print(&display);
+                        self.print(":\r\n");
                     }
-                    first = false;
-                    self.print(&entry.name);
-                    if matches!(entry.kind, EntryKind::Directory) {
-                        self.print("/");
-                    }
+                    first_section = false;
+                    self.print_directory_entries(entries, options.color_mode, options.show_hidden);
                 }
-                self.print("\r\n");
+                Err(FsError::Unavailable) => self.println("ls: filesystem unavailable"),
+                Err(FsError::NotFound) => {
+                    self.print("ls: not found: ");
+                    self.println(&display);
+                }
+                Err(FsError::NotDirectory | FsError::NotFile) => {
+                    self.print("ls: not a directory: ");
+                    self.println(&display);
+                }
+                Err(FsError::Corrupt) => self.println("ls: filesystem corrupt"),
             }
-            Err(FsError::Unavailable) => self.println("ls: filesystem unavailable"),
-            Err(FsError::NotFound) => {
-                self.print("ls: not found: ");
-                self.println(display);
-            }
-            Err(FsError::NotDirectory | FsError::NotFile) => {
-                self.print("ls: not a directory: ");
-                self.println(display);
-            }
-            Err(FsError::Corrupt) => self.println("ls: filesystem corrupt"),
         }
     }
 
@@ -300,6 +374,138 @@ where
     fn command_read_only(&mut self, cmd: &str) {
         self.print(cmd);
         self.println(": filesystem is read-only");
+    }
+
+    fn command_reboot(&mut self) {
+        self.println("reboot: attempting reboot...");
+        if let Err(err) = self.sys.reboot() {
+            match err {
+                SystemError::Unsupported => {
+                    self.println("reboot: operation unsupported on this build")
+                }
+                SystemError::Failed => self.println("reboot: hardware did not respond"),
+            }
+        }
+    }
+
+    fn command_shutdown(&mut self) {
+        self.println("shutdown: attempting power off...");
+        if let Err(err) = self.sys.shutdown() {
+            match err {
+                SystemError::Unsupported => {
+                    self.println("shutdown: operation unsupported on this build")
+                }
+                SystemError::Failed => self.println("shutdown: hardware did not respond"),
+            }
+        }
+    }
+
+    fn parse_ls_args<'a>(&mut self, args: &[&'a str]) -> Result<(LsOptions, Vec<&'a str>), ()> {
+        let mut options = LsOptions::default();
+        let mut paths = Vec::new();
+        let mut end_of_options = false;
+
+        for &arg in args {
+            if !end_of_options && arg == "--" {
+                end_of_options = true;
+                continue;
+            }
+
+            if !end_of_options && arg.starts_with("--") {
+                match arg {
+                    "--help" => options.help = true,
+                    "--all" | "--almost-all" => options.show_hidden = true,
+                    "--color" => options.color_mode = ColorMode::Always,
+                    _ => {
+                        if let Some(value) = arg.strip_prefix("--color=") {
+                            match value {
+                                "auto" => options.color_mode = ColorMode::Auto,
+                                "always" => options.color_mode = ColorMode::Always,
+                                "never" => options.color_mode = ColorMode::Never,
+                                _ => {
+                                    self.print("ls: invalid value for --color: ");
+                                    self.println(value);
+                                    return Err(());
+                                }
+                            }
+                        } else {
+                            self.print("ls: unsupported option: ");
+                            self.println(arg);
+                            return Err(());
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if !end_of_options && arg.starts_with('-') && arg.len() > 1 && arg != "-" {
+                for ch in arg.chars().skip(1) {
+                    match ch {
+                        'a' | 'A' => options.show_hidden = true,
+                        'h' => options.help = true,
+                        _ => {
+                            self.println(&format!("ls: unsupported flag -{ch}"));
+                            return Err(());
+                        }
+                    }
+                }
+                continue;
+            }
+
+            paths.push(arg);
+        }
+
+        Ok((options, paths))
+    }
+
+    fn print_ls_help(&mut self) {
+        self.println("用法: ls [选项]... [路径]");
+        self.println("简化版 ls 支持以下选项:");
+        self.println("  -a, --all           显示以 '.' 开头的文件");
+        self.println("  -h, --help          显示本帮助信息");
+        self.println("      --color[=WHEN]  启用彩色输出，WHEN=auto|always|never");
+        self.println("");
+        self.println("若未指定路径，则默认列出当前工作目录。");
+    }
+
+    fn print_directory_entries(
+        &mut self,
+        entries: Vec<DirEntry>,
+        color_mode: ColorMode,
+        show_hidden: bool,
+    ) {
+        let mut first = true;
+        for entry in entries {
+            if !show_hidden && entry.name.starts_with('.') {
+                continue;
+            }
+            if !first {
+                self.print("  ");
+            }
+            first = false;
+
+            let mut display_name = entry.name.clone();
+            if matches!(entry.kind, EntryKind::Directory) {
+                display_name.push('/');
+            }
+            let colored = self.apply_color(&display_name, entry.kind, color_mode);
+            self.print(&colored);
+        }
+
+        if !first {
+            self.print("\r\n");
+        }
+    }
+
+    fn apply_color(&self, name: &str, kind: EntryKind, mode: ColorMode) -> String {
+        if !mode.uses_color() {
+            return name.to_string();
+        }
+
+        match kind {
+            EntryKind::Directory => format!("{COLOR_BLUE}{name}{COLOR_RESET}"),
+            EntryKind::File => name.to_string(),
+        }
     }
 
     fn make_absolute_path(&self, arg: Option<&str>) -> String {
