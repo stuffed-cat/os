@@ -6,6 +6,7 @@ use crate::{
     error::{KernelError, SubsystemError},
     posix::{Errno, PosixLayer},
     process::{Pid, ProcessTable},
+    user::TrapFrame,
 };
 
 /// Identifiers for supported syscalls.
@@ -88,6 +89,15 @@ impl<'a> SyscallDispatcher<'a> {
             Ok(ret) => Ok(ret),
             Err(errno) => Err(map_errno(errno, id)),
         }
+    }
+
+    /// Handles a syscall triggered through a trap frame, mirroring the x86-64 Linux ABI.
+    pub fn handle_trap(&self, pid: Pid, frame: &mut TrapFrame) -> Result<(), KernelError> {
+        let id = SyscallId::from(frame.rax);
+        let args = [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9];
+        let result = self.handle(pid, id, &args)?;
+        frame.set_return_value(result);
+        Ok(())
     }
 
     /// Returns the underlying POSIX layer for explicit operations.

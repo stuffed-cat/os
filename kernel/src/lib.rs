@@ -26,6 +26,7 @@ pub mod scheduler;
 pub mod services;
 pub mod shell;
 pub mod syscall;
+pub mod user;
 
 pub use crate::core::{Kernel, KernelBuilder, KernelContext, KernelState, Subsystem, SubsystemId};
 pub use crate::error::{KernelError, SubsystemError};

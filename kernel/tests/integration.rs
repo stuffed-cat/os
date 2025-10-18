@@ -4,7 +4,8 @@ use kernel::{
     posix::{Errno, PosixLayer},
     process::{Pid, ProcessTable, Tid},
     scheduler::{RunQueueEntry, Scheduler, SchedulingClass},
-    syscall::SyscallId,
+    syscall::{SyscallDispatcher, SyscallId},
+    user::TrapFrame,
 };
 
 #[test]
@@ -62,6 +63,7 @@ fn posix_fork_exec_open_read_flow() {
     };
     let stub_image = ExecutableImage::from_parts(0x4000_0000, vec![stub_segment])
         .expect("stub executable valid");
+    let stub_entry = stub_image.entry_point();
     table.register_exec_override("/bin/init".to_string(), stub_image);
 
     let child_pid = layer
@@ -73,6 +75,18 @@ fn posix_fork_exec_open_read_flow() {
     layer
         .dispatch(parent.pid(), SyscallId::Exec, &[1])
         .expect("exec succeeds");
+
+    let exec_proc = table.lookup(parent.pid()).expect("process still present");
+    let address_space = exec_proc
+        .address_space()
+        .expect("address space present after exec");
+    assert_eq!(address_space.entry_point(), stub_entry);
+    assert_eq!(address_space.segments().len(), 1);
+    let context = exec_proc
+        .user_context()
+        .expect("user context present after exec");
+    assert_eq!(context.frame().rip, stub_entry);
+    assert_eq!(context.frame().rsp, address_space.stack().top());
 
     let fd = layer
         .dispatch(parent.pid(), SyscallId::Open, &[2, 0])
@@ -128,4 +142,17 @@ fn posix_fork_exec_open_read_flow() {
         .dispatch(parent.pid(), SyscallId::WaitPid, &[child_pid, 0, 0])
         .unwrap_err();
     assert_eq!(no_child, Errno::Child);
+}
+
+#[test]
+fn syscall_dispatcher_handles_trap_frame() {
+    let table = ProcessTable::new();
+    let process = table.spawn();
+    let dispatcher = SyscallDispatcher::new(&table);
+    let mut frame = TrapFrame::default();
+    frame.rax = 39; // getpid syscall number
+    dispatcher
+        .handle_trap(process.pid(), &mut frame)
+        .expect("syscall trap handled");
+    assert_eq!(frame.rax, process.pid().as_u64());
 }

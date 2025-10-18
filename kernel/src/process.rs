@@ -15,6 +15,7 @@ use crate::{
     fs::{self, Credentials, FsError},
     memory::Capability,
     scheduler::ThreadState,
+    user::{AddressSpace, StackConfig, UserContext},
 };
 use log::trace;
 
@@ -60,6 +61,8 @@ pub struct Process {
     parent: RwLock<Option<Pid>>,
     program: RwLock<Option<String>>,
     executable: RwLock<Option<ExecutableImage>>,
+    address_space: RwLock<Option<AddressSpace>>,
+    user_context: RwLock<Option<UserContext>>,
     fds: RwLock<BTreeMap<u64, String>>,
     fd_offsets: RwLock<BTreeMap<u64, usize>>,
     next_fd: AtomicU64,
@@ -83,6 +86,8 @@ impl Process {
             parent: RwLock::new(None),
             program: RwLock::new(None),
             executable: RwLock::new(None),
+            address_space: RwLock::new(None),
+            user_context: RwLock::new(None),
             fds: RwLock::new(BTreeMap::new()),
             fd_offsets: RwLock::new(BTreeMap::new()),
             next_fd: AtomicU64::new(3),
@@ -149,8 +154,13 @@ impl Process {
 
     /// Records the currently executing program.
     pub fn set_program_image(&self, program: String, image: ExecutableImage) {
+        let address_space = AddressSpace::from_executable(&image, StackConfig::default());
+        let stack_top = address_space.stack().top();
+        let context = UserContext::for_entry(address_space.entry_point(), stack_top);
         *self.program.write() = Some(program);
         *self.executable.write() = Some(image);
+        *self.address_space.write() = Some(address_space);
+        *self.user_context.write() = Some(context);
     }
 
     /// Retrieves the program string.
@@ -161,6 +171,21 @@ impl Process {
     /// Retrieves the parsed executable image for the process, if any.
     pub fn executable_image(&self) -> Option<ExecutableImage> {
         self.executable.read().clone()
+    }
+
+    /// Returns the synthesized user address space for this process, if available.
+    pub fn address_space(&self) -> Option<AddressSpace> {
+        self.address_space.read().clone()
+    }
+
+    /// Returns the user context (register snapshot) if one has been built for the process.
+    pub fn user_context(&self) -> Option<UserContext> {
+        self.user_context.read().clone()
+    }
+
+    /// Replaces the stored user context.
+    pub fn set_user_context(&self, context: UserContext) {
+        *self.user_context.write() = Some(context);
     }
 
     /// Returns the next free file descriptor.
@@ -341,6 +366,8 @@ impl Process {
         *target.capabilities.write() = self.capabilities.read().clone();
         *target.program.write() = self.program.read().clone();
         *target.executable.write() = self.executable.read().clone();
+    *target.address_space.write() = self.address_space.read().clone();
+    *target.user_context.write() = self.user_context.read().clone();
         *target.fds.write() = self.fds.read().clone();
         *target.fd_offsets.write() = self.fd_offsets.read().clone();
         target
