@@ -19,6 +19,7 @@ const ET_DYN: u16 = 3;
 const EM_X86_64: u16 = 0x3E;
 
 const PT_LOAD: u32 = 1;
+const PT_INTERP: u32 = 3;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
@@ -44,6 +45,8 @@ pub enum ElfError {
     BadSegmentBounds,
     /// No loadable segments were found.
     NoLoadSegments,
+    /// Executable requests a dynamic interpreter which is not supported yet.
+    UnsupportedInterpreter,
 }
 
 impl fmt::Display for ElfError {
@@ -59,6 +62,7 @@ impl fmt::Display for ElfError {
             BadProgramHeaderBounds => write!(f, "program header table out of bounds"),
             BadSegmentBounds => write!(f, "segment bounds invalid"),
             NoLoadSegments => write!(f, "ELF contains no loadable segments"),
+            UnsupportedInterpreter => write!(f, "ELF requires an unsupported interpreter"),
         }
     }
 }
@@ -128,6 +132,9 @@ impl ExecutableImage {
             let offset = e_phoff + index * e_phentsize;
             let header = &data[offset..offset + e_phentsize];
             let p_type = read_u32(header, 0);
+            if p_type == PT_INTERP {
+                return Err(ElfError::UnsupportedInterpreter);
+            }
             if p_type != PT_LOAD {
                 continue;
             }

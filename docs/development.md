@@ -40,7 +40,7 @@
 mke2fs -t ext4 -O ^has_journal,^metadata_csum,^64bit,^flex_bg -d assets/rootfs -b 1024 -m 0 assets/rootfs.ext4 16384
 ```
 
-> 提示：上述命令依赖 `mke2fs`（e2fsprogs）工具。镜像大小为 1 MiB；如需更多空间，可调整最后的块数量参数。`-O` 参数用于禁用当前内核尚未实现的 ext4 特性（journal、metadata checksum、64bit block 号、flex_bg 分组布局），确保镜像可以顺利加载。
+> 提示：上述命令依赖 `mke2fs`（e2fsprogs）工具。镜像大小为 16 MiB；如需更多空间，可调整最后的块数量参数。`-O` 参数用于禁用当前内核尚未实现的 ext4 特性（journal、metadata checksum、64bit block 号、flex_bg 分组布局），确保镜像可以顺利加载。
 
 #### Bare shell 内置命令
 

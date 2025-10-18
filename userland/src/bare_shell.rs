@@ -645,7 +645,11 @@ where
             Ok(data) => match self.parse_command_binary(&data) {
                 Ok(binary) => Ok(CommandExecutable::Builtin(binary.builtin)),
                 Err(CommandResolutionError::InvalidFormat) => {
-                    Ok(CommandExecutable::External { path })
+                    if let Some(builtin) = Self::builtin_from_str(name) {
+                        Ok(CommandExecutable::Builtin(builtin))
+                    } else {
+                        Ok(CommandExecutable::External { path })
+                    }
                 }
                 Err(other) => Err(other),
             },

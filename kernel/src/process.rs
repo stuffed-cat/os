@@ -585,6 +585,9 @@ impl ProcessTable {
             ElfError::BadProgramHeaderBounds => SubsystemError::Runtime("corrupt program header"),
             ElfError::BadSegmentBounds => SubsystemError::Runtime("corrupt segment"),
             ElfError::NoLoadSegments => SubsystemError::Runtime("executable missing segments"),
+            ElfError::UnsupportedInterpreter => {
+                SubsystemError::Runtime("unsupported elf interpreter")
+            }
         })?;
 
         proc.set_program_image(program, image, self.memory_manager())?;
@@ -728,3 +731,6 @@ impl ProcessTable {
         }
     }
 }
+
+unsafe impl Send for ProcessTable {}
+unsafe impl Sync for ProcessTable {}

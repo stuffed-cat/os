@@ -11,6 +11,7 @@ use crate::scheduler::SchedulingClass;
 use crate::scheduler::{RunQueueEntry, Scheduler, ThreadStatus};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
+use alloc::format;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 #[cfg(not(feature = "std"))]
@@ -358,7 +359,8 @@ fn map_exec_error(err: SubsystemError) -> SystemError {
             | "corrupt program header"
             | "corrupt segment"
             | "executable truncated"
-            | "executable missing segments" => SystemError::InvalidExecutable,
+            | "executable missing segments"
+            | "unsupported elf interpreter" => SystemError::InvalidExecutable,
             _ => SystemError::Failed,
         },
         SubsystemError::Init(_) | SubsystemError::Resource(_) => SystemError::Failed,

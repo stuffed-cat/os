@@ -990,7 +990,11 @@ impl<'a> Ext2Fs<'a> {
                 break;
             }
             if block_number == 0 {
-                return Err(FsError::Unsupported);
+                let to_copy = cmp::min(remaining, self.block_size);
+                let current_len = data.len();
+                data.resize(current_len + to_copy, 0);
+                remaining = remaining.saturating_sub(to_copy);
+                continue;
             }
             let block_data = self.block(block_number)?;
             let to_copy = cmp::min(remaining, self.block_size);
@@ -1259,45 +1263,88 @@ impl<'a> Ext2Fs<'a> {
         if read_u16(&raw, 0) != EXT4_EXTENT_HEADER_MAGIC {
             return Err(FsError::Unsupported);
         }
-        let entries = read_u16(&raw, 2) as usize;
         let depth = read_u16(&raw, 6);
-        if depth != 0 {
+        self.collect_extent_node(&raw, depth, needed, &mut blocks)?;
+
+        Ok(blocks)
+    }
+
+    fn collect_extent_node(
+        &self,
+        node: &[u8],
+        depth: u16,
+        needed: usize,
+        blocks: &mut [u64],
+    ) -> Result<(), FsError> {
+        if read_u16(node, 0) != EXT4_EXTENT_HEADER_MAGIC {
             return Err(FsError::Unsupported);
+        }
+
+        let entries = cmp::min(
+            read_u16(node, 2) as usize,
+            node.len().saturating_sub(12) / 12,
+        );
+
+        if depth == 0 {
+            for index in 0..entries {
+                let offset = 12 + index * 12;
+                if offset + 12 > node.len() {
+                    break;
+                }
+                let logical_start = read_u32(node, offset) as usize;
+                if logical_start >= needed {
+                    break;
+                }
+                let length_raw = read_u16(node, offset + 4);
+                if length_raw == 0 {
+                    continue;
+                }
+                if (length_raw & 0x8000) != 0 {
+                    return Err(FsError::Unsupported);
+                }
+                let length = (length_raw & 0x7FFF) as usize;
+                let start_hi = read_u16(node, offset + 6) as u64;
+                let start_lo = read_u32(node, offset + 8) as u64;
+                let mut physical = (start_hi << 32) | start_lo;
+
+                for idx in 0..length {
+                    let logical = logical_start + idx;
+                    if logical >= needed {
+                        break;
+                    }
+                    blocks[logical] = physical;
+                    physical += 1;
+                }
+            }
+            return Ok(());
         }
 
         for index in 0..entries {
             let offset = 12 + index * 12;
-            if offset + 12 > raw.len() {
+            if offset + 12 > node.len() {
                 break;
             }
-            let logical_start = read_u32(&raw, offset) as usize;
-            let length_raw = read_u16(&raw, offset + 4);
-            if length_raw == 0 {
+            let logical_start = read_u32(node, offset) as usize;
+            if logical_start >= needed {
+                break;
+            }
+            let leaf_lo = read_u32(node, offset + 4) as u64;
+            let leaf_hi = read_u16(node, offset + 8) as u64;
+            let child_block = (leaf_hi << 32) | leaf_lo;
+            if child_block == 0 {
                 continue;
             }
-            if (length_raw & 0x8000) != 0 {
+            let child = self.block(child_block)?;
+            // Child depth should be depth - 1, but trust the header for resilience.
+            let child_depth = read_u16(child, 6);
+            if child_depth > depth {
                 return Err(FsError::Unsupported);
             }
-            let length = (length_raw & 0x7FFF) as usize;
-            let start_hi = read_u16(&raw, offset + 6) as u64;
-            let start_lo = read_u32(&raw, offset + 8) as u64;
-            let mut physical = (start_hi << 32) | start_lo;
-
-            for idx in 0..length {
-                let logical = logical_start + idx;
-                if logical >= needed {
-                    break;
-                }
-                blocks[logical] = physical;
-                physical += 1;
-            }
+            let expected_depth = depth.saturating_sub(1);
+            self.collect_extent_node(child, child_depth.min(expected_depth), needed, blocks)?;
         }
 
-        if blocks.iter().any(|&block| block == 0) {
-            return Err(FsError::Unsupported);
-        }
-
-        Ok(blocks)
+        Ok(())
     }
 
     fn ensure_access(&self, inode: &Inode, creds: &Credentials, mask: u16) -> Result<(), FsError> {

@@ -605,6 +605,12 @@ impl MemoryManager {
 }
 
 #[cfg(any(feature = "alloc", feature = "std"))]
+unsafe impl Send for MemoryManager {}
+
+#[cfg(any(feature = "alloc", feature = "std"))]
+unsafe impl Sync for MemoryManager {}
+
+#[cfg(any(feature = "alloc", feature = "std"))]
 unsafe fn init_offset_page_table(phys_mem_offset: VirtAddr) -> OffsetPageTable<'static> {
     let level_4_table = active_level_4_table(phys_mem_offset);
     OffsetPageTable::new(level_4_table, phys_mem_offset)
