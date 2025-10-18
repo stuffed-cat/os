@@ -1,6 +1,8 @@
-//! Prototype `rmdir` command.
+//! Prototype `rmdir` command that serializes the directory removal syscall.
 
 use std::env;
+
+use userland::{print_requests, SyscallRequest};
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -10,12 +12,10 @@ fn main() {
     };
 
     if args.next().is_some() {
-        eprintln!("rmdir: this prototype only supports removing a single directory");
+        eprintln!("rmdir: only single directory removal is supported");
         std::process::exit(1);
     }
 
-    println!(
-        "rmdir: would remove directory `{}` (syscall plumbing pending)",
-        path
-    );
+    let requests = [SyscallRequest::Rmdir { path }];
+    print_requests(requests);
 }

@@ -1,5 +1,7 @@
-//! Prototype `reboot` command.
+//! Prototype `reboot` command that serializes a reboot request.
+
+use userland::{print_requests, SyscallRequest};
 
 fn main() {
-    println!("reboot: would request a system reboot (hardware integration pending)");
+    print_requests([SyscallRequest::Reboot]);
 }

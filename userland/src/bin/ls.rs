@@ -16,6 +16,7 @@ fn main() {
     sequence.push(SyscallRequest::Open {
         path: target.clone(),
         flags: 0,
+        mode: 0,
     });
     sequence.push(SyscallRequest::Read {
         fd: 3,

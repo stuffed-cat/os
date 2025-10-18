@@ -26,6 +26,7 @@ fn main() {
         let open_bytes = runtime.invoke(SyscallRequest::Open {
             path: path.clone(),
             flags: 0,
+            mode: 0,
         });
         println!("{}", to_hex(&open_bytes));
 

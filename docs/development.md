@@ -37,7 +37,7 @@
 裸机镜像会自动将 `assets/rootfs.ext4` 作为 ramdisk 装载进内核，内核使用写入 overlay 提供默认可写的视图。若需要修改根文件系统内容，可直接编辑 `assets/rootfs/` 目录，然后使用以下命令重新生成兼容的 ext4 镜像：
 
 ```bash
-mke2fs -t ext4 -O ^has_journal,^metadata_csum,^64bit,^flex_bg -d assets/rootfs -b 1024 -m 0 assets/rootfs.ext4 1024
+mke2fs -t ext4 -O ^has_journal,^metadata_csum,^64bit,^flex_bg -d assets/rootfs -b 1024 -m 0 assets/rootfs.ext4 16384
 ```
 
 > 提示：上述命令依赖 `mke2fs`（e2fsprogs）工具。镜像大小为 1 MiB；如需更多空间，可调整最后的块数量参数。`-O` 参数用于禁用当前内核尚未实现的 ext4 特性（journal、metadata checksum、64bit block 号、flex_bg 分组布局），确保镜像可以顺利加载。

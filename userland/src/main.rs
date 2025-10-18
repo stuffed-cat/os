@@ -4,7 +4,7 @@
 //! shared memory channel or direct syscall traps. Here we showcase the
 //! message formats that future IPC layers can consume.
 
-use userland::{to_hex, Runtime, SyscallRequest};
+use userland::{to_hex, Runtime, SyscallRequest, O_CREAT, O_RDWR};
 
 fn main() {
     println!("hybrid kernel userland runtime prototype");
@@ -22,7 +22,8 @@ fn main() {
 
     let open_packet = runtime.invoke(SyscallRequest::Open {
         path: "/tmp/data".into(),
-        flags: 0o644,
+        flags: O_RDWR | O_CREAT,
+        mode: 0o644,
     });
     println!("open => {}", to_hex(&open_packet));
 

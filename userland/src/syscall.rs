@@ -9,14 +9,16 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 
 /// Serializable representation of syscall intents used by the kernel IPC shim.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum SyscallRequest {
     /// POSIX `fork` primitive.
     Fork,
     /// POSIX `execve` primitive.
     Exec { path: String, argv: Vec<String> },
     /// POSIX `open` primitive.
-    Open { path: String, flags: u32 },
+    Open { path: String, flags: u32, mode: u32 },
+    /// POSIX `close` primitive.
+    Close { fd: u64 },
     /// POSIX `read` primitive.
     Read { fd: u64, len: u64 },
     /// POSIX `write` primitive.
@@ -35,6 +37,20 @@ pub enum SyscallRequest {
     GetCwd,
     /// POSIX `sleep` primitive (milliseconds placeholder).
     Sleep { millis: u64 },
+    /// POSIX `mkdir` primitive.
+    Mkdir { path: String, mode: u32 },
+    /// POSIX `rmdir` primitive.
+    Rmdir { path: String },
+    /// POSIX `unlink` primitive.
+    Unlink { path: String },
+    /// POSIX `rename` primitive.
+    Rename { old_path: String, new_path: String },
+    /// POSIX `ftruncate` primitive.
+    Ftruncate { fd: u64, len: u64 },
+    /// System reboot request.
+    Reboot,
+    /// System shutdown request.
+    Shutdown,
 }
 
 /// Runtime helper capable of turning high-level requests into binary payloads.
@@ -89,5 +105,33 @@ mod tests {
     fn to_hex_formatting() {
         let bytes = [0xde, 0xad, 0xbe, 0xef];
         assert_eq!(to_hex(&bytes), "deadbeef");
+    }
+
+    #[test]
+    fn extended_syscalls_roundtrip() {
+        let runtime = Runtime::default();
+        let requests = [
+            SyscallRequest::Open {
+                path: "/tmp/file".into(),
+                flags: 0o1,
+                mode: 0o600,
+            },
+            SyscallRequest::Close { fd: 3 },
+            SyscallRequest::Mkdir {
+                path: "/tmp/dir".into(),
+                mode: 0o755,
+            },
+            SyscallRequest::Rename {
+                old_path: "/tmp/a".into(),
+                new_path: "/tmp/b".into(),
+            },
+            SyscallRequest::Shutdown,
+        ];
+
+        for request in requests {
+            let encoded = runtime.invoke(request.clone());
+            let decoded: SyscallRequest = bincode::deserialize(&encoded).unwrap();
+            assert_eq!(decoded, request);
+        }
     }
 }

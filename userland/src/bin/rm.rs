@@ -1,6 +1,8 @@
-//! Prototype `rm` command.
+//! Prototype `rm` command that emits unlink syscall payloads.
 
 use std::env;
+
+use userland::{print_requests, SyscallRequest};
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -10,9 +12,10 @@ fn main() {
     };
 
     if args.next().is_some() {
-        eprintln!("rm: multiple operands are not supported in this prototype");
+        eprintln!("rm: multiple operands are not supported yet");
         std::process::exit(1);
     }
 
-    println!("rm: would remove `{}` (syscall plumbing pending)", path);
+    let requests = [SyscallRequest::Unlink { path }];
+    print_requests(requests);
 }

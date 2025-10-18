@@ -6,10 +6,14 @@
 extern crate alloc;
 
 #[cfg(feature = "std")]
+pub mod command_util;
+#[cfg(feature = "std")]
 pub mod shell;
 #[cfg(feature = "std")]
 pub mod syscall;
 
+#[cfg(feature = "std")]
+pub use command_util::*;
 #[cfg(feature = "std")]
 pub use shell::Shell;
 #[cfg(feature = "std")]

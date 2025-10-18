@@ -1,6 +1,8 @@
-//! Prototype `mv` command.
+//! Prototype `mv` command that emits a rename syscall payload.
 
 use std::env;
+
+use userland::{print_requests, SyscallRequest};
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -18,8 +20,10 @@ fn main() {
         std::process::exit(1);
     }
 
-    println!(
-        "mv: would move `{}` to `{}` (syscall wiring pending)",
-        src, dest
-    );
+    let requests = [SyscallRequest::Rename {
+        old_path: src,
+        new_path: dest,
+    }];
+
+    print_requests(requests);
 }

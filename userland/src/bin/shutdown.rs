@@ -1,5 +1,7 @@
-//! Prototype `shutdown` command.
+//! Prototype `shutdown` command that serializes a power-off request.
+
+use userland::{print_requests, SyscallRequest};
 
 fn main() {
-    println!("shutdown: would request a power-off (hardware integration pending)");
+    print_requests([SyscallRequest::Shutdown]);
 }
