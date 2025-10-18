@@ -4,8 +4,8 @@
 //! little-endian ELF binaries for the x86-64 architecture and extracts the
 //! loadable segments so that the process layer can build an address space.
 
-use alloc::vec;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
 use core::fmt;

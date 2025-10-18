@@ -36,6 +36,7 @@ const COLOR_RESET: &str = "\x1b[0m";
 const HELP_ENTRIES: &[(&str, &str)] = &[
     ("help", "Show this help message"),
     ("history", "Display previously executed commands"),
+    ("clear", "Clear the screen"),
     ("sh", "Launch a nested shell session"),
     ("ls", "List entries from the mounted filesystem"),
     ("pwd", "Print the current working directory"),
@@ -242,6 +243,7 @@ enum BuiltinCommand {
     Shell,
     Help,
     History,
+    Clear,
     Ls,
     Pwd,
     Cd,
@@ -440,6 +442,10 @@ where
         for entry in entries {
             self.println(&entry);
         }
+    }
+
+    fn command_clear(&mut self) {
+        self.print("\x1b[2J\x1b[H");
     }
 
     fn command_ls(&mut self, args: &[&str]) {
@@ -1272,6 +1278,7 @@ where
             BuiltinCommand::Shell => self.command_sh(args),
             BuiltinCommand::Help => self.print_help(),
             BuiltinCommand::History => self.print_history(),
+            BuiltinCommand::Clear => self.command_clear(),
             BuiltinCommand::Ls => self.command_ls(args),
             BuiltinCommand::Pwd => self.command_pwd(),
             BuiltinCommand::Cd => self.command_cd(args),
@@ -1303,6 +1310,7 @@ where
             "sh" => Some(BuiltinCommand::Shell),
             "help" => Some(BuiltinCommand::Help),
             "history" => Some(BuiltinCommand::History),
+            "clear" => Some(BuiltinCommand::Clear),
             "ls" => Some(BuiltinCommand::Ls),
             "pwd" => Some(BuiltinCommand::Pwd),
             "cd" => Some(BuiltinCommand::Cd),
@@ -1334,30 +1342,31 @@ where
         match id {
             0 => Some(BuiltinCommand::Help),
             1 => Some(BuiltinCommand::History),
-            2 => Some(BuiltinCommand::Ls),
-            3 => Some(BuiltinCommand::Pwd),
-            4 => Some(BuiltinCommand::Cd),
-            5 => Some(BuiltinCommand::Cat),
-            6 => Some(BuiltinCommand::Echo),
-            7 => Some(BuiltinCommand::Touch),
-            8 => Some(BuiltinCommand::Mkdir),
-            9 => Some(BuiltinCommand::Rmdir),
-            10 => Some(BuiltinCommand::Rm),
-            11 => Some(BuiltinCommand::Cp),
-            12 => Some(BuiltinCommand::Mv),
-            13 => Some(BuiltinCommand::Reboot),
-            14 => Some(BuiltinCommand::Shutdown),
-            15 => Some(BuiltinCommand::Shell),
-            16 => Some(BuiltinCommand::Chmod),
-            17 => Some(BuiltinCommand::Chown),
-            18 => Some(BuiltinCommand::Whoami),
-            19 => Some(BuiltinCommand::Id),
-            20 => Some(BuiltinCommand::Users),
-            21 => Some(BuiltinCommand::Su),
-            22 => Some(BuiltinCommand::UserAdd),
-            23 => Some(BuiltinCommand::Passwd),
-            24 => Some(BuiltinCommand::SetSid),
-            25 => Some(BuiltinCommand::CttyHack),
+            2 => Some(BuiltinCommand::Clear),
+            3 => Some(BuiltinCommand::Ls),
+            4 => Some(BuiltinCommand::Pwd),
+            5 => Some(BuiltinCommand::Cd),
+            6 => Some(BuiltinCommand::Cat),
+            7 => Some(BuiltinCommand::Echo),
+            8 => Some(BuiltinCommand::Touch),
+            9 => Some(BuiltinCommand::Mkdir),
+            10 => Some(BuiltinCommand::Rmdir),
+            11 => Some(BuiltinCommand::Rm),
+            12 => Some(BuiltinCommand::Cp),
+            13 => Some(BuiltinCommand::Mv),
+            14 => Some(BuiltinCommand::Reboot),
+            15 => Some(BuiltinCommand::Shutdown),
+            16 => Some(BuiltinCommand::Shell),
+            17 => Some(BuiltinCommand::Chmod),
+            18 => Some(BuiltinCommand::Chown),
+            19 => Some(BuiltinCommand::Whoami),
+            20 => Some(BuiltinCommand::Id),
+            21 => Some(BuiltinCommand::Users),
+            22 => Some(BuiltinCommand::Su),
+            23 => Some(BuiltinCommand::UserAdd),
+            24 => Some(BuiltinCommand::Passwd),
+            25 => Some(BuiltinCommand::SetSid),
+            26 => Some(BuiltinCommand::CttyHack),
             _ => None,
         }
     }
