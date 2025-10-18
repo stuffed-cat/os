@@ -1,4 +1,5 @@
 use kernel::{
+    elf::{ExecutableImage, ExecutableSegment, SegmentFlags},
     ipc::{IpcRouter, Message},
     posix::{Errno, PosixLayer},
     process::{Pid, ProcessTable, Tid},
@@ -48,6 +49,20 @@ fn posix_fork_exec_open_read_flow() {
     let layer = PosixLayer::new(&table);
     layer.register_program_handle(1, "/bin/init".to_string());
     layer.register_path_handle(2, "/tmp/data".to_string());
+    layer.register_virtual_file("/tmp/data".to_string(), vec![0u8; 128]);
+
+    let stub_segment = ExecutableSegment {
+        virtual_addr: 0x4000_0000,
+        data: vec![0xC3], // ret
+        flags: SegmentFlags {
+            readable: true,
+            writable: false,
+            executable: true,
+        },
+    };
+    let stub_image = ExecutableImage::from_parts(0x4000_0000, vec![stub_segment])
+        .expect("stub executable valid");
+    table.register_exec_override("/bin/init".to_string(), stub_image);
 
     let child_pid = layer
         .dispatch(parent.pid(), SyscallId::Fork, &[])

@@ -9,7 +9,13 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use spin::RwLock;
 
-use crate::{error::SubsystemError, fs::Credentials, memory::Capability, scheduler::ThreadState};
+use crate::{
+    elf::{ExecutableImage, ElfError},
+    error::SubsystemError,
+    fs::{self, Credentials, FsError},
+    memory::Capability,
+    scheduler::ThreadState,
+};
 use log::trace;
 
 /// Process identifier type.
@@ -53,6 +59,7 @@ pub struct Process {
     terminated: AtomicBool,
     parent: RwLock<Option<Pid>>,
     program: RwLock<Option<String>>,
+    executable: RwLock<Option<ExecutableImage>>,
     fds: RwLock<BTreeMap<u64, String>>,
     fd_offsets: RwLock<BTreeMap<u64, usize>>,
     next_fd: AtomicU64,
@@ -75,6 +82,7 @@ impl Process {
             terminated: AtomicBool::new(false),
             parent: RwLock::new(None),
             program: RwLock::new(None),
+            executable: RwLock::new(None),
             fds: RwLock::new(BTreeMap::new()),
             fd_offsets: RwLock::new(BTreeMap::new()),
             next_fd: AtomicU64::new(3),
@@ -140,13 +148,19 @@ impl Process {
     }
 
     /// Records the currently executing program.
-    pub fn set_program(&self, program: String) {
+    pub fn set_program_image(&self, program: String, image: ExecutableImage) {
         *self.program.write() = Some(program);
+        *self.executable.write() = Some(image);
     }
 
     /// Retrieves the program string.
     pub fn program(&self) -> Option<String> {
         self.program.read().clone()
+    }
+
+    /// Retrieves the parsed executable image for the process, if any.
+    pub fn executable_image(&self) -> Option<ExecutableImage> {
+        self.executable.read().clone()
     }
 
     /// Returns the next free file descriptor.
@@ -326,6 +340,7 @@ impl Process {
     pub fn clone_state_into(&self, target: &Process) {
         *target.capabilities.write() = self.capabilities.read().clone();
         *target.program.write() = self.program.read().clone();
+        *target.executable.write() = self.executable.read().clone();
         *target.fds.write() = self.fds.read().clone();
         *target.fd_offsets.write() = self.fd_offsets.read().clone();
         target
@@ -350,6 +365,7 @@ impl Process {
 pub struct ProcessTable {
     next_pid: AtomicU64,
     processes: RwLock<BTreeMap<Pid, Arc<Process>>>,
+    exec_overrides: RwLock<BTreeMap<String, ExecutableImage>>,
 }
 
 /// Errors returned when waiting on child processes.
@@ -368,6 +384,7 @@ impl Default for ProcessTable {
         Self {
             next_pid: AtomicU64::new(100),
             processes: RwLock::new(BTreeMap::new()),
+            exec_overrides: RwLock::new(BTreeMap::new()),
         }
     }
 }
@@ -391,6 +408,11 @@ impl ProcessTable {
         proc
     }
 
+    /// Registers an in-memory executable image that bypasses filesystem lookup.
+    pub fn register_exec_override(&self, path: String, image: ExecutableImage) {
+        self.exec_overrides.write().insert(path, image);
+    }
+
     /// Looks up a process by PID.
     pub fn lookup(&self, pid: Pid) -> Option<Arc<Process>> {
         self.processes.read().get(&pid).cloned()
@@ -412,7 +434,40 @@ impl ProcessTable {
         let proc = self
             .lookup(pid)
             .ok_or(SubsystemError::Runtime("process not found"))?;
-        proc.set_program(program);
+
+        if let Some(image) = self.exec_overrides.read().get(&program).cloned() {
+            proc.set_program_image(program, image);
+            return Ok(());
+        }
+
+        let creds = proc.credentials();
+        let data = match fs::read_file_with_credentials(&program, &creds) {
+            Ok(bytes) => bytes,
+            Err(FsError::NotFound) => {
+                return Err(SubsystemError::Runtime("executable not found"));
+            }
+            Err(FsError::NotInitialized) => {
+                return Err(SubsystemError::Runtime("filesystem unavailable"));
+            }
+            Err(FsError::PermissionDenied) => {
+                return Err(SubsystemError::Runtime("permission denied"));
+            }
+            Err(_) => return Err(SubsystemError::Runtime("exec read failure")),
+        };
+
+        let image = ExecutableImage::parse(&data).map_err(|err| match err {
+            ElfError::Truncated => SubsystemError::Runtime("executable truncated"),
+            ElfError::BadMagic => SubsystemError::Runtime("invalid executable magic"),
+            ElfError::UnsupportedClass => SubsystemError::Runtime("unsupported elf class"),
+            ElfError::UnsupportedEndian => SubsystemError::Runtime("unsupported elf endian"),
+            ElfError::UnsupportedType => SubsystemError::Runtime("unsupported elf type"),
+            ElfError::UnsupportedArch => SubsystemError::Runtime("unsupported elf arch"),
+            ElfError::BadProgramHeaderBounds => SubsystemError::Runtime("corrupt program header"),
+            ElfError::BadSegmentBounds => SubsystemError::Runtime("corrupt segment"),
+            ElfError::NoLoadSegments => SubsystemError::Runtime("executable missing segments"),
+        })?;
+
+        proc.set_program_image(program, image);
         Ok(())
     }
 

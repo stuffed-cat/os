@@ -40,21 +40,27 @@ const HELP_ENTRIES: &[(&str, &str)] = &[
     ("echo", "Print arguments back to the console"),
     (
         "touch",
-        "Create an empty file (not supported on read-only FS)",
+        "Create an empty file (overlay-backed; shell wiring WIP)",
     ),
     (
         "mkdir",
-        "Create a directory (not supported on read-only FS)",
+        "Create a directory (overlay-backed; shell wiring WIP)",
     ),
     (
         "rmdir",
-        "Remove a directory (not supported on read-only FS)",
+        "Remove a directory (overlay-backed; shell wiring WIP)",
     ),
-    ("rm", "Remove a file (not supported on read-only FS)"),
-    ("cp", "Copy a file (not supported on read-only FS)"),
+    (
+        "rm",
+        "Remove a file (overlay-backed; shell wiring WIP)",
+    ),
+    (
+        "cp",
+        "Copy a file (overlay-backed; shell wiring WIP)",
+    ),
     (
         "mv",
-        "Move or rename a file (not supported on read-only FS)",
+        "Move or rename a file (overlay-backed; shell wiring WIP)",
     ),
     ("reboot", "Reboot the system"),
     ("shutdown", "Power off the system"),
@@ -66,6 +72,17 @@ pub trait ShellFs {
     fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError>;
     /// Reads a regular file from the provided absolute path.
     fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError>;
+    /// Creates a regular file with the requested permissions.
+    fn create_file(&self, path: &str, mode: u16) -> Result<(), FsError>;
+    /// Removes a filesystem node.
+    fn remove_file(&self, path: &str) -> Result<(), FsError>;
+    /// Writes bytes to a path at the given offset, optionally truncating first.
+    fn write_file(&self, path: &str, offset: usize, data: &[u8], truncate: bool)
+        -> Result<usize, FsError>;
+    /// Updates an inode's permission bits.
+    fn chmod(&self, path: &str, mode: u16) -> Result<(), FsError>;
+    /// Updates an inode's owner/group identifiers.
+    fn chown(&self, path: &str, uid: u32, gid: u32) -> Result<(), FsError>;
 }
 
 /// Platform control hooks exposed to the shell.
@@ -163,6 +180,8 @@ pub enum FsError {
     NotDirectory,
     /// Requested path exists but is not a regular file.
     NotFile,
+    /// Target already exists.
+    AlreadyExists,
     /// Filesystem image is corrupt or unreadable.
     Corrupt,
     /// Operation denied due to insufficient permissions.
@@ -341,6 +360,7 @@ where
                 }
                 Err(FsError::PermissionDenied) => self.println("ls: permission denied"),
                 Err(FsError::Corrupt) => self.println("ls: filesystem corrupt"),
+                Err(_) => self.println("ls: filesystem error"),
             }
         }
     }
@@ -383,6 +403,7 @@ where
             }
             Err(FsError::PermissionDenied) => self.println("cd: permission denied"),
             Err(FsError::Corrupt) => self.println("cd: filesystem corrupt"),
+            Err(_) => self.println("cd: filesystem error"),
         }
     }
 
@@ -410,6 +431,7 @@ where
                 }
                 Err(FsError::PermissionDenied) => self.println("cat: permission denied"),
                 Err(FsError::Corrupt) => self.println("cat: filesystem corrupt"),
+                Err(_) => self.println("cat: filesystem error"),
             }
         }
     }
@@ -432,7 +454,7 @@ where
 
     fn command_read_only(&mut self, cmd: &str) {
         self.print(cmd);
-        self.println(": filesystem is read-only");
+        self.println(": write support not wired into the bare shell yet");
     }
 
     fn command_sh(&mut self, args: &[&str]) {
@@ -444,15 +466,17 @@ where
     }
 
     fn resolve_command(&mut self, name: &str) -> Result<CommandExecutable, CommandResolutionError> {
+        if let Some(builtin) = Self::builtin_from_str(name) {
+            return Ok(CommandExecutable::Builtin(builtin));
+        }
+
         let path = format!("/bin/{name}");
         match self.fs.read_file(&path) {
             Ok(data) => self
                 .parse_command_binary(&data)
                 .map(CommandExecutable::Binary),
             Err(FsError::NotFound) | Err(FsError::NotDirectory) | Err(FsError::NotFile) => {
-                Self::builtin_from_str(name)
-                    .map(CommandExecutable::Builtin)
-                    .ok_or(CommandResolutionError::NotFound)
+                Err(CommandResolutionError::NotFound)
             }
             Err(FsError::Unavailable) => {
                 Err(CommandResolutionError::Filesystem(FsError::Unavailable))
@@ -461,6 +485,7 @@ where
                 FsError::PermissionDenied,
             )),
             Err(FsError::Corrupt) => Err(CommandResolutionError::Filesystem(FsError::Corrupt)),
+            Err(other) => Err(CommandResolutionError::Filesystem(other)),
         }
     }
 

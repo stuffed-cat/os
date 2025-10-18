@@ -32,19 +32,19 @@
    该命令会同时运行 `kernel` crate 的单测、集成测试以及 `userland` 的测试。
 5. **编写新模块**：请补充相应的文档（如本目录）并在合适位置添加测试用例。
 
-### 重新生成 RAM DISK（ext2 根文件系统）
+### 重新生成 RAM DISK（ext4 可写根文件系统）
 
-裸机镜像会自动将 `assets/rootfs.ext2` 作为 `ramdisk` 装载进内核。若需要修改根文件系统内容，可直接编辑 `assets/rootfs/` 目录，然后使用以下命令重新生成 ext2 镜像：
+裸机镜像会自动将 `assets/rootfs.ext4` 作为 ramdisk 装载进内核，内核使用写入 overlay 提供默认可写的视图。若需要修改根文件系统内容，可直接编辑 `assets/rootfs/` 目录，然后使用以下命令重新生成兼容的 ext4 镜像：
 
 ```bash
-mke2fs -t ext2 -d assets/rootfs -b 1024 -m 0 assets/rootfs.ext2 1024
+mke2fs -t ext4 -O ^has_journal,^metadata_csum,^64bit,^flex_bg -d assets/rootfs -b 1024 -m 0 assets/rootfs.ext4 1024
 ```
 
-> 提示：上述命令依赖 `mke2fs`（e2fsprogs）工具。镜像大小为 1 MiB；如需更多空间，可调整最后的块数量参数。
+> 提示：上述命令依赖 `mke2fs`（e2fsprogs）工具。镜像大小为 1 MiB；如需更多空间，可调整最后的块数量参数。`-O` 参数用于禁用当前内核尚未实现的 ext4 特性（journal、metadata checksum、64bit block 号、flex_bg 分组布局），确保镜像可以顺利加载。
 
 #### Bare shell 内置命令
 
-重新生成 `rootfs.ext2` 后，`/bin` 目录会包含一组“裸机命令二进制”（Bare Command Module，BCM）文件。每个命令对应一个最小化的 64 位 ELF，可通过 `.note.bcm` 段携带元数据：`namesz = 0`、`descsz = 12`，`type = 0x4D43_4221`，描述符内容分别是魔数 `0x214D_4342`、版本 `1` 和命令编号（同 `BuiltinCommand` 枚举）。shell 仅依赖这段 note 来解析命令身份，真正的行为仍由内核内置实现——未来引入 `exec` 时，可把这些占位 ELF 替换成真实可执行文件。当前版本的 shell 在内核态解释以下命令：
+重新生成 `rootfs.ext4` 后，`/bin` 目录会包含一组“裸机命令二进制”（Bare Command Module，BCM）文件。每个命令对应一个最小化的 64 位 ELF，可通过 `.note.bcm` 段携带元数据：`namesz = 0`、`descsz = 12`，`type = 0x4D43_4221`，描述符内容分别是魔数 `0x214D_4342`、版本 `1` 和命令编号（同 `BuiltinCommand` 枚举）。shell 仅依赖这段 note 来解析命令身份，真正的行为仍由内核内置实现——未来引入 `exec` 时，可把这些占位 ELF 替换成真实可执行文件。当前版本的 shell 在内核态解释以下命令：
 
 | 命令 | 功能 | 备注 |
 |------|------|------|
@@ -53,9 +53,9 @@ mke2fs -t ext2 -d assets/rootfs -b 1024 -m 0 assets/rootfs.ext2 1024
 | `ls [PATH]` | 列出目录内容 | 支持相对/绝对路径，可使用 `-a`/`--all`、`--color[=WHEN]` |
 | `pwd` | 显示当前工作目录 | |
 | `cd [PATH]` | 切换工作目录 | 多参数报错 |
-| `cat FILE...` | 打印文件内容 | 仅支持 ext2 中的常规文件 |
+| `cat FILE...` | 打印文件内容 | 仅支持 ext4 镜像中的常规文件 |
 | `echo ARGS...` | 原样回显参数 | |
-| `touch`/`mkdir`/`rmdir`/`rm`/`cp`/`mv` | 预留命令 | 当前根文件系统为只读，这些命令会提示只读限制 |
+| `touch`/`mkdir`/`rmdir`/`rm`/`cp`/`mv` | 预留命令 | 内核 overlay 已支持写入路径，shell 侧仍在对接（目前提示功能未完成） |
 | `reboot` | 请求重启 | 在 `hardware` 构建目标上调用 ACPI/键盘复位，其他配置打印提示 |
 | `shutdown` | 请求关机 | 同上 |
 
@@ -73,7 +73,7 @@ cargo run -p xtask --features bootimage -- bootimage
 
 若直接执行 `cargo xtask bootimage`（未启用特性），工具会给出友好的提示信息并指导如何重新运行。
 
-若仅需重新生成根文件系统中的裸机命令与 `assets/rootfs.ext2`，运行 `cargo xtask rootfs` 即可，无需启用额外特性。
+若仅需重新生成根文件系统中的裸机命令与 `assets/rootfs.ext4`，运行 `cargo xtask rootfs` 即可，无需启用额外特性。
 
 ## 代码布局速查
 

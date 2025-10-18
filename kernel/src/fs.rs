@@ -1,8 +1,11 @@
-//! Read-only filesystem services backed by an embedded ext2 image.
+//! Filesystem services backed by an embedded ext4 image with an in-memory overlay.
 
 use crate::arch::x86_64::serial;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::format;
+use alloc::string::{String, ToString};
 use alloc::vec;
-use alloc::{collections::BTreeMap, string::String, vec::Vec};
+use alloc::vec::Vec;
 use core::cmp;
 use core::str;
 use spin::Mutex;
@@ -32,9 +35,42 @@ const EXT4_FEATURE_RO_COMPAT_DIR_NLINK: u32 = 0x0000_0020;
 const EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE: u32 = 0x0000_0040;
 const EXT4_EXTENT_HEADER_MAGIC: u16 = 0xF30A;
 const EXT4_INODE_FLAG_EXTENTS: u32 = 0x0008_0000;
+const S_IFREG: u16 = 0o100000;
+const MODE_PERMS_MASK: u16 = 0o7777;
 
 static FILESYSTEM: Mutex<Option<Ext2Fs<'static>>> = Mutex::new(None);
-static FILE_OVERLAY: Mutex<BTreeMap<String, Vec<u8>>> = Mutex::new(BTreeMap::new());
+static FILE_OVERLAY: Mutex<BTreeMap<String, OverlayEntry>> = Mutex::new(BTreeMap::new());
+
+#[derive(Clone)]
+enum OverlayEntry {
+    File(OverlayFile),
+    Tombstone,
+}
+
+#[derive(Clone)]
+struct OverlayFile {
+    data: Option<Vec<u8>>,
+    size: u64,
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    source: OverlaySource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OverlaySource {
+    Created,
+    Shadowed,
+}
+
+#[derive(Clone, Copy)]
+struct NodeMetadata {
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    kind: EntryKind,
+}
 
 /// Errors raised by the filesystem service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +89,8 @@ pub enum FsError {
     NotFile,
     /// Operation not permitted for the provided credentials.
     PermissionDenied,
+    /// Requested path already exists.
+    AlreadyExists,
 }
 
 /// Directory entry returned by [`list_dir`].
@@ -143,6 +181,106 @@ impl Credentials {
         self.gid == gid || self.groups.iter().any(|&g| g == gid)
     }
 }
+
+fn normalize_path(path: &str) -> Result<String, FsError> {
+    if path.is_empty() {
+        return Ok(String::from("/"));
+    }
+    if !path.starts_with('/') {
+        return Err(FsError::NotFound);
+    }
+
+    let mut stack: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            stack.pop();
+        } else {
+            stack.push(component);
+        }
+    }
+
+    if stack.is_empty() {
+        Ok(String::from("/"))
+    } else {
+        Ok(format!("/{}", stack.join("/")))
+    }
+}
+
+fn parent_path(path: &str) -> Option<String> {
+    if path == "/" {
+        return None;
+    }
+    let normalized = normalize_path(path).ok()?;
+    let mut parts = normalized.rsplitn(2, '/');
+    let name = parts.next()?;
+    if name.is_empty() {
+        return Some(String::from("/"));
+    }
+    if let Some(parent) = parts.next() {
+        if parent.is_empty() {
+            return Some(String::from("/"));
+        }
+        return Some(parent.to_string());
+    }
+    Some(String::from("/"))
+}
+
+fn file_name(path: &str) -> Option<&str> {
+    if path == "/" {
+        None
+    } else {
+        path.rsplit('/').next()
+    }
+}
+
+fn join_path(parent: &str, name: &str) -> String {
+    if parent == "/" {
+        format!("/{}", name)
+    } else {
+        format!("{}/{}", parent, name)
+    }
+}
+
+fn has_permission(mode: u16, creds: &Credentials, owner: u32, group: u32, mask: u16) -> bool {
+    if creds.is_root() {
+        return true;
+    }
+    let class_bits = if creds.uid() == owner {
+        (mode >> 6) & 0x7
+    } else if creds.has_group(group) {
+        (mode >> 3) & 0x7
+    } else {
+        mode & 0x7
+    };
+    (class_bits & mask) == mask
+}
+
+fn load_baseline_file(path: &str, creds: &Credentials) -> Result<(NodeMetadata, Vec<u8>), FsError> {
+    let (metadata, data) = {
+        let guard = FILESYSTEM.lock();
+        let fs = guard.as_ref().ok_or(FsError::NotInitialized)?;
+        let metadata = fs.metadata(path, creds)?;
+        if metadata.kind != EntryKind::File {
+            return Err(FsError::NotFile);
+        }
+        let data = match fs.read_file(path, creds) {
+            Ok(bytes) => bytes,
+            Err(FsError::PermissionDenied) => Vec::new(),
+            Err(other) => return Err(other),
+        };
+        (metadata, data)
+    };
+    Ok((metadata, data))
+}
+
+fn load_metadata(path: &str, creds: &Credentials) -> Result<NodeMetadata, FsError> {
+    let guard = FILESYSTEM.lock();
+    let fs = guard.as_ref().ok_or(FsError::NotInitialized)?;
+    fs.metadata(path, creds)
+}
 /// Initializes the filesystem service from a ramdisk image.
 ///
 /// # Safety
@@ -186,9 +324,63 @@ pub fn list_dir_with_credentials(
     path: &str,
     creds: &Credentials,
 ) -> Result<Vec<DirEntry>, FsError> {
-    let guard = FILESYSTEM.lock();
-    let fs = guard.as_ref().ok_or(FsError::NotInitialized)?;
-    fs.list_dir(path, creds)
+    let normalized = normalize_path(path)?;
+    let overlay_snapshot = FILE_OVERLAY.lock().clone();
+
+    let entries = {
+        let guard = FILESYSTEM.lock();
+        let fs = guard.as_ref().ok_or(FsError::NotInitialized)?;
+        fs.list_dir(&normalized, creds)?
+    };
+
+    let mut merged = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for mut entry in entries {
+        let child_path = join_path(&normalized, &entry.name);
+        match overlay_snapshot.get(&child_path) {
+            Some(OverlayEntry::Tombstone) => {}
+            Some(OverlayEntry::File(file)) => {
+                entry.size = file.size;
+                entry.mode = file.mode;
+                entry.uid = file.uid;
+                entry.gid = file.gid;
+                merged.push(entry);
+            }
+            None => merged.push(entry),
+        }
+        seen.insert(child_path);
+    }
+
+    for (overlay_path, overlay_entry) in overlay_snapshot.iter() {
+        let OverlayEntry::File(file) = overlay_entry else {
+            continue;
+        };
+        if seen.contains(overlay_path) {
+            continue;
+        }
+        if let Some(parent) = parent_path(overlay_path) {
+            if parent != normalized {
+                continue;
+            }
+        } else if normalized != "/" {
+            continue;
+        }
+        if let Some(name) = file_name(overlay_path) {
+            merged.push(DirEntry {
+                name: name.to_string(),
+                kind: EntryKind::File,
+                size: file.size,
+                mode: file.mode,
+                uid: file.uid,
+                gid: file.gid,
+                inode: 0,
+            });
+        }
+    }
+
+    merged.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(merged)
 }
 
 /// Reads a regular file from the provided absolute path.
@@ -196,14 +388,58 @@ pub fn read_file(path: &str) -> Result<Vec<u8>, FsError> {
     read_file_with_credentials(path, &Credentials::root())
 }
 
+/// Writes data to a file as the superuser using the overlay layer.
+pub fn write_file(path: &str, offset: usize, data: &[u8], truncate: bool) -> Result<usize, FsError> {
+    write_file_with_credentials(path, &Credentials::root(), offset, data, truncate)
+}
+
+/// Truncates a file to zero length as the superuser.
+pub fn truncate_file(path: &str) -> Result<(), FsError> {
+    truncate_file_with_credentials(path, &Credentials::root())
+}
+
+/// Creates an empty regular file as the superuser.
+pub fn create_file(path: &str, mode: u16) -> Result<(), FsError> {
+    create_file_with_credentials(path, &Credentials::root(), mode)
+}
+
+/// Removes a regular file as the superuser.
+pub fn remove_file(path: &str) -> Result<(), FsError> {
+    remove_file_with_credentials(path, &Credentials::root())
+}
+
+/// Updates file permissions as the superuser.
+pub fn chmod(path: &str, mode: u16) -> Result<(), FsError> {
+    chmod_with_credentials(path, &Credentials::root(), mode)
+}
+
+/// Updates ownership information as the superuser.
+pub fn chown(path: &str, uid: u32, gid: u32) -> Result<(), FsError> {
+    chown_with_credentials(path, &Credentials::root(), uid, gid)
+}
+
 /// Reads a file using the provided credentials.
 pub fn read_file_with_credentials(path: &str, creds: &Credentials) -> Result<Vec<u8>, FsError> {
-    if let Some(buffer) = FILE_OVERLAY.lock().get(path).cloned() {
-        return Ok(buffer);
+    let normalized = normalize_path(path)?;
+    {
+        let overlay = FILE_OVERLAY.lock();
+        if let Some(entry) = overlay.get(&normalized) {
+            match entry {
+                OverlayEntry::Tombstone => return Err(FsError::NotFound),
+                OverlayEntry::File(file) => {
+                    if !has_permission(file.mode, creds, file.uid, file.gid, PERM_READ) {
+                        return Err(FsError::PermissionDenied);
+                    }
+                    if let Some(data) = &file.data {
+                        return Ok(data.clone());
+                    }
+                }
+            }
+        }
     }
     let guard = FILESYSTEM.lock();
     let fs = guard.as_ref().ok_or(FsError::NotInitialized)?;
-    fs.read_file(path, creds)
+    fs.read_file(&normalized, creds)
 }
 
 /// Writes data to a file using a software overlay.
@@ -214,60 +450,102 @@ pub fn write_file_with_credentials(
     data: &[u8],
     truncate: bool,
 ) -> Result<usize, FsError> {
-    use alloc::collections::btree_map::Entry;
+    let normalized = normalize_path(path)?;
+    let mut metadata_cache: Option<NodeMetadata> = None;
+    let mut data_cache: Option<Vec<u8>> = None;
+    let mut require_metadata = false;
+    let mut require_data = false;
 
-    let baseline = {
-        let guard = FILESYSTEM.lock();
-        let fs = guard.as_ref().ok_or(FsError::NotInitialized)?;
-        let inode_num = fs.resolve_path(path, creds)?;
-        let inode = fs.load_inode(inode_num)?;
-        if !inode.is_regular_file() {
-            return Err(FsError::NotFile);
-        }
-        fs.ensure_access(&inode, creds, PERM_WRITE)?;
-        if truncate {
-            Vec::new()
-        } else {
-            match fs.read_file(path, creds) {
-                Ok(data) => data,
-                Err(FsError::PermissionDenied) => Vec::new(),
-                Err(other) => return Err(other),
-            }
-        }
-    };
+    loop {
+        let mut overlay = FILE_OVERLAY.lock();
+        match overlay.entry(normalized.clone()) {
+            alloc::collections::btree_map::Entry::Occupied(mut occ) => {
+                match occ.get_mut() {
+                    OverlayEntry::Tombstone => return Err(FsError::NotFound),
+                    OverlayEntry::File(file) => {
+                        if !has_permission(file.mode, creds, file.uid, file.gid, PERM_WRITE) {
+                            return Err(FsError::PermissionDenied);
+                        }
+                        if truncate {
+                            file.data = Some(Vec::new());
+                            file.size = 0;
+                        } else if file.data.is_none() && data_cache.is_none() {
+                            require_data = true;
+                        }
 
-    let mut overlay = FILE_OVERLAY.lock();
-    match overlay.entry(String::from(path)) {
-        Entry::Occupied(mut entry) => {
-            let buffer = entry.get_mut();
-            if truncate {
-                buffer.clear();
-            } else if buffer.is_empty() && !baseline.is_empty() {
-                *buffer = baseline.clone();
+                        if require_data {
+                            // Drop lock to load baseline data.
+                        } else {
+                            let buffer = file.data.get_or_insert_with(Vec::new);
+                            if truncate {
+                                buffer.clear();
+                            }
+                            if let Some(cached) = &data_cache {
+                                if buffer.is_empty() && !cached.is_empty() {
+                                    *buffer = cached.clone();
+                                }
+                            }
+                            if offset > buffer.len() {
+                                buffer.resize(offset, 0);
+                            }
+                            if offset + data.len() > buffer.len() {
+                                buffer.resize(offset + data.len(), 0);
+                            }
+                            buffer[offset..offset + data.len()].copy_from_slice(data);
+                            file.size = buffer.len() as u64;
+                            return Ok(data.len());
+                        }
+                    }
+                }
             }
-            if offset > buffer.len() {
-                buffer.resize(offset, 0);
+            alloc::collections::btree_map::Entry::Vacant(vacant) => {
+                if metadata_cache.is_none() {
+                    require_metadata = true;
+                }
+                if require_metadata {
+                    // Drop lock to load metadata/data before inserting.
+                } else {
+                    let mut buffer = data_cache.clone().unwrap_or_else(Vec::new);
+                    if truncate {
+                        buffer.clear();
+                    }
+                    if offset > buffer.len() {
+                        buffer.resize(offset, 0);
+                    }
+                    if offset + data.len() > buffer.len() {
+                        buffer.resize(offset + data.len(), 0);
+                    }
+                    buffer[offset..offset + data.len()].copy_from_slice(data);
+                    let metadata = metadata_cache.expect("metadata must be available");
+                    let size = buffer.len() as u64;
+                    let overlay_file = OverlayFile {
+                        data: Some(buffer),
+                        size,
+                        mode: metadata.mode,
+                        uid: metadata.uid,
+                        gid: metadata.gid,
+                        source: OverlaySource::Shadowed,
+                    };
+                    vacant.insert(OverlayEntry::File(overlay_file));
+                    return Ok(data.len());
+                }
             }
-            if offset + data.len() > buffer.len() {
-                buffer.resize(offset + data.len(), 0);
-            }
-            buffer[offset..offset + data.len()].copy_from_slice(data);
-            Ok(data.len())
         }
-        Entry::Vacant(entry) => {
-            let mut buffer = baseline;
-            if truncate {
-                buffer.clear();
+        drop(overlay);
+
+        if require_metadata {
+            let (metadata, baseline) = load_baseline_file(&normalized, creds)?;
+            if !has_permission(metadata.mode, creds, metadata.uid, metadata.gid, PERM_WRITE) {
+                return Err(FsError::PermissionDenied);
             }
-            if offset > buffer.len() {
-                buffer.resize(offset, 0);
-            }
-            if offset + data.len() > buffer.len() {
-                buffer.resize(offset + data.len(), 0);
-            }
-            buffer[offset..offset + data.len()].copy_from_slice(data);
-            entry.insert(buffer);
-            Ok(data.len())
+            metadata_cache = Some(metadata);
+            data_cache = Some(baseline);
+            require_metadata = false;
+            require_data = false;
+        } else if require_data {
+            let (_, baseline) = load_baseline_file(&normalized, creds)?;
+            data_cache = Some(baseline);
+            require_data = false;
         }
     }
 }
@@ -284,20 +562,259 @@ pub fn file_info_with_credentials(
     require_read: bool,
     require_write: bool,
 ) -> Result<FileAccessInfo, FsError> {
-    let base_size = {
-        let guard = FILESYSTEM.lock();
-        let fs = guard.as_ref().ok_or(FsError::NotInitialized)?;
-        fs.file_info(path, creds, require_read, require_write)?
-    };
+    let normalized = normalize_path(path)?;
 
-    let overlay_size = FILE_OVERLAY
-        .lock()
-        .get(path)
-        .map(|buffer| buffer.len() as u64);
+    {
+        let overlay = FILE_OVERLAY.lock();
+        if let Some(entry) = overlay.get(&normalized) {
+            match entry {
+                OverlayEntry::Tombstone => return Err(FsError::NotFound),
+                OverlayEntry::File(file) => {
+                    if require_read
+                        && !has_permission(file.mode, creds, file.uid, file.gid, PERM_READ)
+                    {
+                        return Err(FsError::PermissionDenied);
+                    }
+                    if require_write
+                        && !has_permission(file.mode, creds, file.uid, file.gid, PERM_WRITE)
+                    {
+                        return Err(FsError::PermissionDenied);
+                    }
+                    return Ok(FileAccessInfo { size: file.size });
+                }
+            }
+        }
+    }
+
+    let metadata = load_metadata(&normalized, creds)?;
+    if metadata.kind != EntryKind::File {
+        return Err(FsError::NotFile);
+    }
+    if require_read && !has_permission(metadata.mode, creds, metadata.uid, metadata.gid, PERM_READ)
+    {
+        return Err(FsError::PermissionDenied);
+    }
+    if require_write
+        && !has_permission(metadata.mode, creds, metadata.uid, metadata.gid, PERM_WRITE)
+    {
+        return Err(FsError::PermissionDenied);
+    }
 
     Ok(FileAccessInfo {
-        size: overlay_size.unwrap_or(base_size),
+        size: metadata.size,
     })
+}
+
+/// Creates an empty file in the overlay if it does not exist.
+pub fn create_file_with_credentials(path: &str, creds: &Credentials, mode: u16) -> Result<(), FsError> {
+    let normalized = normalize_path(path)?;
+    if normalized == "/" {
+        return Err(FsError::AlreadyExists);
+    }
+
+    if let Some(parent) = parent_path(&normalized) {
+        let metadata = load_metadata(&parent, creds)?;
+        if metadata.kind != EntryKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        if !has_permission(metadata.mode, creds, metadata.uid, metadata.gid, PERM_WRITE) {
+            return Err(FsError::PermissionDenied);
+        }
+    }
+
+    let default_mode = (mode & MODE_PERMS_MASK) | S_IFREG;
+
+    loop {
+        let mut overlay = FILE_OVERLAY.lock();
+        match overlay.get_mut(&normalized) {
+            Some(OverlayEntry::File(_)) => return Ok(()),
+            Some(OverlayEntry::Tombstone) => {
+                let overlay_file = OverlayFile {
+                    data: Some(Vec::new()),
+                    size: 0,
+                    mode: default_mode,
+                    uid: creds.uid(),
+                    gid: creds.gid(),
+                    source: OverlaySource::Created,
+                };
+                overlay.insert(normalized.clone(), OverlayEntry::File(overlay_file));
+                return Ok(());
+            }
+            None => {
+                drop(overlay);
+                match load_metadata(&normalized, creds) {
+                    Ok(meta) => {
+                        if meta.kind != EntryKind::File {
+                            return Err(FsError::AlreadyExists);
+                        }
+                        return Ok(());
+                    }
+                    Err(FsError::NotFound) => {
+                        let overlay_file = OverlayFile {
+                            data: Some(Vec::new()),
+                            size: 0,
+                            mode: default_mode,
+                            uid: creds.uid(),
+                            gid: creds.gid(),
+                            source: OverlaySource::Created,
+                        };
+                        FILE_OVERLAY
+                            .lock()
+                            .insert(normalized.clone(), OverlayEntry::File(overlay_file));
+                        return Ok(());
+                    }
+                    Err(other) => return Err(other),
+                }
+            }
+        }
+    }
+}
+
+/// Removes a file by marking it as deleted in the overlay.
+pub fn remove_file_with_credentials(path: &str, creds: &Credentials) -> Result<(), FsError> {
+    let normalized = normalize_path(path)?;
+    if normalized == "/" {
+        return Err(FsError::PermissionDenied);
+    }
+
+    {
+        let overlay = FILE_OVERLAY.lock();
+        if let Some(entry) = overlay.get(&normalized) {
+            match entry {
+                OverlayEntry::File(file) => {
+                    if !has_permission(file.mode, creds, file.uid, file.gid, PERM_WRITE) {
+                        return Err(FsError::PermissionDenied);
+                    }
+                }
+                OverlayEntry::Tombstone => return Err(FsError::NotFound),
+            }
+        }
+    }
+
+    match load_metadata(&normalized, creds) {
+        Ok(meta) => {
+            if meta.kind != EntryKind::File {
+                return Err(FsError::NotFile);
+            }
+            if !has_permission(meta.mode, creds, meta.uid, meta.gid, PERM_WRITE) {
+                return Err(FsError::PermissionDenied);
+            }
+        }
+        Err(FsError::NotFound) => {
+            let mut overlay = FILE_OVERLAY.lock();
+            match overlay.get(&normalized) {
+                Some(OverlayEntry::File(file)) if file.source == OverlaySource::Created => {
+                    overlay.remove(&normalized);
+                    return Ok(());
+                }
+                Some(OverlayEntry::File(_)) => {
+                    overlay.insert(normalized, OverlayEntry::Tombstone);
+                    return Ok(());
+                }
+                Some(OverlayEntry::Tombstone) => return Err(FsError::NotFound),
+                None => return Err(FsError::NotFound),
+            }
+        }
+        Err(other) => return Err(other),
+    }
+
+    let mut overlay = FILE_OVERLAY.lock();
+    match overlay.get(&normalized) {
+        Some(OverlayEntry::File(file)) if file.source == OverlaySource::Created => {
+            overlay.remove(&normalized);
+        }
+        _ => {
+            overlay.insert(normalized, OverlayEntry::Tombstone);
+        }
+    }
+    Ok(())
+}
+
+/// Changes file permissions in the overlay.
+pub fn chmod_with_credentials(path: &str, creds: &Credentials, mode: u16) -> Result<(), FsError> {
+    let normalized = normalize_path(path)?;
+    let desired_mode = (mode & MODE_PERMS_MASK) | S_IFREG;
+
+    let mut overlay = FILE_OVERLAY.lock();
+    if let Some(entry) = overlay.get_mut(&normalized) {
+        match entry {
+            OverlayEntry::File(file) => {
+                if !creds.is_root() && creds.uid() != file.uid {
+                    return Err(FsError::PermissionDenied);
+                }
+                file.mode = desired_mode;
+                return Ok(());
+            }
+            OverlayEntry::Tombstone => return Err(FsError::NotFound),
+        }
+    }
+    drop(overlay);
+
+    let metadata = load_metadata(&normalized, creds)?;
+    if metadata.kind != EntryKind::File {
+        return Err(FsError::NotFile);
+    }
+    if !creds.is_root() && creds.uid() != metadata.uid {
+        return Err(FsError::PermissionDenied);
+    }
+
+    let overlay_file = OverlayFile {
+        data: None,
+        size: metadata.size,
+        mode: desired_mode,
+        uid: metadata.uid,
+        gid: metadata.gid,
+        source: OverlaySource::Shadowed,
+    };
+    FILE_OVERLAY
+        .lock()
+        .insert(normalized, OverlayEntry::File(overlay_file));
+    Ok(())
+}
+
+/// Changes file ownership in the overlay.
+pub fn chown_with_credentials(
+    path: &str,
+    creds: &Credentials,
+    uid: u32,
+    gid: u32,
+) -> Result<(), FsError> {
+    if !creds.is_root() {
+        return Err(FsError::PermissionDenied);
+    }
+
+    let normalized = normalize_path(path)?;
+
+    let mut overlay = FILE_OVERLAY.lock();
+    if let Some(entry) = overlay.get_mut(&normalized) {
+        match entry {
+            OverlayEntry::File(file) => {
+                file.uid = uid;
+                file.gid = gid;
+                return Ok(());
+            }
+            OverlayEntry::Tombstone => return Err(FsError::NotFound),
+        }
+    }
+    drop(overlay);
+
+    let metadata = load_metadata(&normalized, &Credentials::root())?;
+    if metadata.kind != EntryKind::File {
+        return Err(FsError::NotFile);
+    }
+
+    let overlay_file = OverlayFile {
+        data: None,
+        size: metadata.size,
+        mode: metadata.mode,
+        uid,
+        gid,
+        source: OverlaySource::Shadowed,
+    };
+    FILE_OVERLAY
+        .lock()
+        .insert(normalized, OverlayEntry::File(overlay_file));
+    Ok(())
 }
 
 struct Ext2Fs<'a> {
@@ -478,6 +995,25 @@ impl<'a> Ext2Fs<'a> {
 
         data.truncate(inode.size as usize);
         Ok(data)
+    }
+
+    fn metadata(&self, path: &str, creds: &Credentials) -> Result<NodeMetadata, FsError> {
+        let inode_num = self.resolve_path(path, creds)?;
+        let inode = self.load_inode(inode_num)?;
+        let kind = if inode.is_directory() {
+            EntryKind::Directory
+        } else if inode.is_regular_file() {
+            EntryKind::File
+        } else {
+            return Err(FsError::Unsupported);
+        };
+        Ok(NodeMetadata {
+            mode: inode.mode,
+            uid: inode.uid,
+            gid: inode.gid,
+            size: inode.size,
+            kind,
+        })
     }
 
     fn file_info(
@@ -887,8 +1423,8 @@ mod tests {
 
     #[test]
     fn parse_rootfs_image() {
-        let bytes = include_bytes!("../../assets/rootfs.ext2");
-        let fs = Ext2Fs::parse(bytes).expect("parse ext2");
+    let bytes = include_bytes!("../../assets/rootfs.ext4");
+    let fs = Ext2Fs::parse(bytes).expect("parse ext4");
         let creds = Credentials::root();
         let entries = fs.list_dir("/", &creds).expect("list root");
         let names: Vec<_> = entries.into_iter().map(|e| e.name).collect();
@@ -898,8 +1434,8 @@ mod tests {
 
     #[test]
     fn read_readme_file() {
-        let bytes = include_bytes!("../../assets/rootfs.ext2");
-        let fs = Ext2Fs::parse(bytes).expect("parse ext2");
+    let bytes = include_bytes!("../../assets/rootfs.ext4");
+    let fs = Ext2Fs::parse(bytes).expect("parse ext4");
         let creds = Credentials::root();
         let data = fs.read_file("/README", &creds).expect("read README");
         assert!(!data.is_empty());
@@ -907,8 +1443,8 @@ mod tests {
 
     #[test]
     fn bin_contains_command_binaries() {
-        let bytes = include_bytes!("../../assets/rootfs.ext2");
-        let fs = Ext2Fs::parse(bytes).expect("parse ext2");
+    let bytes = include_bytes!("../../assets/rootfs.ext4");
+    let fs = Ext2Fs::parse(bytes).expect("parse ext4");
         let creds = Credentials::root();
         let entries = fs.list_dir("/bin", &creds).expect("list /bin");
         let names: Vec<String> = entries.into_iter().map(|entry| entry.name).collect();
@@ -952,8 +1488,8 @@ mod tests {
 
     #[test]
     fn overlay_write_roundtrip() {
-        let bytes = include_bytes!("../../assets/rootfs.ext2");
-        let fs = Ext2Fs::parse(bytes).expect("parse ext2");
+    let bytes = include_bytes!("../../assets/rootfs.ext4");
+    let fs = Ext2Fs::parse(bytes).expect("parse ext4");
         {
             let mut guard = FILESYSTEM.lock();
             *guard = Some(fs);

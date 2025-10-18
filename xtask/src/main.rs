@@ -145,10 +145,10 @@ fn build_bootimage(
     }
 
     let mut builder = DiskImageBuilder::new(kernel_path.clone());
-    let ramdisk_path = workspace_root.join("assets").join("rootfs.ext2");
+    let ramdisk_path = workspace_root.join("assets").join("rootfs.ext4");
     if !ramdisk_path.exists() {
         bail!(
-            "ramdisk image not found at {}. Run `mke2fs -t ext2 -d assets/rootfs -b 1024 -m 0 assets/rootfs.ext2 1024` to regenerate.",
+            "ramdisk image not found at {}. Run `mke2fs -t ext4 -O ^has_journal,^metadata_csum,^64bit,^flex_bg -d assets/rootfs -b 1024 -m 0 assets/rootfs.ext4 1024` to regenerate.",
             ramdisk_path.display()
         );
     }
@@ -332,7 +332,7 @@ fn build_command_module(command_id: u8, command_name: &str) -> Result<Vec<u8>> {
 fn regenerate_rootfs_image(workspace_root: &Path) -> Result<()> {
     let assets_dir = workspace_root.join("assets");
     let rootfs_dir = assets_dir.join("rootfs");
-    let ramdisk_path = assets_dir.join("rootfs.ext2");
+    let ramdisk_path = assets_dir.join("rootfs.ext4");
 
     if !rootfs_dir.exists() {
         bail!(
@@ -343,7 +343,9 @@ fn regenerate_rootfs_image(workspace_root: &Path) -> Result<()> {
 
     let mut cmd = ProcessCommand::new("mke2fs");
     cmd.arg("-t")
-        .arg("ext2")
+        .arg("ext4")
+        .arg("-O")
+        .arg("^has_journal,^metadata_csum,^64bit,^flex_bg")
         .arg("-d")
         .arg(&rootfs_dir)
         .arg("-b")

@@ -23,6 +23,6 @@ temp/
 third_party/
 
 # system files
-assets/rootfs.ext2
+assets/rootfs.*
 assets/rootfs/bin/
 !assets/rootfs/bin/.gitkeep

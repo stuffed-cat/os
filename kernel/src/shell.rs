@@ -3,13 +3,14 @@
 use alloc::collections::VecDeque;
 use log::info;
 use spin::Mutex;
-
-#[cfg(feature = "hardware")]
-use crate::arch::x86_64::framebuffer;
 use crate::arch::x86_64::serial;
 use crate::core::{KernelContext, Subsystem, SubsystemId};
 use crate::error::SubsystemError;
-use crate::fs::{self, EntryKind as FsEntryKind, FsError as KernelFsError};
+use crate::fs::{
+    self,
+    EntryKind as FsEntryKind,
+    FsError as KernelFsError,
+};
 use alloc::vec::Vec;
 use userland::{
     BareShell, DirEntry, EntryKind, FsError as ShellFsError, ShellFs, ShellIo, ShellSystem,
@@ -94,6 +95,7 @@ impl ShellFs for KernelShellFs {
                 Err(ShellFsError::Unavailable)
             }
             Err(KernelFsError::InvalidImage) => Err(ShellFsError::Corrupt),
+            Err(KernelFsError::AlreadyExists) => Err(ShellFsError::Corrupt),
             Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
             Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
             Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
@@ -108,6 +110,88 @@ impl ShellFs for KernelShellFs {
                 Err(ShellFsError::Unavailable)
             }
             Err(KernelFsError::InvalidImage) => Err(ShellFsError::Corrupt),
+            Err(KernelFsError::AlreadyExists) => Err(ShellFsError::Corrupt),
+            Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
+            Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
+            Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
+            Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
+        }
+    }
+
+    fn create_file(&self, path: &str, mode: u16) -> Result<(), ShellFsError> {
+        match fs::create_file(path, mode) {
+            Ok(_) => Ok(()),
+            Err(KernelFsError::NotInitialized | KernelFsError::Unsupported) => {
+                Err(ShellFsError::Unavailable)
+            }
+            Err(KernelFsError::InvalidImage) => Err(ShellFsError::Corrupt),
+            Err(KernelFsError::AlreadyExists) => Err(ShellFsError::AlreadyExists),
+            Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
+            Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
+            Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
+            Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
+        }
+    }
+
+    fn remove_file(&self, path: &str) -> Result<(), ShellFsError> {
+        match fs::remove_file(path) {
+            Ok(_) => Ok(()),
+            Err(KernelFsError::NotInitialized | KernelFsError::Unsupported) => {
+                Err(ShellFsError::Unavailable)
+            }
+            Err(KernelFsError::InvalidImage) => Err(ShellFsError::Corrupt),
+            Err(KernelFsError::AlreadyExists) => Err(ShellFsError::Corrupt),
+            Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
+            Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
+            Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
+            Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
+        }
+    }
+
+    fn write_file(
+        &self,
+        path: &str,
+        offset: usize,
+        data: &[u8],
+        truncate: bool,
+    ) -> Result<usize, ShellFsError> {
+        match fs::write_file(path, offset, data, truncate) {
+            Ok(written) => Ok(written),
+            Err(KernelFsError::NotInitialized | KernelFsError::Unsupported) => {
+                Err(ShellFsError::Unavailable)
+            }
+            Err(KernelFsError::InvalidImage) => Err(ShellFsError::Corrupt),
+            Err(KernelFsError::AlreadyExists) => Err(ShellFsError::Corrupt),
+            Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
+            Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
+            Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
+            Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
+        }
+    }
+
+    fn chmod(&self, path: &str, mode: u16) -> Result<(), ShellFsError> {
+        match fs::chmod(path, mode) {
+            Ok(_) => Ok(()),
+            Err(KernelFsError::NotInitialized | KernelFsError::Unsupported) => {
+                Err(ShellFsError::Unavailable)
+            }
+            Err(KernelFsError::InvalidImage) => Err(ShellFsError::Corrupt),
+            Err(KernelFsError::AlreadyExists) => Err(ShellFsError::Corrupt),
+            Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
+            Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
+            Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
+            Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
+        }
+    }
+
+    fn chown(&self, path: &str, uid: u32, gid: u32) -> Result<(), ShellFsError> {
+        match fs::chown(path, uid, gid) {
+            Ok(_) => Ok(()),
+            Err(KernelFsError::NotInitialized | KernelFsError::Unsupported) => {
+                Err(ShellFsError::Unavailable)
+            }
+            Err(KernelFsError::InvalidImage) => Err(ShellFsError::Corrupt),
+            Err(KernelFsError::AlreadyExists) => Err(ShellFsError::Corrupt),
             Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
             Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
             Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),

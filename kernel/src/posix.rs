@@ -75,6 +75,7 @@ pub struct PosixLayer<'a> {
     path_handles: RwLock<BTreeMap<u64, String>>,
     next_handle: AtomicU64,
     pipes: RwLock<BTreeMap<u64, PipeState>>,
+    virtual_files: RwLock<BTreeMap<String, Vec<u8>>>,
 }
 
 impl<'a> PosixLayer<'a> {
@@ -86,6 +87,7 @@ impl<'a> PosixLayer<'a> {
             path_handles: RwLock::new(BTreeMap::new()),
             next_handle: AtomicU64::new(1_000),
             pipes: RwLock::new(BTreeMap::new()),
+            virtual_files: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -164,6 +166,11 @@ impl<'a> PosixLayer<'a> {
         self.path_handles.write().insert(handle, path);
     }
 
+    /// Registers a memory-backed file that bypasses the kernel filesystem.
+    pub fn register_virtual_file(&self, path: String, data: Vec<u8>) {
+        self.virtual_files.write().insert(path, data);
+    }
+
     /// Allocates a new handle id for either program or path associations.
     pub fn allocate_handle(&self) -> u64 {
         self.next_handle.fetch_add(1, Ordering::SeqCst)
@@ -196,10 +203,10 @@ impl<'a> PosixLayer<'a> {
                 Ok(state.write(data) as u64)
             }
             Descriptor::Pipe { .. } => Err(Errno::Badf),
-            Descriptor::Path => {
+            Descriptor::Path(path) => {
                 let creds = proc.credentials();
                 let offset = proc.fd_offset(fd).unwrap_or(0);
-                match fs::write_file_with_credentials(&descriptor, &creds, offset, data, false) {
+                match fs::write_file_with_credentials(path, &creds, offset, data, false) {
                     Ok(written) => {
                         proc.advance_fd_offset(fd, written);
                         Ok(written as u64)
@@ -211,6 +218,20 @@ impl<'a> PosixLayer<'a> {
                     Err(FsError::Unsupported) => Err(Errno::NoImpl),
                     Err(_) => Err(Errno::NoImpl),
                 }
+            }
+            Descriptor::Virtual(path) => {
+                let mut files = self.virtual_files.write();
+                let entry = files.get_mut(path).ok_or(Errno::NoEnt)?;
+                let offset = proc.fd_offset(fd).unwrap_or(0);
+                if offset > entry.len() {
+                    entry.resize(offset, 0);
+                }
+                if offset + data.len() > entry.len() {
+                    entry.resize(offset + data.len(), 0);
+                }
+                entry[offset..offset + data.len()].copy_from_slice(data);
+                proc.advance_fd_offset(fd, data.len());
+                Ok(data.len() as u64)
             }
             Descriptor::Unknown => Err(Errno::NoImpl),
             Descriptor::StdIn => Err(Errno::Badf),
@@ -245,9 +266,9 @@ impl<'a> PosixLayer<'a> {
             }
             Descriptor::Pipe { .. } => Err(Errno::Badf),
             Descriptor::StdOut | Descriptor::StdErr => Err(Errno::Badf),
-            Descriptor::Path => {
+            Descriptor::Path(path) => {
                 let creds = proc.credentials();
-                match fs::read_file_with_credentials(&descriptor, &creds) {
+                match fs::read_file_with_credentials(path, &creds) {
                     Ok(data) => {
                         let offset = proc.fd_offset(fd).unwrap_or(0);
                         if offset >= data.len() {
@@ -263,8 +284,22 @@ impl<'a> PosixLayer<'a> {
                     Err(FsError::NotFound) => Err(Errno::NoEnt),
                     Err(FsError::NotDirectory) => Err(Errno::NotDir),
                     Err(FsError::NotFile) => Err(Errno::Inval),
+                    Err(FsError::Unsupported) => Err(Errno::NoImpl),
                     Err(_) => Err(Errno::NoImpl),
                 }
+            }
+            Descriptor::Virtual(path) => {
+                let files = self.virtual_files.read();
+                let data = files.get(path).ok_or(Errno::NoEnt)?;
+                let offset = proc.fd_offset(fd).unwrap_or(0);
+                if offset >= data.len() {
+                    return Ok(0);
+                }
+                let available = data.len() - offset;
+                let to_copy = core::cmp::min(available, len as usize);
+                buffer[..to_copy].copy_from_slice(&data[offset..offset + to_copy]);
+                proc.advance_fd_offset(fd, to_copy);
+                Ok(to_copy as u64)
             }
             Descriptor::Unknown => Err(Errno::NoImpl),
         }
@@ -273,6 +308,32 @@ impl<'a> PosixLayer<'a> {
     fn open(&self, pid: Pid, path: &str, flags: u64) -> Result<u64, Errno> {
         let normalized = Self::normalize_path(path);
         let proc = self.process_table.lookup(pid).ok_or(Errno::NoEnt)?;
+
+        // Prefer memory-backed files before touching the global filesystem.
+        let mut virtual_len = None;
+        {
+            let mut files = self.virtual_files.write();
+            if let Some(entry) = files.get_mut(&normalized) {
+                if (flags & O_TRUNC) != 0 {
+                    entry.clear();
+                }
+                virtual_len = Some(entry.len());
+            }
+        }
+        if let Some(len) = virtual_len {
+            let descriptor = format!("virt:{}", normalized);
+            let fd = self
+                .process_table
+                .open(pid, descriptor)
+                .map_err(Errno::from_subsystem)?;
+            if (flags & O_APPEND) != 0 {
+                proc.set_fd_offset(fd, len);
+            } else {
+                proc.set_fd_offset(fd, 0);
+            }
+            return Ok(fd);
+        }
+
         let creds = proc.credentials();
 
         let accmode = flags & O_ACCMODE;
@@ -487,12 +548,13 @@ enum PipeEnd {
 }
 
 #[derive(Debug)]
-enum Descriptor {
+enum Descriptor<'a> {
     StdIn,
     StdOut,
     StdErr,
     Pipe { id: u64, end: PipeEnd },
-    Path,
+    Path(&'a str),
+    Virtual(&'a str),
     Unknown,
 }
 
@@ -563,7 +625,7 @@ impl<'a> PosixLayer<'a> {
             .and_then(|proc| proc.get_fd(fd))
     }
 
-    fn classify_descriptor(&self, descriptor: &str) -> Descriptor {
+    fn classify_descriptor<'d>(&self, descriptor: &'d str) -> Descriptor<'d> {
         match descriptor {
             "tty:stdin" => Descriptor::StdIn,
             "tty:stdout" => Descriptor::StdOut,
@@ -587,10 +649,13 @@ impl<'a> PosixLayer<'a> {
                         }
                     }
                 }
+                if let Some(path) = other.strip_prefix("virt:") {
+                    return Descriptor::Virtual(path);
+                }
                 if descriptor.is_empty() {
                     Descriptor::Unknown
                 } else {
-                    Descriptor::Path
+                    Descriptor::Path(other)
                 }
             }
         }
