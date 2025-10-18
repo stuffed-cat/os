@@ -32,6 +32,7 @@ const COLOR_RESET: &str = "\x1b[0m";
 const HELP_ENTRIES: &[(&str, &str)] = &[
     ("help", "Show this help message"),
     ("history", "Display previously executed commands"),
+    ("sh", "Launch a nested shell session"),
     ("ls", "List entries from the mounted filesystem"),
     ("pwd", "Print the current working directory"),
     ("cd", "Change the current working directory"),
@@ -118,6 +119,7 @@ impl Default for LsOptions {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BuiltinCommand {
+    Shell,
     Help,
     History,
     Ls,
@@ -416,6 +418,14 @@ where
         self.println(": filesystem is read-only");
     }
 
+    fn command_sh(&mut self, args: &[&str]) {
+        if !args.is_empty() {
+            self.println("sh: arguments are not supported in the bare shell");
+            return;
+        }
+        self.println("already running bare shell; nested shells are not implemented");
+    }
+
     fn resolve_command(&mut self, name: &str) -> Result<CommandExecutable, CommandResolutionError> {
         let path = format!("/bin/{name}");
         match self.fs.read_file(&path) {
@@ -673,6 +683,7 @@ where
 
     fn run_builtin(&mut self, builtin: BuiltinCommand, args: &[&str]) {
         match builtin {
+            BuiltinCommand::Shell => self.command_sh(args),
             BuiltinCommand::Help => self.print_help(),
             BuiltinCommand::History => self.print_history(),
             BuiltinCommand::Ls => self.command_ls(args),
@@ -693,6 +704,7 @@ where
 
     fn builtin_from_str(name: &str) -> Option<BuiltinCommand> {
         match name {
+            "sh" => Some(BuiltinCommand::Shell),
             "help" => Some(BuiltinCommand::Help),
             "history" => Some(BuiltinCommand::History),
             "ls" => Some(BuiltinCommand::Ls),
@@ -729,6 +741,7 @@ where
             12 => Some(BuiltinCommand::Mv),
             13 => Some(BuiltinCommand::Reboot),
             14 => Some(BuiltinCommand::Shutdown),
+            15 => Some(BuiltinCommand::Shell),
             _ => None,
         }
     }

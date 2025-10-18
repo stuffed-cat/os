@@ -45,6 +45,8 @@ enum Command {
         #[arg(last = true)]
         extra: Vec<String>,
     },
+    /// Regenerate command binaries and rebuild the root filesystem image.
+    Rootfs,
 }
 
 fn main() -> Result<()> {
@@ -68,6 +70,7 @@ fn main() -> Result<()> {
             features,
             &extra,
         )?,
+        Command::Rootfs => rebuild_rootfs()?,
     }
     Ok(())
 }
@@ -151,6 +154,16 @@ fn build_bootimage(
     Ok(())
 }
 
+fn rebuild_rootfs() -> Result<()> {
+    let metadata = MetadataCommand::new()
+        .exec()
+        .context("failed to load cargo metadata")?;
+    let workspace_root = PathBuf::from(metadata.workspace_root);
+    generate_command_binaries(&workspace_root)?;
+    regenerate_rootfs_image(&workspace_root)?;
+    Ok(())
+}
+
 const BCM_COMMANDS: &[(&str, u8)] = &[
     ("help", 0),
     ("history", 1),
@@ -167,6 +180,7 @@ const BCM_COMMANDS: &[(&str, u8)] = &[
     ("mv", 12),
     ("reboot", 13),
     ("shutdown", 14),
+    ("sh", 15),
 ];
 
 fn generate_command_binaries(workspace_root: &Path) -> Result<()> {

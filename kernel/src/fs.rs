@@ -461,6 +461,7 @@ mod tests {
             ("mv", 12u8),
             ("reboot", 13u8),
             ("shutdown", 14u8),
+            ("sh", 15u8),
         ];
 
         for (command, expected_id) in expected_commands {

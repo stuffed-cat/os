@@ -65,8 +65,6 @@ impl ShellIo for SerialShellIo {
 
     fn write_str(&mut self, s: &str) {
         serial::write_str(s);
-        #[cfg(feature = "hardware")]
-        framebuffer::write_str(s);
     }
 }
 
