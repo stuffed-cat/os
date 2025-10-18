@@ -48,9 +48,8 @@ impl UserSession {
     }
 }
 
-static CURRENT_SESSION: Lazy<Mutex<UserSession>> = Lazy::new(|| {
-    Mutex::new(UserSession::from(users::root_profile()))
-});
+static CURRENT_SESSION: Lazy<Mutex<UserSession>> =
+    Lazy::new(|| Mutex::new(UserSession::from(users::root_profile())));
 
 /// Returns the current session snapshot.
 pub fn current_session() -> UserSession {

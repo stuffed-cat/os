@@ -148,7 +148,7 @@ fn build_bootimage(
     let ramdisk_path = workspace_root.join("assets").join("rootfs.ext4");
     if !ramdisk_path.exists() {
         bail!(
-            "ramdisk image not found at {}. Run `mke2fs -t ext4 -O ^has_journal,^metadata_csum,^64bit,^flex_bg -d assets/rootfs -b 1024 -m 0 assets/rootfs.ext4 16384` to regenerate.",
+            "ramdisk image not found at {}. Run `mke2fs -t ext4 -O ^has_journal,^metadata_csum -d assets/rootfs -b 1024 -m 0 assets/rootfs.ext4 16384` to regenerate.",
             ramdisk_path.display()
         );
     }
@@ -190,6 +190,16 @@ const BCM_COMMANDS: &[(&str, u8)] = &[
     ("reboot", 13),
     ("shutdown", 14),
     ("sh", 15),
+    ("chmod", 16),
+    ("chown", 17),
+    ("whoami", 18),
+    ("id", 19),
+    ("users", 20),
+    ("su", 21),
+    ("useradd", 22),
+    ("passwd", 23),
+    ("setsid", 24),
+    ("cttyhack", 25),
 ];
 
 fn generate_command_binaries(workspace_root: &Path) -> Result<()> {
@@ -214,7 +224,7 @@ fn generate_command_binaries(workspace_root: &Path) -> Result<()> {
 fn copy_userland_execs(workspace_root: &Path, bin_dir: &Path) -> Result<()> {
     let commands = [
         "bash", "cat", "cd", "cp", "echo", "help", "history", "ls", "mkdir", "mv", "pwd", "reboot",
-        "rm", "rmdir", "sh", "shutdown", "touch",
+        "rm", "rmdir", "sh", "shutdown", "touch", "setsid", "cttyhack",
     ];
 
     let mut build_args = vec!["build", "--release", "-p", "userland"];
@@ -414,7 +424,7 @@ fn regenerate_rootfs_image(workspace_root: &Path) -> Result<()> {
     cmd.arg("-t")
         .arg("ext4")
         .arg("-O")
-        .arg("^has_journal,^metadata_csum,^64bit,^flex_bg")
+    .arg("^has_journal,^metadata_csum")
         .arg("-d")
         .arg(&rootfs_dir)
         .arg("-b")

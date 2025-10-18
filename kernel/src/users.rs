@@ -36,7 +36,11 @@ impl UserRecord {
     fn new(profile: UserProfile, password: &str) -> Self {
         let salt = next_salt();
         let hash = hash_password(password, salt);
-        Self { profile, salt, hash }
+        Self {
+            profile,
+            salt,
+            hash,
+        }
     }
 
     fn verify_password(&self, password: &str) -> bool {
@@ -134,7 +138,11 @@ fn with_database<T>(mut f: impl FnMut(&mut UserDatabase) -> T) -> T {
 
 /// Returns a profile snapshot for the given username if present.
 pub fn get_user(username: &str) -> Option<UserProfile> {
-    with_database(|db| db.by_name.get(username).map(|record| record.profile.clone()))
+    with_database(|db| {
+        db.by_name
+            .get(username)
+            .map(|record| record.profile.clone())
+    })
 }
 
 /// Returns a profile snapshot for the given UID if present.
@@ -147,7 +155,12 @@ pub fn get_user_by_uid(uid: u32) -> Option<UserProfile> {
 
 /// Enumerates all user profiles currently registered.
 pub fn list_users() -> Vec<UserProfile> {
-    with_database(|db| db.by_name.values().map(|record| record.profile.clone()).collect())
+    with_database(|db| {
+        db.by_name
+            .values()
+            .map(|record| record.profile.clone())
+            .collect()
+    })
 }
 
 fn validate_password(password: &str) -> Result<(), UserError> {

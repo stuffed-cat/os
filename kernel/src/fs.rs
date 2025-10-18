@@ -18,6 +18,7 @@ const SUPERBLOCK_MAGIC: u16 = 0xEF53;
 const INODE_SIZE_DEFAULT: usize = 128;
 const ROOT_INODE: u32 = 2;
 const BLOCK_GROUP_DESC_SIZE: usize = 32;
+const SUPERBLOCK_DESC_SIZE_OFFSET: usize = 0xFE;
 const INODE_DIRECT_BLOCKS: usize = 12;
 const PERM_READ: u16 = 0b100;
 const PERM_WRITE: u16 = 0b010;
@@ -975,6 +976,7 @@ struct Ext2Fs<'a> {
     inodes_per_group: u32,
     block_group_table_offset: usize,
     block_group_count: u32,
+    block_group_desc_size: usize,
     kind: ExtFilesystemKind,
 }
 
@@ -1033,13 +1035,20 @@ impl<'a> Ext2Fs<'a> {
             | EXT_FEATURE_INCOMPAT_RECOVER
             | EXT_FEATURE_INCOMPAT_JOURNAL_DEV
             | EXT_FEATURE_INCOMPAT_META_BG
-            | EXT4_FEATURE_INCOMPAT_EXTENTS;
+            | EXT4_FEATURE_INCOMPAT_EXTENTS
+            | EXT4_FEATURE_INCOMPAT_64BIT
+            | EXT4_FEATURE_INCOMPAT_FLEX_BG;
         if feature_incompat & !allowed_incompat != 0 {
             return Err(FsError::Unsupported);
         }
-        if feature_incompat & (EXT4_FEATURE_INCOMPAT_64BIT | EXT4_FEATURE_INCOMPAT_FLEX_BG) != 0 {
-            return Err(FsError::Unsupported);
-        }
+
+        let descriptor_size = if (feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT) != 0 {
+            let raw = read_u16(superblock, SUPERBLOCK_DESC_SIZE_OFFSET) as usize;
+            let size = if raw == 0 { 64 } else { raw };
+            size.max(BLOCK_GROUP_DESC_SIZE)
+        } else {
+            BLOCK_GROUP_DESC_SIZE
+        };
 
         let allowed_ro = EXT_FEATURE_RO_COMPAT_SPARSE_SUPER
             | EXT_FEATURE_RO_COMPAT_LARGE_FILE
@@ -1061,7 +1070,7 @@ impl<'a> Ext2Fs<'a> {
 
         let block_group_table_block = if block_size == 1024 { 2 } else { 1 };
         let block_group_table_offset = block_group_table_block * block_size;
-        let descriptor_table_size = block_group_count as usize * BLOCK_GROUP_DESC_SIZE;
+        let descriptor_table_size = block_group_count as usize * descriptor_size;
         if block_group_table_offset + descriptor_table_size > data.len() {
             return Err(FsError::InvalidImage);
         }
@@ -1073,6 +1082,7 @@ impl<'a> Ext2Fs<'a> {
             inodes_per_group,
             block_group_table_offset,
             block_group_count,
+            block_group_desc_size: descriptor_size,
             kind,
         })
     }
@@ -1304,8 +1314,14 @@ impl<'a> Ext2Fs<'a> {
             return Err(FsError::InvalidImage);
         }
         let descriptor_offset =
-            self.block_group_table_offset + group as usize * BLOCK_GROUP_DESC_SIZE;
-        let inode_table_block = read_u32(self.data, descriptor_offset + 8);
+            self.block_group_table_offset + group as usize * self.block_group_desc_size;
+        let inode_table_low = read_u32(self.data, descriptor_offset + 8) as u64;
+        let inode_table_high = if self.block_group_desc_size >= 64 {
+            read_u32(self.data, descriptor_offset + 48) as u64
+        } else {
+            0
+        };
+        let inode_table_block = (inode_table_high << 32) | inode_table_low;
         if inode_table_block == 0 {
             return Err(FsError::InvalidImage);
         }
@@ -1698,6 +1714,16 @@ mod tests {
             ("reboot", 13u8),
             ("shutdown", 14u8),
             ("sh", 15u8),
+            ("chmod", 16u8),
+            ("chown", 17u8),
+            ("whoami", 18u8),
+            ("id", 19u8),
+            ("users", 20u8),
+            ("su", 21u8),
+            ("useradd", 22u8),
+            ("passwd", 23u8),
+            ("setsid", 24u8),
+            ("cttyhack", 25u8),
         ];
 
         for (command, expected_id) in expected_commands {

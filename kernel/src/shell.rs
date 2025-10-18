@@ -9,6 +9,8 @@ use crate::process::ProcessTable;
 #[cfg(not(feature = "std"))]
 use crate::scheduler::SchedulingClass;
 use crate::scheduler::{RunQueueEntry, Scheduler, ThreadStatus};
+use crate::session::{self, UserSession};
+use crate::users::{self, UserError, UserProfile};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -20,8 +22,6 @@ use log::info;
 #[cfg(not(feature = "std"))]
 use log::warn;
 use spin::Mutex;
-use crate::session::{self, UserSession};
-use crate::users::{self, UserError, UserProfile};
 use userland::{
     AuthError, BareShell, DirEntry, EntryKind, ExecResult, FsError as ShellFsError, ShellFs,
     ShellIo, ShellSystem, SystemError, UserAdminError, UserIdentity,

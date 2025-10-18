@@ -106,3 +106,13 @@ required-features = ["std"]
 name = "sh"
 path = "src/bin/sh.rs"
 required-features = ["std"]
+
+[[bin]]
+name = "setsid"
+path = "src/bin/setsid.rs"
+required-features = ["std"]
+
+[[bin]]
+name = "cttyhack"
+path = "src/bin/cttyhack.rs"
+required-features = ["std"]

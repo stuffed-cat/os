@@ -37,10 +37,10 @@
 裸机镜像会自动将 `assets/rootfs.ext4` 作为 ramdisk 装载进内核，内核使用写入 overlay 提供默认可写的视图。若需要修改根文件系统内容，可直接编辑 `assets/rootfs/` 目录，然后使用以下命令重新生成兼容的 ext4 镜像：
 
 ```bash
-mke2fs -t ext4 -O ^has_journal,^metadata_csum,^64bit,^flex_bg -d assets/rootfs -b 1024 -m 0 assets/rootfs.ext4 16384
+mke2fs -t ext4 -O ^has_journal,^metadata_csum -d assets/rootfs -b 1024 -m 0 assets/rootfs.ext4 16384
 ```
 
-> 提示：上述命令依赖 `mke2fs`（e2fsprogs）工具。镜像大小为 16 MiB；如需更多空间，可调整最后的块数量参数。`-O` 参数用于禁用当前内核尚未实现的 ext4 特性（journal、metadata checksum、64bit block 号、flex_bg 分组布局），确保镜像可以顺利加载。
+> 提示：上述命令依赖 `mke2fs`（e2fsprogs）工具。镜像大小为 16 MiB；如需更多空间，可调整最后的块数量参数。`-O` 参数用于禁用当前内核尚未实现的 ext4 特性（journal、metadata checksum）。从现在起，镜像可启用 ext4 的 `64bit` 与 `flex_bg` 扩展，无需额外参数即可兼容。
 
 #### Bare shell 内置命令
 
@@ -56,6 +56,16 @@ mke2fs -t ext4 -O ^has_journal,^metadata_csum,^64bit,^flex_bg -d assets/rootfs -
 | `cat FILE...` | 打印文件内容 | 仅支持 ext4 镜像中的常规文件 |
 | `echo ARGS...` | 原样回显参数 | |
 | `touch`/`mkdir`/`rmdir`/`rm`/`cp`/`mv` | 预留命令 | 内核 overlay 已支持写入路径，shell 侧仍在对接（目前提示功能未完成） |
+| `chmod MODE PATH` | 修改权限位 | 支持八进制模式（如 `0644`） |
+| `chown USER[:GROUP] PATH` | 调整所有者 | 仅 root 可调用，组名可留空默认同用户 |
+| `whoami` | 显示当前用户名 | |
+| `id` | 显示 UID/GID/附加组 | |
+| `users` | 列出系统已注册用户 | |
+| `su USER [PASSWORD]` | 切换用户 | root 可省略密码；其他用户需提供密码 |
+| `useradd USER PASS [--home PATH]` | 新建用户 | 仅 root 可调用，默认家目录 `/home/USER` |
+| `passwd [USER] NEWPASS` | 修改密码 | 非 root 只能改自身密码 |
+| `setsid CMD [ARGS...]` | 在新会话中执行命令 | 当前实现为占位实现，直接转发到目标命令 |
+| `cttyhack CMD [ARGS...]` | 附加控制终端后执行命令 | 当前实现为占位实现，直接转发到目标命令 |
 | `reboot` | 请求重启 | 在 `hardware` 构建目标上调用 ACPI/键盘复位，其他配置打印提示 |
 | `shutdown` | 请求关机 | 同上 |
 

@@ -53,9 +53,11 @@ const HELP_ENTRIES: &[(&str, &str)] = &[
         "useradd",
         "Create a user: useradd name password [--home PATH]",
     ),
+    ("passwd", "Update password: passwd [name] newpassword"),
+    ("setsid", "Run a command in a new session (placeholder)"),
     (
-        "passwd",
-        "Update password: passwd [name] newpassword",
+        "cttyhack",
+        "Attach to controlling tty before running command (placeholder)",
     ),
     (
         "touch",
@@ -267,6 +269,8 @@ enum BuiltinCommand {
     Su,
     UserAdd,
     Passwd,
+    SetSid,
+    CttyHack,
 }
 
 struct CommandBinary {
@@ -397,28 +401,32 @@ where
             let mut parts = trimmed.split_whitespace();
             if let Some(cmd) = parts.next() {
                 let args: Vec<&str> = parts.collect();
-                match self.resolve_command(cmd) {
-                    Ok(CommandExecutable::Builtin(builtin)) => self.run_builtin(builtin, &args),
-                    Ok(CommandExecutable::External { path }) => self.run_external(&path, &args),
-                    Err(CommandResolutionError::InvalidFormat) => {
-                        self.print("unsupported executable format: ");
-                        self.println(cmd);
-                    }
-                    Err(CommandResolutionError::Filesystem(FsError::Unavailable)) => {
-                        self.println("filesystem unavailable")
-                    }
-                    Err(CommandResolutionError::Filesystem(FsError::Corrupt)) => {
-                        self.println("filesystem corrupt")
-                    }
-                    Err(CommandResolutionError::Filesystem(FsError::PermissionDenied)) => {
-                        self.println("permission denied")
-                    }
-                    Err(CommandResolutionError::Filesystem(_)) => self.println("command not found"),
-                    Err(CommandResolutionError::NotFound) => self.println("command not found"),
-                }
+                self.dispatch_command(cmd, &args);
             }
         }
         self.print_prompt();
+    }
+
+    fn dispatch_command(&mut self, cmd: &str, args: &[&str]) {
+        match self.resolve_command(cmd) {
+            Ok(CommandExecutable::Builtin(builtin)) => self.run_builtin(builtin, args),
+            Ok(CommandExecutable::External { path }) => self.run_external(&path, args),
+            Err(CommandResolutionError::InvalidFormat) => {
+                self.print("unsupported executable format: ");
+                self.println(cmd);
+            }
+            Err(CommandResolutionError::Filesystem(FsError::Unavailable)) => {
+                self.println("filesystem unavailable")
+            }
+            Err(CommandResolutionError::Filesystem(FsError::Corrupt)) => {
+                self.println("filesystem corrupt")
+            }
+            Err(CommandResolutionError::Filesystem(FsError::PermissionDenied)) => {
+                self.println("permission denied")
+            }
+            Err(CommandResolutionError::Filesystem(_)) => self.println("command not found"),
+            Err(CommandResolutionError::NotFound) => self.println("command not found"),
+        }
     }
 
     fn print_help(&mut self) {
@@ -820,7 +828,10 @@ where
     fn command_id(&mut self) {
         let mut line = format!(
             "uid={}({}) gid={}({})",
-            self.current_user.uid, self.current_user.username, self.current_user.gid, self.current_user.gid
+            self.current_user.uid,
+            self.current_user.username,
+            self.current_user.gid,
+            self.current_user.gid
         );
         if !self.current_user.groups.is_empty() {
             let groups = self
@@ -944,12 +955,12 @@ where
             }
         }
 
-        match self
-            .sys
-            .create_user(username, password, home.as_deref())
-        {
+        match self.sys.create_user(username, password, home.as_deref()) {
             Ok(identity) => {
-                self.println(&format!("user {} created (uid={})", identity.username, identity.uid));
+                self.println(&format!(
+                    "user {} created (uid={})",
+                    identity.username, identity.uid
+                ));
             }
             Err(UserAdminError::AlreadyExists) => self.println("useradd: user already exists"),
             Err(UserAdminError::InvalidPassword) => self.println("useradd: password rejected"),
@@ -984,6 +995,22 @@ where
             Err(UserAdminError::Unsupported) => self.println("passwd: operation unsupported"),
             Err(UserAdminError::AlreadyExists) => {}
         }
+    }
+
+    fn command_setsid(&mut self, args: &[&str]) {
+        if args.is_empty() {
+            self.println("usage: setsid COMMAND [ARGS...]");
+            return;
+        }
+        self.dispatch_command(args[0], &args[1..]);
+    }
+
+    fn command_cttyhack(&mut self, args: &[&str]) {
+        if args.is_empty() {
+            self.println("usage: cttyhack COMMAND [ARGS...]");
+            return;
+        }
+        self.dispatch_command(args[0], &args[1..]);
     }
 
     fn parse_owner_spec(&mut self, spec: &str) -> Result<(u32, u32), String> {
@@ -1287,10 +1314,7 @@ where
         let display = path.rsplit('/').next().unwrap_or(path);
         let mut owned_env: Vec<(String, String)> = Vec::new();
         if !self.history.is_empty() {
-            owned_env.push((
-                "SHELL_HISTORY".to_string(),
-                self.history.join("\n"),
-            ));
+            owned_env.push(("SHELL_HISTORY".to_string(), self.history.join("\n")));
             owned_env.push((
                 "SHELL_HISTORY_COUNT".to_string(),
                 self.history.len().to_string(),
@@ -1406,6 +1430,8 @@ where
             BuiltinCommand::Su => self.command_su(args),
             BuiltinCommand::UserAdd => self.command_useradd(args),
             BuiltinCommand::Passwd => self.command_passwd(args),
+            BuiltinCommand::SetSid => self.command_setsid(args),
+            BuiltinCommand::CttyHack => self.command_cttyhack(args),
         }
     }
 
@@ -1435,6 +1461,8 @@ where
             "su" => Some(BuiltinCommand::Su),
             "useradd" => Some(BuiltinCommand::UserAdd),
             "passwd" => Some(BuiltinCommand::Passwd),
+            "setsid" => Some(BuiltinCommand::SetSid),
+            "cttyhack" => Some(BuiltinCommand::CttyHack),
             _ => None,
         }
     }
@@ -1465,6 +1493,8 @@ where
             21 => Some(BuiltinCommand::Su),
             22 => Some(BuiltinCommand::UserAdd),
             23 => Some(BuiltinCommand::Passwd),
+            24 => Some(BuiltinCommand::SetSid),
+            25 => Some(BuiltinCommand::CttyHack),
             _ => None,
         }
     }
@@ -1807,11 +1837,7 @@ mod tests {
             Self::root_identity()
         }
 
-        fn authenticate(
-            &self,
-            username: &str,
-            password: &str,
-        ) -> Result<UserIdentity, AuthError> {
+        fn authenticate(&self, username: &str, password: &str) -> Result<UserIdentity, AuthError> {
             if username == "root" && password == "root" {
                 Ok(Self::root_identity())
             } else {
