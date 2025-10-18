@@ -44,7 +44,7 @@ mke2fs -t ext2 -d assets/rootfs -b 1024 -m 0 assets/rootfs.ext2 1024
 
 #### Bare shell 内置命令
 
-重新生成 `rootfs.ext2` 后，`/bin` 目录会生成一组 `#!bare-script` 脚本，它们是对裸机 shell 内置命令的独立封装（每个脚本的第一行必须是 `#!bare-script`，后续行可调用 `builtin <name>` 来触发内置实现）。这让命令逻辑存储在镜像中，未来接入真正的 `exec` 时只需替换对应脚本或程序即可。当前版本的 shell 在内核态解释以下命令：
+重新生成 `rootfs.ext2` 后，`/bin` 目录会包含一组“裸机命令二进制”（Bare Command Module，扩展名可自行决定）。文件格式如下：开头四个字节为魔数 `0x7F 42 43 4D`（即 `\x7fBCM`），随后一个字节版本号（当前为 `1`），一个字节表示命令编号，接着是一个 16 位小端长度字段以及同等长度的 UTF-8 命令名。命令编号与 `userland/src/bare_shell.rs` 中的 `BuiltinCommand` 枚举一一对应。二进制主体仅用于鉴别命令，真正的行为由内核内置实现完成——因此未来接入 `exec` 时，只需用真实可执行文件替换这些二进制封装。当前版本的 shell 在内核态解释以下命令：
 
 | 命令 | 功能 | 备注 |
 |------|------|------|
@@ -59,7 +59,7 @@ mke2fs -t ext2 -d assets/rootfs -b 1024 -m 0 assets/rootfs.ext2 1024
 | `reboot` | 请求重启 | 在 `hardware` 构建目标上调用 ACPI/键盘复位，其他配置打印提示 |
 | `shutdown` | 请求关机 | 同上 |
 
-> 注意：脚本解释器位于 `userland/src/bare_shell.rs`，会读取 `/bin/<command>` 的脚本并解析其中的 `builtin` 调用。彩色输出基于 ANSI 转义序列，如需关闭可执行 `ls --color=never`。
+> 注意：命令解析器位于 `userland/src/bare_shell.rs`，会读取 `/bin/<command>` 的裸机命令二进制并调度到对应内置实现。彩色输出基于 ANSI 转义序列，如需关闭可执行 `ls --color=never`。
 
 ### 构建裸机镜像
 

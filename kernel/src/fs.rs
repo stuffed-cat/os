@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn bin_contains_command_scripts() {
+    fn bin_contains_command_binaries() {
         let bytes = include_bytes!("../../assets/rootfs.ext2");
         let fs = Ext2Fs::parse(bytes).expect("parse ext2");
         let entries = fs.list_dir("/bin").expect("list /bin");
@@ -429,14 +429,16 @@ mod tests {
         ] {
             assert!(
                 names.contains(&command.to_string()),
-                "missing /bin/{command} script"
+                "missing /bin/{command} binary"
             );
             let path = format!("/bin/{command}");
-            let data = fs.read_file(&path).expect("read command script");
+            let data = fs.read_file(&path).expect("read command binary");
+            assert!(data.len() >= 8, "{command} binary must be at least 8 bytes");
             assert!(
-                data.starts_with(b"#!bare-script"),
-                "{command} script must start with #!bare-script"
+                data.starts_with(&[0x7F, b'B', b'C', b'M']),
+                "{command} binary must start with magic header"
             );
+            assert!(data[4] == 1, "{command} binary must use version 1");
         }
     }
 }

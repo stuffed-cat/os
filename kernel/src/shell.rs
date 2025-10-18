@@ -4,6 +4,8 @@ use alloc::collections::VecDeque;
 use log::info;
 use spin::Mutex;
 
+#[cfg(feature = "hardware")]
+use crate::arch::x86_64::framebuffer;
 use crate::arch::x86_64::serial;
 use crate::core::{KernelContext, Subsystem, SubsystemId};
 use crate::error::SubsystemError;
@@ -63,6 +65,8 @@ impl ShellIo for SerialShellIo {
 
     fn write_str(&mut self, s: &str) {
         serial::write_str(s);
+        #[cfg(feature = "hardware")]
+        framebuffer::write_str(s);
     }
 }
 
