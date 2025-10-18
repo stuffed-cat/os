@@ -15,6 +15,8 @@ static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
 struct Selectors {
     code_selector: SegmentSelector,
     data_selector: SegmentSelector,
+    user_code_selector: SegmentSelector,
+    user_data_selector: SegmentSelector,
     tss_selector: SegmentSelector,
 }
 
@@ -33,12 +35,16 @@ pub fn init() {
         let mut gdt = GlobalDescriptorTable::new();
         let code_selector = gdt.append(Descriptor::kernel_code_segment());
         let data_selector = gdt.append(Descriptor::kernel_data_segment());
+        let user_code_selector = gdt.append(Descriptor::user_code_segment());
+        let user_data_selector = gdt.append(Descriptor::user_data_segment());
         let tss_selector = gdt.append(Descriptor::tss_segment(TSS.wait()));
         (
             gdt,
             Selectors {
                 code_selector,
                 data_selector,
+                user_code_selector,
+                user_data_selector,
                 tss_selector,
             },
         )
@@ -58,4 +64,18 @@ pub fn init() {
 /// Provides access to the TSS IST index for other modules.
 pub fn double_fault_ist_index() -> u16 {
     DOUBLE_FAULT_IST_INDEX as u16
+}
+
+fn selectors() -> &'static Selectors {
+    &GDT.wait().1
+}
+
+/// Returns the segment selector for user-mode code.
+pub fn user_code_selector() -> SegmentSelector {
+    selectors().user_code_selector
+}
+
+/// Returns the segment selector for user-mode data segments.
+pub fn user_data_selector() -> SegmentSelector {
+    selectors().user_data_selector
 }

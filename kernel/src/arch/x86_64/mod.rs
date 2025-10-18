@@ -1,6 +1,7 @@
 //! x86-64 specific hardware abstractions and initialization.
 
 mod boot;
+pub mod context;
 pub mod gdt;
 #[cfg(feature = "hardware")]
 pub mod idt;

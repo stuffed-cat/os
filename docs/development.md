@@ -61,6 +61,10 @@ mke2fs -t ext4 -O ^has_journal,^metadata_csum,^64bit,^flex_bg -d assets/rootfs -
 
 > 注意：命令解析器位于 `userland/src/bare_shell.rs`，会读取 `/bin/<command>` 的裸机命令二进制并调度到对应内置实现。彩色输出基于 ANSI 转义序列，如需关闭可执行 `ls --color=never`。
 
+#### 用户态 syscall 原型命令
+
+`userland` crate 现额外提供 `ls`、`cat` 两个 `std` 环境下的 CLI，它们使用 `SyscallRequest` 编码器序列化 POSIX 调用（`open`/`read` 等），方便在 Step 5 中替换 shell 内置逻辑。执行 `cargo build -p userland --release --bin ls --bin cat` 后，`xtask rootfs` 会把生成的 ELF 拷贝到 `assets/rootfs/bin/*.exec`，供后续在真正的 `exec` 流程中加载。
+
 ### 构建裸机镜像
 
 使用工作区内置的 `xtask` 可生成 BIOS 镜像（调用 vendored `bootloader`）。由于 bootloader 依赖 nightly toolchain，需要先安装 nightly（`rustup toolchain install nightly`）。生成镜像时请显式启用 `bootimage` 特性：

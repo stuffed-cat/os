@@ -2,6 +2,7 @@ use ::core::sync::atomic::{AtomicBool, Ordering};
 use alloc::sync::Arc;
 
 use super::*;
+use crate::process::{Pid, Process};
 
 struct DummySubsystem {
     id: SubsystemId,
@@ -52,4 +53,12 @@ fn kernel_initializes_and_runs_subsystems() {
 
     kernel.run().expect("run succeeds");
     assert!(tick_called.load(Ordering::SeqCst));
+}
+
+#[test]
+fn process_allocates_monotonic_thread_ids() {
+    let process = Process::new(Pid::new(1));
+    let first = process.allocate_tid();
+    let second = process.allocate_tid();
+    assert!(second.as_u64() > first.as_u64());
 }

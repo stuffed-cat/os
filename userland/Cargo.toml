@@ -26,3 +26,13 @@ required-features = ["std"]
 name = "bash"
 path = "src/bin/bash.rs"
 required-features = ["std"]
+
+[[bin]]
+name = "ls"
+path = "src/bin/ls.rs"
+required-features = ["std"]
+
+[[bin]]
+name = "cat"
+path = "src/bin/cat.rs"
+required-features = ["std"]

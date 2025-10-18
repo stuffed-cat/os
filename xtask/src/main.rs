@@ -206,6 +206,60 @@ fn generate_command_binaries(workspace_root: &Path) -> Result<()> {
             .with_context(|| format!("failed to write BCM stub for {}", path.display()))?;
     }
 
+    copy_userland_execs(workspace_root, &bin_dir)?;
+
+    Ok(())
+}
+
+fn copy_userland_execs(workspace_root: &Path, bin_dir: &Path) -> Result<()> {
+    let status = ProcessCommand::new("cargo")
+        .current_dir(workspace_root)
+        .args([
+            "build",
+            "--release",
+            "-p",
+            "userland",
+            "--bin",
+            "ls",
+            "--bin",
+            "cat",
+        ])
+        .status()
+        .context("failed to build userland command binaries")?;
+    if !status.success() {
+        bail!("userland command build failed with status {status}");
+    }
+
+    let metadata = MetadataCommand::new()
+        .current_dir(workspace_root)
+        .exec()
+        .context("failed to load cargo metadata for userland binaries")?;
+    let target_dir = PathBuf::from(metadata.target_directory);
+    let profile_dir = target_dir.join("release");
+
+    let commands = ["ls", "cat"];
+    for cmd in commands {
+        let artifact = if cfg!(target_os = "windows") {
+            profile_dir.join(format!("{cmd}.exe"))
+        } else {
+            profile_dir.join(cmd)
+        };
+        if !artifact.exists() {
+            bail!(
+                "expected compiled binary {} was not produced",
+                artifact.display()
+            );
+        }
+        let destination = bin_dir.join(format!("{cmd}.exec"));
+        fs::copy(&artifact, &destination).with_context(|| {
+            format!(
+                "failed to copy {} to {}",
+                artifact.display(),
+                destination.display()
+            )
+        })?;
+    }
+
     Ok(())
 }
 

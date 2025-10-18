@@ -3,7 +3,7 @@ use kernel::{
     ipc::{IpcRouter, Message},
     posix::{Errno, PosixLayer},
     process::{Pid, ProcessTable, Tid},
-    scheduler::{RunQueueEntry, Scheduler, SchedulingClass},
+    scheduler::{RunQueueEntry, Scheduler},
     syscall::{SyscallDispatcher, SyscallId},
     user::TrapFrame,
 };
@@ -25,14 +25,8 @@ fn ipc_message_roundtrip() {
 #[test]
 fn scheduler_round_robin_ordering() {
     let scheduler = Scheduler::new();
-    scheduler.enqueue(RunQueueEntry {
-        tid: Tid::new(1),
-        class: SchedulingClass::User,
-    });
-    scheduler.enqueue(RunQueueEntry {
-        tid: Tid::new(2),
-        class: SchedulingClass::Kernel,
-    });
+    scheduler.enqueue(RunQueueEntry::user(Pid::new(1), Tid::new(1)));
+    scheduler.enqueue(RunQueueEntry::kernel(Pid::new(1), Tid::new(2)));
 
     let first = scheduler.pick_next().expect("first task available");
     assert_eq!(first.tid.as_u64(), 1);

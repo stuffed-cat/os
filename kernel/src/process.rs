@@ -16,7 +16,7 @@ use crate::{
     error::SubsystemError,
     fs::{self, Credentials, FsError},
     memory::{Capability, MemoryManager, PageTableHandle},
-    scheduler::ThreadState,
+    scheduler::{ThreadState, ThreadStatus},
     user::{AddressSpace, StackConfig, UserContext},
 };
 use log::trace;
@@ -75,6 +75,7 @@ pub struct Process {
     uid: AtomicU32,
     gid: AtomicU32,
     groups: RwLock<Vec<u32>>,
+    next_tid: AtomicU64,
 }
 
 impl Process {
@@ -101,6 +102,7 @@ impl Process {
             uid: AtomicU32::new(0),
             gid: AtomicU32::new(0),
             groups: RwLock::new(vec![0]),
+            next_tid: AtomicU64::new(1),
         });
 
         process.set_fd(0, String::from("tty:stdin"));
@@ -129,6 +131,10 @@ impl Process {
     pub fn mark_terminated(&self, status: i32) {
         self.exit_status.store(status, Ordering::SeqCst);
         self.terminated.store(true, Ordering::SeqCst);
+        let mut threads = self.threads.write();
+        for state in threads.values_mut() {
+            state.set_status(ThreadStatus::Dead);
+        }
     }
 
     /// Returns whether the process has terminated.
@@ -144,6 +150,18 @@ impl Process {
     /// Adds a thread to the process.
     pub fn add_thread(&self, tid: Tid, state: ThreadState) {
         self.threads.write().insert(tid, state);
+    }
+
+    /// Allocates a fresh thread identifier.
+    pub fn allocate_tid(&self) -> Tid {
+        let id = self.next_tid.fetch_add(1, Ordering::SeqCst);
+        Tid::new(id)
+    }
+
+    /// Resets thread bookkeeping, removing existing entries and rewinding TID allocation.
+    fn reset_threads(&self) {
+        self.next_tid.store(1, Ordering::SeqCst);
+        self.threads.write().clear();
     }
 
     /// Assigns the parent PID for this process.
@@ -176,8 +194,16 @@ impl Process {
 
         *self.program.write() = Some(program);
         *self.executable.write() = Some(image);
-        *self.address_space.write() = Some(address_space);
-        *self.user_context.write() = Some(context);
+        *self.address_space.write() = Some(address_space.clone());
+        *self.user_context.write() = Some(context.clone());
+
+        // Refresh thread table with an initial user thread representing the exec'd image.
+        self.reset_threads();
+        if let Some(root) = self.page_table_root() {
+            let tid = self.allocate_tid();
+            let thread_state = ThreadState::new_user(context, root);
+            self.add_thread(tid, thread_state);
+        }
         Ok(())
     }
 
@@ -392,6 +418,10 @@ impl Process {
         *target.address_space.write() = self.address_space.read().clone();
         target.page_table.write().take();
         *target.user_context.write() = self.user_context.read().clone();
+        target
+            .next_tid
+            .store(self.next_tid.load(Ordering::SeqCst), Ordering::SeqCst);
+        *target.threads.write() = self.threads.read().clone();
         *target.fds.write() = self.fds.read().clone();
         *target.fd_offsets.write() = self.fd_offsets.read().clone();
         target
