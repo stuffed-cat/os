@@ -56,7 +56,7 @@ const HELP_ENTRIES: &[(&str, &str)] = &[
     ),
     (
         "cp",
-        "Copy a file (overlay-backed; shell wiring WIP)",
+        "Copy a file",
     ),
     (
         "mv",
@@ -452,6 +452,158 @@ where
         self.print("\r\n");
     }
 
+    fn command_cp(&mut self, args: &[&str]) {
+        if args.is_empty() {
+            self.println("cp: missing file operand");
+            return;
+        }
+        if args.len() == 1 {
+            self.print("cp: missing destination file operand after '");
+            self.print(args[0]);
+            self.println("'");
+            return;
+        }
+        if args.len() > 2 {
+            self.println("cp: multiple sources are not supported in the bare shell yet");
+            return;
+        }
+
+        let src_arg = args[0];
+        let dest_arg = args[1];
+        let src_path = self.make_absolute_path(Some(src_arg));
+        let mut dest_path = self.make_absolute_path(Some(dest_arg));
+
+        let data = match self.fs.read_file(&src_path) {
+            Ok(bytes) => bytes,
+            Err(FsError::Unavailable) => {
+                self.println("cp: filesystem unavailable");
+                return;
+            }
+            Err(FsError::NotFound) => {
+                self.print("cp: no such file: ");
+                self.println(src_arg);
+                return;
+            }
+            Err(FsError::NotFile) | Err(FsError::NotDirectory) => {
+                self.print("cp: not a regular file: ");
+                self.println(src_arg);
+                return;
+            }
+            Err(FsError::PermissionDenied) => {
+                self.println("cp: permission denied");
+                return;
+            }
+            Err(FsError::Corrupt) => {
+                self.println("cp: filesystem corrupt");
+                return;
+            }
+            Err(_) => {
+                self.println("cp: filesystem error");
+                return;
+            }
+        };
+
+        let dest_is_directory = match self.fs.list_dir(&dest_path) {
+            Ok(_) => Some(true),
+            Err(FsError::NotFound) | Err(FsError::NotDirectory) | Err(FsError::NotFile) => {
+                Some(false)
+            }
+            Err(FsError::Unavailable) => {
+                self.println("cp: filesystem unavailable");
+                None
+            }
+            Err(FsError::PermissionDenied) => {
+                self.println("cp: permission denied");
+                None
+            }
+            Err(FsError::Corrupt) => {
+                self.println("cp: filesystem corrupt");
+                None
+            }
+            Err(_) => {
+                self.println("cp: filesystem error");
+                None
+            }
+        };
+
+        let Some(dest_is_directory) = dest_is_directory else {
+            return;
+        };
+
+        if dest_is_directory {
+            let Some(name) = src_path.rsplit('/').find(|component| !component.is_empty()) else {
+                self.println("cp: invalid source path");
+                return;
+            };
+            let combined = if dest_path == "/" {
+                format!("/{name}")
+            } else {
+                format!("{dest_path}/{name}")
+            };
+            dest_path = self.normalize_path(&combined);
+        }
+
+        if src_path == dest_path {
+            self.println("cp: source and destination are the same file");
+            return;
+        }
+
+        match self.fs.create_file(&dest_path, 0o644) {
+            Ok(()) | Err(FsError::AlreadyExists) => {}
+            Err(FsError::Unavailable) => {
+                self.println("cp: filesystem unavailable");
+                return;
+            }
+            Err(FsError::NotFound) => {
+                self.print("cp: destination directory not found: ");
+                self.println(&dest_path);
+                return;
+            }
+            Err(FsError::NotDirectory) => {
+                self.print("cp: destination parent is not a directory: ");
+                self.println(&dest_path);
+                return;
+            }
+            Err(FsError::NotFile) => {
+                self.print("cp: destination is not a regular file: ");
+                self.println(&dest_path);
+                return;
+            }
+            Err(FsError::PermissionDenied) => {
+                self.println("cp: permission denied");
+                return;
+            }
+            Err(FsError::Corrupt) => {
+                self.println("cp: filesystem corrupt");
+                return;
+            }
+        }
+
+        match self.fs.write_file(&dest_path, 0, &data, true) {
+            Ok(written) => {
+                if written != data.len() {
+                    self.println("cp: incomplete write");
+                }
+            }
+            Err(FsError::Unavailable) => self.println("cp: filesystem unavailable"),
+            Err(FsError::NotFound) => {
+                self.print("cp: destination not found: ");
+                self.println(&dest_path);
+            }
+            Err(FsError::NotDirectory) => {
+                self.print("cp: destination parent is not a directory: ");
+                self.println(&dest_path);
+            }
+            Err(FsError::NotFile) => {
+                self.print("cp: destination is not a regular file: ");
+                self.println(&dest_path);
+            }
+            Err(FsError::PermissionDenied) => self.println("cp: permission denied"),
+            Err(FsError::Corrupt) => self.println("cp: filesystem corrupt"),
+            Err(FsError::AlreadyExists) => self.println("cp: filesystem error"),
+        }
+    }
+
     fn command_read_only(&mut self, cmd: &str) {
         self.print(cmd);
         self.println(": write support not wired into the bare shell yet");
@@ -740,7 +892,7 @@ where
             BuiltinCommand::Mkdir => self.command_read_only("mkdir"),
             BuiltinCommand::Rmdir => self.command_read_only("rmdir"),
             BuiltinCommand::Rm => self.command_read_only("rm"),
-            BuiltinCommand::Cp => self.command_read_only("cp"),
+            BuiltinCommand::Cp => self.command_cp(args),
             BuiltinCommand::Mv => self.command_read_only("mv"),
             BuiltinCommand::Reboot => self.command_reboot(),
             BuiltinCommand::Shutdown => self.command_shutdown(),
@@ -1038,4 +1190,294 @@ where
 pub enum EntryKind {
     Directory,
     File,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::collections::{BTreeMap, BTreeSet};
+    use alloc::rc::Rc;
+    use core::cell::RefCell;
+
+    #[derive(Default)]
+    struct TestIo {
+        output: String,
+    }
+
+    impl ShellIo for TestIo {
+        fn next_scancode(&mut self) -> Option<u8> {
+            None
+        }
+
+        fn write_str(&mut self, s: &str) {
+            self.output.push_str(s);
+        }
+    }
+
+    struct TestSystem;
+
+    impl ShellSystem for TestSystem {
+        fn reboot(&self) -> Result<(), SystemError> {
+            Err(SystemError::Unsupported)
+        }
+
+        fn shutdown(&self) -> Result<(), SystemError> {
+            Err(SystemError::Unsupported)
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestFs {
+        state: Rc<RefCell<TestFsState>>,
+    }
+
+    #[derive(Default)]
+    struct TestFsState {
+        dirs: BTreeSet<String>,
+        files: BTreeMap<String, Vec<u8>>,
+    }
+
+    impl TestFs {
+        fn new() -> Self {
+            let mut dirs = BTreeSet::new();
+            dirs.insert("/".to_string());
+            Self {
+                state: Rc::new(RefCell::new(TestFsState { dirs, files: BTreeMap::new() })),
+            }
+        }
+
+        fn add_dir(&self, path: &str) {
+            self.state
+                .borrow_mut()
+                .dirs
+                .insert(normalize_test_path(path));
+        }
+
+        fn add_file(&self, path: &str, data: Vec<u8>) {
+            self.state
+                .borrow_mut()
+                .files
+                .insert(normalize_test_path(path), data);
+        }
+
+        fn file_contents(&self, path: &str) -> Option<Vec<u8>> {
+            self.state
+                .borrow()
+                .files
+                .get(&normalize_test_path(path))
+                .cloned()
+        }
+    }
+
+    impl ShellFs for TestFs {
+        fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
+            let path = normalize_test_path(path);
+            let state = self.state.borrow();
+            if state.dirs.contains(&path) {
+                let mut entries = Vec::new();
+                for file_path in state.files.keys() {
+                    if test_parent_of(file_path.as_str()) == Some(path.clone()) {
+                        if let Some(name) = test_file_name(file_path) {
+                            entries.push(DirEntry {
+                                name,
+                                kind: EntryKind::File,
+                                size: state
+                                    .files
+                                    .get(file_path)
+                                    .map(|data| data.len() as u64)
+                                    .unwrap_or(0),
+                                mode: 0o100644,
+                                uid: 0,
+                                gid: 0,
+                                inode: 0,
+                            });
+                        }
+                    }
+                }
+                for dir_path in state.dirs.iter() {
+                    if dir_path == &path {
+                        continue;
+                    }
+                    if test_parent_of(dir_path.as_str()) == Some(path.clone()) {
+                        if let Some(name) = test_file_name(dir_path) {
+                            entries.push(DirEntry {
+                                name,
+                                kind: EntryKind::Directory,
+                                size: 0,
+                                mode: 0o040755,
+                                uid: 0,
+                                gid: 0,
+                                inode: 0,
+                            });
+                        }
+                    }
+                }
+                Ok(entries)
+            } else if state.files.contains_key(&path) {
+                Err(FsError::NotDirectory)
+            } else {
+                Err(FsError::NotFound)
+            }
+        }
+
+        fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError> {
+            let path = normalize_test_path(path);
+            let state = self.state.borrow();
+            if let Some(data) = state.files.get(&path) {
+                Ok(data.clone())
+            } else if state.dirs.contains(&path) {
+                Err(FsError::NotFile)
+            } else {
+                Err(FsError::NotFound)
+            }
+        }
+
+        fn create_file(&self, path: &str, _mode: u16) -> Result<(), FsError> {
+            let path = normalize_test_path(path);
+            let mut state = self.state.borrow_mut();
+            if state.dirs.contains(&path) {
+                return Err(FsError::NotFile);
+            }
+            if state.files.contains_key(&path) {
+                return Err(FsError::AlreadyExists);
+            }
+            let Some(parent) = test_parent_of(&path) else {
+                return Err(FsError::NotDirectory);
+            };
+            if !state.dirs.contains(&parent) {
+                return Err(FsError::NotFound);
+            }
+            state.files.insert(path, Vec::new());
+            Ok(())
+        }
+
+        fn remove_file(&self, path: &str) -> Result<(), FsError> {
+            let path = normalize_test_path(path);
+            let mut state = self.state.borrow_mut();
+            if state.files.remove(&path).is_some() {
+                Ok(())
+            } else if state.dirs.contains(&path) {
+                Err(FsError::NotFile)
+            } else {
+                Err(FsError::NotFound)
+            }
+        }
+
+        fn write_file(
+            &self,
+            path: &str,
+            offset: usize,
+            data: &[u8],
+            truncate: bool,
+        ) -> Result<usize, FsError> {
+            let path = normalize_test_path(path);
+            let mut state = self.state.borrow_mut();
+            if let Some(buffer) = state.files.get_mut(&path) {
+                if truncate {
+                    buffer.clear();
+                }
+                if offset > buffer.len() {
+                    buffer.resize(offset, 0);
+                }
+                if offset + data.len() > buffer.len() {
+                    buffer.resize(offset + data.len(), 0);
+                }
+                buffer[offset..offset + data.len()].copy_from_slice(data);
+                Ok(data.len())
+            } else if state.dirs.contains(&path) {
+                Err(FsError::NotFile)
+            } else {
+                Err(FsError::NotFound)
+            }
+        }
+
+        fn chmod(&self, _path: &str, _mode: u16) -> Result<(), FsError> {
+            Ok(())
+        }
+
+        fn chown(&self, _path: &str, _uid: u32, _gid: u32) -> Result<(), FsError> {
+            Ok(())
+        }
+    }
+
+    fn normalize_test_path(path: &str) -> String {
+        if path.is_empty() {
+            return "/".to_string();
+        }
+        if !path.starts_with('/') {
+            panic!("test paths must be absolute: {}", path);
+        }
+        let mut parts = Vec::new();
+        for component in path.split('/') {
+            if component.is_empty() || component == "." {
+                continue;
+            }
+            if component == ".." {
+                parts.pop();
+            } else {
+                parts.push(component);
+            }
+        }
+        if parts.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", parts.join("/"))
+        }
+    }
+
+    fn test_parent_of(path: &str) -> Option<String> {
+        if path == "/" {
+            return None;
+        }
+        let normalized = normalize_test_path(path);
+        if normalized == "/" {
+            return None;
+        }
+        if let Some(pos) = normalized.rfind('/') {
+            if pos == 0 {
+                Some("/".to_string())
+            } else {
+                Some(normalized[..pos].to_string())
+            }
+        } else {
+            Some("/".to_string())
+        }
+    }
+
+    fn test_file_name(path: &str) -> Option<String> {
+        let normalized = normalize_test_path(path);
+        normalized
+            .rsplit('/')
+            .find(|component| !component.is_empty())
+            .map(|component| component.to_string())
+    }
+
+    #[test]
+    fn cp_copies_into_new_path() {
+        let fs = TestFs::new();
+        fs.add_file("/src.txt", b"hello".to_vec());
+
+        let mut shell = BareShell::new(TestIo::default(), fs, TestSystem);
+        shell.command_cp(&["/src.txt", "/copy.txt"]);
+
+        assert_eq!(
+            shell.fs.file_contents("/copy.txt"),
+            Some(b"hello".to_vec())
+        );
+    }
+
+    #[test]
+    fn cp_copies_into_directory_destination() {
+        let fs = TestFs::new();
+        fs.add_dir("/dest");
+        fs.add_file("/src.bin", b"payload".to_vec());
+
+        let mut shell = BareShell::new(TestIo::default(), fs, TestSystem);
+        shell.command_cp(&["/src.bin", "/dest"]);
+
+        assert_eq!(
+            shell.fs.file_contents("/dest/src.bin"),
+            Some(b"payload".to_vec())
+        );
+    }
 }
