@@ -15,9 +15,7 @@ use crate::users;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::string::String;
-use log::{info, trace};
-#[cfg(not(feature = "std"))]
-use log::warn;
+use log::{info, trace, error, warn};
 use pc_keyboard::layouts::Us104Key;
 use pc_keyboard::{DecodedKey, HandleControl, Keyboard, ScancodeSet1};
 use spin::{Lazy, Mutex};
@@ -122,10 +120,19 @@ impl ConsoleState {
 
 static CONSOLE: Lazy<Mutex<ConsoleState>> = Lazy::new(|| Mutex::new(ConsoleState::new()));
 
+/// Global state to track if current process should be skipped due to exception
+static SKIP_CURRENT_PROCESS: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
+
 /// Enqueues a raw keyboard scancode produced by the hardware interrupt handler.
 pub fn enqueue_scancode(scancode: u8) {
     let mut console = CONSOLE.lock();
     console.push_scancode(scancode);
+}
+
+/// Called by exception handlers to signal that the current process should be skipped
+pub fn mark_current_process_failed() {
+    let mut skip = SKIP_CURRENT_PROCESS.lock();
+    *skip = true;
 }
 
 /// Reads buffered console input into the provided slice, returning the number of bytes copied.
@@ -214,32 +221,50 @@ impl ShellSubsystem {
     fn run_ready_threads(&mut self) {
         use core::task::Poll;
 
-        while let Poll::Ready(entry) = self.scheduler.tick() {
-            match entry.class {
-                SchedulingClass::User => {
-                    if let Some(process) = self.process_table.lookup(entry.pid) {
-                        if let Some((context, root)) = process.take_thread_runtime(entry.tid) {
-                            process.set_thread_status(entry.tid, ThreadStatus::Running);
-                            unsafe {
-                                crate::arch::x86_64::context::enter_user_mode(&context, root);
+        loop {
+            match self.scheduler.tick() {
+                Poll::Ready(entry) => {
+                    // Check if this process should be skipped due to an exception
+                    {
+                        let should_skip = *SKIP_CURRENT_PROCESS.lock();
+                        if should_skip {
+                            *SKIP_CURRENT_PROCESS.lock() = false;
+                            error!("Skipping user process due to exception");
+                            continue;
+                        }
+                    }
+
+                    match entry.class {
+                        SchedulingClass::User => {
+                            if let Some(process) = self.process_table.lookup(entry.pid) {
+                                if let Some((context, root)) = process.take_thread_runtime(entry.tid) {
+                                    process.set_thread_status(entry.tid, ThreadStatus::Running);
+                                    unsafe {
+                                        crate::arch::x86_64::context::enter_user_mode(&context, root);
+                                    }
+                                } else {
+                                    warn!(
+                                        "scheduler: missing user context for pid={} tid={}",
+                                        entry.pid.as_u64(),
+                                        entry.tid.as_u64()
+                                    );
+                                }
+                            } else {
+                                warn!("scheduler: missing process for pid={}", entry.pid.as_u64());
                             }
-                        } else {
+                        }
+                        SchedulingClass::Kernel => {
                             warn!(
-                                "scheduler: missing user context for pid={} tid={}",
+                                "scheduler: kernel thread scheduling not implemented (pid={} tid={})",
                                 entry.pid.as_u64(),
                                 entry.tid.as_u64()
                             );
                         }
-                    } else {
-                        warn!("scheduler: missing process for pid={}", entry.pid.as_u64());
                     }
                 }
-                SchedulingClass::Kernel => {
-                    warn!(
-                        "scheduler: kernel thread scheduling not implemented (pid={} tid={})",
-                        entry.pid.as_u64(),
-                        entry.tid.as_u64()
-                    );
+                Poll::Pending => {
+                    // No ready processes
+                    break;
                 }
             }
         }
@@ -259,11 +284,15 @@ impl Subsystem for ShellSubsystem {
         }
 
         // NOW enable timer after all initialization is done
-        crate::arch::x86_64::serial::write_str("shell: about to enable timer\r\n");
         Scheduler::enable_timer_global();
 
         if !self.init_spawned {
-            match self.launch_initial_user() {
+            // Disable interrupts during initial user launch to avoid deadlock with scheduler lock
+            x86_64::instructions::interrupts::disable();
+            let result = self.launch_initial_user();
+            x86_64::instructions::interrupts::enable();
+            
+            match result {
                 Ok(()) => {
                     self.init_spawned = true;
                     info!("initial user shell spawned");

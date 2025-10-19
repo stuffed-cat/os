@@ -560,10 +560,12 @@ impl Scheduler {
     /// Simulates a scheduling tick returning readiness state.
     pub fn tick(&self) -> Poll<RunQueueEntry> {
         let mut inner = self.inner.lock();
+        // If there's a current thread running and no reschedule needed, keep it running
         if inner.current.is_some() && !inner.need_resched {
             return Poll::Pending;
         }
 
+        // If no thread is currently running, or reschedule is needed, get the next one
         if let Some((key, entry, priority)) = inner.pop_next_ready() {
             if let Some(info) = inner.threads.get_mut(&key) {
                 info.status = ThreadStatus::Running;
@@ -600,7 +602,8 @@ impl Scheduler {
     pub fn evaluate_timer_tick(&self) -> TimerTickOutcome {
         let mut inner = self.inner.lock();
         inner.tick = inner.tick.saturating_add(1);
-        trace!("scheduler: evaluate_timer_tick #{}", inner.tick);
+        // Disable verbose tick logging for cleaner output
+        // trace!("scheduler: evaluate_timer_tick #{}", inner.tick);
         Self::wake_sleepers(&mut inner);
         let preempted = Self::advance_current(&mut inner);
         let next = if inner.need_resched {

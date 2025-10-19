@@ -75,7 +75,8 @@ pub fn start(boot_info: &'static mut BootInfo, allocator: &'static LockedHeap) -
     serial::write_str("kernel: builder constructed\r\n");
     kernel.init().expect("kernel init");
     serial::write_str("kernel: init complete\r\n");
-    kernel.run().expect("kernel run");
+    let _ = kernel.run();
+    serial::write_str("kernel: run returned\r\n");
 
     halt_loop();
 }

@@ -44,6 +44,13 @@ static IDT: Once<InterruptDescriptorTable> = Once::new();
 
 const SYSCALL_VECTOR: u8 = 0x80;
 
+/// Check if the exception occurred in user mode
+fn is_user_mode_exception(stack_frame: &InterruptStackFrame) -> bool {
+    // Check the code segment privilege level (bits 0-1)
+    // 3 = user mode (ring 3), 0 = kernel mode (ring 0)
+    (stack_frame.code_segment.0 & 3) == 3
+}
+
 #[cfg(feature = "hardware")]
 #[repr(C)]
 struct SavedRegisters {
@@ -232,19 +239,66 @@ pub fn load() {
 }
 
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
-    trace!("BREAKPOINT: {:?}", stack_frame);
+    if is_user_mode_exception(&stack_frame) {
+        trace!("User mode BREAKPOINT at {:#x}", stack_frame.instruction_pointer.as_u64());
+    } else {
+        trace!("Kernel mode BREAKPOINT: {:?}", stack_frame);
+    }
 }
 
 extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame, _code: u64) -> ! {
-    panic!("DOUBLE FAULT: {:?}", stack_frame);
+    if is_user_mode_exception(&stack_frame) {
+        error!(
+            "User mode DOUBLE FAULT\nRIP: {:#x}",
+            stack_frame.instruction_pointer.as_u64()
+        );
+        
+        // Try to terminate the user process
+        if let Some(table) = ProcessTable::global() {
+            if let Some(current) = table.current_process() {
+                let pid = current.pid();
+                error!("Terminating process {} due to double fault", pid.as_u64());
+                current.mark_terminated(-1);
+            }
+        }
+        
+        // This is still fatal, but at least we tried to log it
+        panic!("DOUBLE FAULT (USER): {:?}", stack_frame);
+    }
+    
+    panic!("DOUBLE FAULT (KERNEL): {:?}", stack_frame);
 }
 
 extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
+    if is_user_mode_exception(&stack_frame) {
+        // User mode page fault - handle gracefully
+        error!(
+            "User mode PAGE FAULT\nRIP: {:#x}\nFaulted Address: {:#x}\nError Code: {:?}",
+            stack_frame.instruction_pointer.as_u64(),
+            Cr2::read().as_u64(),
+            error_code
+        );
+        
+        // Try to terminate the user process
+        if let Some(table) = ProcessTable::global() {
+            if let Some(current) = table.current_process() {
+                let pid = current.pid();
+                error!("Terminating process {} due to page fault", pid.as_u64());
+                current.mark_terminated(-1);
+            }
+        }
+        
+        crate::shell::mark_current_process_failed();
+        unsafe { x86_64::instructions::interrupts::enable() };
+        return;
+    }
+    
+    // Kernel mode page fault - this is fatal
     panic!(
-        "PAGE FAULT: {:?}\nAccessed Address: {:?}\nError Code: {:?}",
+        "PAGE FAULT (KERNEL): {:?}\nAccessed Address: {:?}\nError Code: {:?}",
         stack_frame,
         Cr2::read(),
         error_code
@@ -255,15 +309,62 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: u64,
 ) {
+    if is_user_mode_exception(&stack_frame) {
+        // User mode exception - handle gracefully
+        error!(
+            "User mode GENERAL PROTECTION FAULT\nRIP: {:#x}\nError Code: {:#x}",
+            stack_frame.instruction_pointer.as_u64(),
+            error_code
+        );
+        
+        // Try to terminate the user process gracefully
+        if let Some(table) = ProcessTable::global() {
+            if let Some(current) = table.current_process() {
+                let pid = current.pid();
+                error!("Terminating process {} due to GPF", pid.as_u64());
+                current.mark_terminated(-1); // Signal terminated
+            }
+        }
+        
+        // Signal to shell to skip this process
+        crate::shell::mark_current_process_failed();
+        
+        // Re-enable interrupts and return to kernel
+        unsafe { x86_64::instructions::interrupts::enable() };
+        return;
+    }
+    
+    // Kernel mode exception - this is fatal
     panic!(
-        "GENERAL PROTECTION FAULT: {:?}\nError Code: {:#x}",
+        "GENERAL PROTECTION FAULT (KERNEL): {:?}\nError Code: {:#x}",
         stack_frame, error_code
     );
 }
 
 #[cfg(not(feature = "hardware"))]
 extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
-    panic!("INVALID OPCODE: {:?}", stack_frame);
+    if is_user_mode_exception(&stack_frame) {
+        // User mode exception
+        error!(
+            "User mode INVALID OPCODE\nRIP: {:#x}",
+            stack_frame.instruction_pointer.as_u64()
+        );
+        
+        // Try to terminate the user process
+        if let Some(table) = ProcessTable::global() {
+            if let Some(current) = table.current_process() {
+                let pid = current.pid();
+                error!("Terminating process {} due to invalid opcode", pid.as_u64());
+                current.mark_terminated(-1);
+            }
+        }
+        
+        crate::shell::mark_current_process_failed();
+        unsafe { x86_64::instructions::interrupts::enable() };
+        return;
+    }
+    
+    panic!("INVALID OPCODE (KERNEL): {:?}", stack_frame);
 }
 
 #[cfg(feature = "hardware")]
@@ -274,8 +375,8 @@ unsafe extern "C" fn timer_interrupt_handler(
     let regs = &mut *regs;
     let frame = &mut *frame;
 
-    crate::arch::x86_64::serial::write_str(">> TIMER INTERRUPT HANDLER ENTERED\r\n");
-    trace!("timer interrupt");
+    // Timer interrupt - schedule next runnable thread
+    // trace!("timer interrupt");
 
     if let Some(table) = ProcessTable::global() {
         if let Some(root) = table.kernel_root_frame() {
