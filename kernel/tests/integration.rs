@@ -2,11 +2,12 @@ use kernel::{
     elf::{ExecutableImage, ExecutableSegment, SegmentFlags},
     ipc::{IpcRouter, Message},
     posix::{Errno, PosixLayer},
-    process::{Pid, ProcessTable, Tid},
-    scheduler::{RunQueueEntry, Scheduler},
+    process::{KernelContext, Pid, ProcessTable, Tid},
+    scheduler::{RunQueueEntry, Scheduler, ThreadPriority, ThreadState},
     syscall::{SyscallDispatcher, SyscallId},
-    user::TrapFrame,
+    user::{TrapFrame, UserContext},
 };
+use x86_64::{structures::paging::PhysFrame, PhysAddr};
 
 #[test]
 fn ipc_message_roundtrip() {
@@ -25,14 +26,21 @@ fn ipc_message_roundtrip() {
 #[test]
 fn scheduler_round_robin_ordering() {
     let scheduler = Scheduler::new();
-    scheduler.enqueue(RunQueueEntry::user(Pid::new(1), Tid::new(1)));
+    scheduler.enqueue(RunQueueEntry::user(
+        Pid::new(1),
+        Tid::new(1),
+        ThreadPriority::Normal,
+    ));
     scheduler.enqueue(RunQueueEntry::kernel(Pid::new(1), Tid::new(2)));
 
     let first = scheduler.pick_next().expect("first task available");
-    assert_eq!(first.tid.as_u64(), 1);
+    assert_eq!(first.tid.as_u64(), 2);
+
+    scheduler.handle_timer_tick();
+    scheduler.handle_timer_tick();
 
     let second = scheduler.pick_next().expect("second task available");
-    assert_eq!(second.tid.as_u64(), 2);
+    assert_eq!(second.tid.as_u64(), 1);
 
     assert!(scheduler.pick_next().is_none());
 }
@@ -152,4 +160,66 @@ fn syscall_dispatcher_handles_trap_frame() {
         .handle_trap(process.pid(), &mut frame)
         .expect("syscall trap handled");
     assert_eq!(frame.rax, process.pid().as_u64());
+}
+
+#[test]
+fn user_preemption_preserves_user_context() {
+    let scheduler = Scheduler::new();
+    let table = ProcessTable::new();
+    let process = table.spawn();
+
+    let root1 = PhysFrame::from_start_address(PhysAddr::new(0x1000)).unwrap();
+    let root2 = PhysFrame::from_start_address(PhysAddr::new(0x2000)).unwrap();
+
+    let tid1 = process.allocate_tid();
+    let tid2 = process.allocate_tid();
+
+    let mut ctx1 = UserContext::for_entry(0xdead_beef, 0x7fff_0000);
+    ctx1.frame_mut().rax = 0x11;
+    let mut ctx2 = UserContext::for_entry(0xcafe_f00d, 0x7fff_1000);
+    ctx2.frame_mut().rax = 0x22;
+
+    process.add_thread(tid1, ThreadState::new_user(ctx1.clone(), root1));
+    process.add_thread(tid2, ThreadState::new_user(ctx2.clone(), root2));
+
+    scheduler.enqueue(RunQueueEntry::user(process.pid(), tid1, ThreadPriority::Normal));
+    scheduler.enqueue(RunQueueEntry::user(process.pid(), tid2, ThreadPriority::Normal));
+
+    let first = scheduler.pick_next().expect("first thread scheduled");
+    assert_eq!(first.tid, tid1);
+    let (mut running_ctx, running_root) =
+        process.take_thread_runtime(tid1).expect("context for first thread");
+    assert_eq!(running_root, root1);
+    running_ctx.frame_mut().rax = 0x99;
+
+    loop {
+        let outcome = scheduler.evaluate_timer_tick();
+        if let Some(preempted) = outcome.preempted {
+            assert_eq!(preempted.tid, tid1);
+            assert!(process.store_thread_context(tid1, running_ctx.clone()));
+            let next = outcome.next.expect("next thread selected");
+            assert_eq!(next.tid, tid2);
+            let (queued_ctx, queued_root) =
+                process.take_thread_runtime(tid2).expect("context for second thread");
+            assert_eq!(queued_root, root2);
+            assert_eq!(queued_ctx.frame().rax, ctx2.frame().rax);
+            assert!(process.store_thread_context(tid2, queued_ctx));
+            break;
+        }
+    }
+}
+
+#[test]
+fn kernel_context_round_trip() {
+    let table = ProcessTable::new();
+    let process = table.spawn();
+    let tid = process.allocate_tid();
+    process.add_thread(tid, ThreadState::new_kernel());
+
+    let mut context = KernelContext::default();
+    context.r12 = 0x1234_5678_9abc_def0;
+
+    assert!(process.store_kernel_context(tid, context.clone()));
+    let restored = process.take_kernel_context(tid).expect("kernel context present");
+    assert_eq!(restored.r12, context.r12);
 }

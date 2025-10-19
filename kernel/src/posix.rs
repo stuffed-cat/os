@@ -6,6 +6,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::slice;
 use core::sync::atomic::{AtomicU64, Ordering};
+use core::time::Duration;
 use spin::RwLock;
 
 use crate::{
@@ -13,6 +14,7 @@ use crate::{
     error::SubsystemError,
     fs::{self, FsError},
     process::{Pid, ProcessTable, WaitError},
+    scheduler::Scheduler,
     syscall::SyscallId,
 };
 
@@ -505,14 +507,22 @@ impl<'a> PosixLayer<'a> {
     }
 
     fn sleep(&self, millis: u64) -> Result<u64, Errno> {
-        // Placeholder: real implementation would integrate with a timer scheduler.
-        if millis == 0 {
-            return Ok(0);
+        if let Some(scheduler) = Scheduler::global() {
+            if millis == 0 {
+                scheduler.yield_current();
+                return Ok(0);
+            }
+            scheduler.sleep_current(Duration::from_millis(millis));
+            Ok(0)
+        } else {
+            if millis == 0 {
+                return Ok(0);
+            }
+            for _ in 0..millis {
+                core::hint::spin_loop();
+            }
+            Ok(0)
         }
-        for _ in 0..millis {
-            core::hint::spin_loop();
-        }
-        Ok(0)
     }
 
     /// Normalizes POSIX path.

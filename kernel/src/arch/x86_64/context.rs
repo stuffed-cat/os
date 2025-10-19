@@ -75,7 +75,6 @@ pub unsafe fn enter_user_mode(context: &UserContext, page_table: PhysFrame) -> !
         rflags_off = const core::mem::offset_of!(crate::user::TrapFrame, rflags),
         options(noreturn)
     );
-    core::hint::unreachable_unchecked();
 }
 
 /// Host builds rely on a stubbed implementation because no privilege transition is available.

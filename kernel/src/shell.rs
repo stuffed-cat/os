@@ -8,7 +8,7 @@ use crate::memory::MemoryManager;
 use crate::process::ProcessTable;
 #[cfg(not(feature = "std"))]
 use crate::scheduler::SchedulingClass;
-use crate::scheduler::{RunQueueEntry, Scheduler, ThreadStatus};
+use crate::scheduler::{RunQueueEntry, Scheduler, ThreadPriority, ThreadStatus};
 use crate::session::{self, UserSession};
 use crate::users::{self, UserError, UserProfile};
 use alloc::boxed::Box;
@@ -43,7 +43,9 @@ impl ShellSubsystem {
     /// Creates a new shell subsystem instance.
     pub fn new() -> Self {
         let process_table = Box::leak(Box::new(ProcessTable::new()));
+        process_table.register_global();
         let scheduler = Box::leak(Box::new(Scheduler::new()));
+        scheduler.start_preemption();
         let system = KernelShellSystem::new(process_table, scheduler);
 
         Self {
@@ -63,14 +65,14 @@ impl ShellSubsystem {
             match entry.class {
                 SchedulingClass::User => {
                     if let Some(process) = self.process_table.lookup(entry.pid) {
-                        if let Some(thread) = process.thread_state(entry.tid) {
+                        if let Some((context, root)) = process.take_thread_runtime(entry.tid) {
                             process.set_thread_status(entry.tid, ThreadStatus::Running);
                             unsafe {
-                                thread.enter_user_mode();
+                                crate::arch::x86_64::context::enter_user_mode(&context, root);
                             }
                         } else {
                             warn!(
-                                "scheduler: missing thread state for pid={} tid={}",
+                                "scheduler: missing user context for pid={} tid={}",
                                 entry.pid.as_u64(),
                                 entry.tid.as_u64()
                             );
@@ -373,7 +375,12 @@ impl ShellSystem for KernelShellSystem {
             .main_thread()
             .ok_or(SystemError::InvalidExecutable)?;
         process.set_thread_status(tid, ThreadStatus::Ready);
-        self.scheduler.enqueue(RunQueueEntry::user(pid, tid));
+        let priority = process
+            .thread_state(tid)
+            .map(|state| state.priority())
+            .unwrap_or(ThreadPriority::Normal);
+        self.scheduler
+            .enqueue(RunQueueEntry::user(pid, tid, priority));
 
         Ok(ExecResult { pid: pid.as_u64() })
     }

@@ -8,7 +8,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-use spin::RwLock;
+use spin::{Once, RwLock};
 use x86_64::structures::paging::PhysFrame;
 
 use crate::{
@@ -51,6 +51,47 @@ impl Tid {
     pub const fn as_u64(self) -> u64 {
         self.0
     }
+}
+
+/// Snapshot of kernel-mode registers captured during a preemption event.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KernelContext {
+    /// General-purpose register used for return values.
+    pub rax: u64,
+    /// Callee-saved register.
+    pub rbx: u64,
+    /// Scratch register.
+    pub rcx: u64,
+    /// Scratch register.
+    pub rdx: u64,
+    /// Scratch register.
+    pub rsi: u64,
+    /// Scratch register.
+    pub rdi: u64,
+    /// Extended scratch register.
+    pub r8: u64,
+    /// Extended scratch register.
+    pub r9: u64,
+    /// Extended scratch register.
+    pub r10: u64,
+    /// Extended scratch register.
+    pub r11: u64,
+    /// Callee-saved register.
+    pub r12: u64,
+    /// Callee-saved register.
+    pub r13: u64,
+    /// Callee-saved register.
+    pub r14: u64,
+    /// Callee-saved register.
+    pub r15: u64,
+    /// Base pointer.
+    pub rbp: u64,
+    /// Stack pointer captured at interrupt entry.
+    pub rsp: u64,
+    /// Instruction pointer where execution resumes.
+    pub rip: u64,
+    /// Saved RFLAGS value.
+    pub rflags: u64,
 }
 
 /// Process control block with capability list.
@@ -150,6 +191,44 @@ impl Process {
     /// Adds a thread to the process.
     pub fn add_thread(&self, tid: Tid, state: ThreadState) {
         self.threads.write().insert(tid, state);
+    }
+
+    /// Removes the saved user context for the given thread and returns it with the page table root.
+    pub fn take_thread_runtime(&self, tid: Tid) -> Option<(UserContext, PhysFrame)> {
+        let mut threads = self.threads.write();
+        threads
+            .get_mut(&tid)
+            .and_then(ThreadState::take_runtime_state)
+    }
+
+    /// Removes and returns the saved kernel context for the given thread.
+    pub fn take_kernel_context(&self, tid: Tid) -> Option<KernelContext> {
+        let mut threads = self.threads.write();
+        threads
+            .get_mut(&tid)
+            .and_then(ThreadState::take_kernel_context)
+    }
+
+    /// Stores a refreshed user context snapshot for the given thread.
+    pub fn store_thread_context(&self, tid: Tid, context: UserContext) -> bool {
+        let mut threads = self.threads.write();
+        if let Some(state) = threads.get_mut(&tid) {
+            state.store_context(context);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Stores a refreshed kernel context snapshot for the given thread.
+    pub fn store_kernel_context(&self, tid: Tid, context: KernelContext) -> bool {
+        let mut threads = self.threads.write();
+        if let Some(state) = threads.get_mut(&tid) {
+            state.store_kernel_context(context);
+            true
+        } else {
+            false
+        }
     }
 
     /// Returns a snapshot of the thread state for the provided TID.
@@ -475,6 +554,8 @@ pub struct ProcessTable {
     memory: RwLock<Option<NonNull<MemoryManager>>>,
 }
 
+static GLOBAL_PROCESS_TABLE: Once<&'static ProcessTable> = Once::new();
+
 /// Errors returned when waiting on child processes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitError {
@@ -501,6 +582,16 @@ impl ProcessTable {
     /// Creates a new table.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Registers this instance as the globally accessible process table.
+    pub fn register_global(&'static self) {
+        GLOBAL_PROCESS_TABLE.call_once(|| self);
+    }
+
+    /// Returns the global process table if one has been registered.
+    pub fn global() -> Option<&'static ProcessTable> {
+        GLOBAL_PROCESS_TABLE.get().copied()
     }
 
     fn allocate_pid(&self) -> Pid {
@@ -536,6 +627,35 @@ impl ProcessTable {
     /// Looks up a process by PID.
     pub fn lookup(&self, pid: Pid) -> Option<Arc<Process>> {
         self.processes.read().get(&pid).cloned()
+    }
+
+    /// Removes the saved user context for the given process/thread pair.
+    pub fn take_thread_context(&self, pid: Pid, tid: Tid) -> Option<(UserContext, PhysFrame)> {
+        self.lookup(pid)?.take_thread_runtime(tid)
+    }
+
+    /// Stores a refreshed user context snapshot for the provided process/thread pair.
+    pub fn store_thread_context(&self, pid: Pid, tid: Tid, context: UserContext) -> bool {
+        self.lookup(pid)
+            .map(|proc| proc.store_thread_context(tid, context))
+            .unwrap_or(false)
+    }
+
+    /// Removes the saved kernel context for the given process/thread pair.
+    pub fn take_kernel_context(&self, pid: Pid, tid: Tid) -> Option<KernelContext> {
+        self.lookup(pid)?.take_kernel_context(tid)
+    }
+
+    /// Stores a kernel context snapshot for the provided process/thread pair.
+    pub fn store_kernel_context(
+        &self,
+        pid: Pid,
+        tid: Tid,
+        context: KernelContext,
+    ) -> bool {
+        self.lookup(pid)
+            .map(|proc| proc.store_kernel_context(tid, context))
+            .unwrap_or(false)
     }
 
     /// Forks the given parent process, returning the child's PID.

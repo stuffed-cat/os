@@ -33,6 +33,14 @@ pub mod framebuffer {
 }
 pub mod power;
 pub mod serial;
+#[cfg(feature = "hardware")]
+pub mod timer;
+#[cfg(not(feature = "hardware"))]
+pub mod timer {
+    //! Stub timer interface for host testing when hardware timers are unavailable.
+    /// Stub timer initializer used in std builds.
+    pub fn init(_: u32) {}
+}
 
 pub use boot::ArchBootstrap;
 pub use boot::Cr0Flags;

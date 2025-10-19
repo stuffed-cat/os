@@ -300,6 +300,11 @@ impl UserContext {
         Self { frame }
     }
 
+    /// Builds a user context from a captured trap frame snapshot.
+    pub fn from_trap_frame(frame: TrapFrame) -> Self {
+        Self { frame }
+    }
+
     /// Returns the trap frame snapshot.
     pub fn frame(&self) -> &TrapFrame {
         &self.frame
