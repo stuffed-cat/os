@@ -430,10 +430,25 @@ impl Scheduler {
         Self::default()
     }
 
+    /// Registers this scheduler as the global instance only (without enabling timer).
+    /// Timer will be enabled later in init() phase.
+    pub fn register_global_only(&'static self) {
+        GLOBAL_SCHEDULER.call_once(|| self);
+    }
+
     /// Registers this scheduler as the global instance and configures timer interrupts.
     pub fn start_preemption(&'static self) {
         GLOBAL_SCHEDULER.call_once(|| self);
         self.configure_timer(DEFAULT_TIMER_FREQUENCY_HZ);
+    }
+
+    /// Enables the timer (should be called from init() after all subsystems ready).
+    /// This is a static method that accesses the global scheduler.
+    pub fn enable_timer_global() {
+        if let Some(scheduler) = Self::global() {
+            scheduler.configure_timer(DEFAULT_TIMER_FREQUENCY_HZ);
+        }
+        crate::arch::x86_64::serial::write_str("shell: timer enabled in init\r\n");
     }
 
     /// Configures the timer frequency driving preemption.

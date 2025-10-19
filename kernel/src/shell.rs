@@ -153,12 +153,13 @@ impl ShellSubsystem {
         let process_table = Box::leak(Box::new(ProcessTable::new()));
         process_table.register_global();
         let scheduler = Box::leak(Box::new(Scheduler::new()));
-        scheduler.start_preemption();
-    // Emit an immediate serial trace so we can observe that preemption started.
-    crate::arch::x86_64::serial::write_str("shell: scheduler started_preemption\r\n");
+        // Register scheduler globally but DON'T start preemption yet
+        // Timer will be enabled in init() after all subsystems are ready
+        scheduler.register_global_only();
+        crate::arch::x86_64::serial::write_str("shell: scheduler registered (timer deferred)\r\n");
         let dispatcher = Box::leak(Box::new(SyscallDispatcher::new(process_table)));
         dispatcher.register_global();
-    crate::arch::x86_64::serial::write_str("shell: syscall dispatcher registered\r\n");
+        crate::arch::x86_64::serial::write_str("shell: syscall dispatcher registered\r\n");
 
         Self {
             process_table,
@@ -256,6 +257,10 @@ impl Subsystem for ShellSubsystem {
                 unsafe { &*(hal.memory() as *const MemoryManager) };
             self.process_table.bind_memory_manager(manager);
         }
+
+        // NOW enable timer after all initialization is done
+        crate::arch::x86_64::serial::write_str("shell: about to enable timer\r\n");
+        Scheduler::enable_timer_global();
 
         if !self.init_spawned {
             match self.launch_initial_user() {
