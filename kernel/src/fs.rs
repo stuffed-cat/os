@@ -36,6 +36,7 @@ const EXT_FEATURE_RO_COMPAT_BTREE_DIR: u32 = 0x0000_0004;
 const EXT4_FEATURE_RO_COMPAT_HUGE_FILE: u32 = 0x0000_0008;
 const EXT4_FEATURE_RO_COMPAT_DIR_NLINK: u32 = 0x0000_0020;
 const EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE: u32 = 0x0000_0040;
+const EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER2: u32 = 0x0000_0200;
 const EXT_FEATURE_COMPAT_HAS_JOURNAL: u32 = 0x0000_0004;
 const EXT4_EXTENT_HEADER_MAGIC: u16 = 0xF30A;
 const EXT4_INODE_FLAG_EXTENTS: u32 = 0x0008_0000;
@@ -1229,14 +1230,20 @@ enum ExtFilesystemKind {
     Ext4,
 }
 
+#[derive(Clone, Copy)]
+struct BlockGroupDescriptor {
+    block_bitmap: u64,
+    inode_bitmap: u64,
+    inode_table: u64,
+}
+
 struct Ext2Fs<'a> {
     data: &'a [u8],
     block_size: usize,
     inode_size: usize,
     inodes_per_group: u32,
-    block_group_table_offset: usize,
     block_group_count: u32,
-    block_group_desc_size: usize,
+    block_groups: Vec<BlockGroupDescriptor>,
     kind: ExtFilesystemKind,
 }
 
@@ -1315,7 +1322,8 @@ impl<'a> Ext2Fs<'a> {
             | EXT_FEATURE_RO_COMPAT_BTREE_DIR
             | EXT4_FEATURE_RO_COMPAT_HUGE_FILE
             | EXT4_FEATURE_RO_COMPAT_DIR_NLINK
-            | EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE;
+            | EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE
+            | EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER2;
         if feature_ro_compat & !allowed_ro != 0 {
             return Err(FsError::Unsupported);
         }
@@ -1328,11 +1336,74 @@ impl<'a> Ext2Fs<'a> {
             feature_ro_compat,
         );
 
-        let block_group_table_block = if block_size == 1024 { 2 } else { 1 };
-        let block_group_table_offset = block_group_table_block * block_size;
-        let descriptor_table_size = block_group_count as usize * descriptor_size;
-        if block_group_table_offset + descriptor_table_size > data.len() {
+        let block_group_table_block = if block_size == 1024 { 2 } else { 1 } as u64;
+        let descriptors_per_block = block_size / descriptor_size;
+        if descriptors_per_block == 0 {
             return Err(FsError::InvalidImage);
+        }
+
+        let has_meta_bg = (feature_incompat & EXT_FEATURE_INCOMPAT_META_BG) != 0;
+        let has_64bit = (feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT) != 0;
+        let has_sparse_super = (feature_ro_compat & EXT_FEATURE_RO_COMPAT_SPARSE_SUPER) != 0;
+        let has_sparse_super2 = (feature_ro_compat & EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER2) != 0;
+
+        let reserved_gdt_blocks = read_u16(superblock, 0x78);
+        let first_data_block = read_u32(superblock, 20);
+        let blocks_per_group = read_u32(superblock, 32);
+        if blocks_per_group == 0 {
+            return Err(FsError::InvalidImage);
+        }
+        let first_meta_bg = if has_meta_bg {
+            read_u32(superblock, 0xFC)
+        } else {
+            0
+        };
+        let backup_super_groups = if has_sparse_super2 {
+            [read_u32(superblock, 0x264), read_u32(superblock, 0x268)]
+        } else {
+            [0, 0]
+        };
+
+        if !has_meta_bg {
+            let table_block = block_group_table_block as usize;
+            let block_group_table_offset = table_block
+                .checked_mul(block_size)
+                .ok_or(FsError::InvalidImage)?;
+            let descriptor_table_size = (block_group_count as usize)
+                .checked_mul(descriptor_size)
+                .ok_or(FsError::InvalidImage)?;
+            if block_group_table_offset + descriptor_table_size > data.len() {
+                return Err(FsError::InvalidImage);
+            }
+        }
+
+        let total_blocks = (data.len() / block_size) as u64;
+        if total_blocks == 0 {
+            return Err(FsError::InvalidImage);
+        }
+
+        let mut block_groups = Vec::with_capacity(block_group_count as usize);
+        for group in 0..block_group_count {
+            let descriptor = locate_block_group_descriptor(
+                data,
+                group,
+                descriptor_size,
+                block_size,
+                block_group_table_block,
+                descriptors_per_block,
+                has_meta_bg,
+                first_meta_bg,
+                first_data_block,
+                blocks_per_group,
+                reserved_gdt_blocks,
+                has_sparse_super,
+                has_sparse_super2,
+                &backup_super_groups,
+                has_64bit,
+                total_blocks,
+            )
+            .ok_or(FsError::InvalidImage)?;
+            block_groups.push(descriptor);
         }
 
         Ok(Self {
@@ -1340,9 +1411,8 @@ impl<'a> Ext2Fs<'a> {
             block_size,
             inode_size,
             inodes_per_group,
-            block_group_table_offset,
             block_group_count,
-            block_group_desc_size: descriptor_size,
+            block_groups,
             kind,
         })
     }
@@ -1573,19 +1643,15 @@ impl<'a> Ext2Fs<'a> {
         if group >= self.block_group_count {
             return Err(FsError::InvalidImage);
         }
-        let descriptor_offset =
-            self.block_group_table_offset + group as usize * self.block_group_desc_size;
-        let inode_table_low = read_u32(self.data, descriptor_offset + 8) as u64;
-        let inode_table_high = if self.block_group_desc_size >= 64 {
-            read_u32(self.data, descriptor_offset + 48) as u64
-        } else {
-            0
-        };
-        let inode_table_block = (inode_table_high << 32) | inode_table_low;
+        let descriptor = self
+            .block_groups
+            .get(group as usize)
+            .ok_or(FsError::InvalidImage)?;
+        let inode_table_block = descriptor.inode_table;
         if inode_table_block == 0 {
             return Err(FsError::InvalidImage);
         }
-        let inode_table_offset = inode_table_block as usize * self.block_size;
+        let inode_table_offset = self.block_offset(inode_table_block)?;
         let inode_offset = inode_table_offset + index_in_group as usize * self.inode_size;
         let inode_end = inode_offset + self.inode_size;
         if inode_end > self.data.len() {
@@ -1595,14 +1661,21 @@ impl<'a> Ext2Fs<'a> {
         Ok(Inode::parse(inode_raw))
     }
 
+    fn block_offset(&self, block: u64) -> Result<usize, FsError> {
+        if block == 0 || block > usize::MAX as u64 {
+            return Err(FsError::InvalidImage);
+        }
+        let total_blocks = self.data.len() / self.block_size;
+        if block as usize >= total_blocks {
+            return Err(FsError::InvalidImage);
+        }
+        (block as usize)
+            .checked_mul(self.block_size)
+            .ok_or(FsError::InvalidImage)
+    }
+
     fn block(&self, block_number: u64) -> Result<&[u8], FsError> {
-        if block_number == 0 {
-            return Err(FsError::InvalidImage);
-        }
-        if block_number > (usize::MAX as u64 / self.block_size as u64) {
-            return Err(FsError::InvalidImage);
-        }
-        let offset = (block_number as usize) * self.block_size;
+        let offset = self.block_offset(block_number)?;
         let end = offset + self.block_size;
         if end > self.data.len() {
             return Err(FsError::InvalidImage);
@@ -1801,6 +1874,306 @@ impl<'a> Ext2Fs<'a> {
         };
         (class_bits & mask) == mask
     }
+}
+
+impl BlockGroupDescriptor {
+    fn parse(bytes: &[u8], has_64bit: bool) -> Option<Self> {
+        if bytes.len() < 12 {
+            return None;
+        }
+        let block_bitmap_low = read_u32(bytes, 0) as u64;
+        let inode_bitmap_low = read_u32(bytes, 4) as u64;
+        let inode_table_low = read_u32(bytes, 8) as u64;
+        let mut block_bitmap = block_bitmap_low;
+        let mut inode_bitmap = inode_bitmap_low;
+        let mut inode_table = inode_table_low;
+        if has_64bit && bytes.len() >= 0x2C {
+            block_bitmap |= (read_u32(bytes, 0x20) as u64) << 32;
+            inode_bitmap |= (read_u32(bytes, 0x24) as u64) << 32;
+            inode_table |= (read_u32(bytes, 0x28) as u64) << 32;
+        }
+        Some(Self {
+            block_bitmap,
+            inode_bitmap,
+            inode_table,
+        })
+    }
+
+    fn parse_at(
+        data: &[u8],
+        offset: usize,
+        desc_size: usize,
+        has_64bit: bool,
+        total_blocks: u64,
+    ) -> Option<Self> {
+        let end = offset.checked_add(desc_size)?;
+        if end > data.len() {
+            return None;
+        }
+        let descriptor = Self::parse(&data[offset..end], has_64bit)?;
+        if descriptor.inode_table == 0
+            || descriptor.inode_table >= total_blocks
+            || descriptor.block_bitmap == 0
+            || descriptor.block_bitmap >= total_blocks
+            || descriptor.inode_bitmap == 0
+            || descriptor.inode_bitmap >= total_blocks
+        {
+            return None;
+        }
+        Some(descriptor)
+    }
+}
+
+fn locate_block_group_descriptor(
+    data: &[u8],
+    group: u32,
+    desc_size: usize,
+    block_size: usize,
+    primary_block: u64,
+    descriptors_per_block: usize,
+    has_meta_bg: bool,
+    first_meta_bg: u32,
+    first_data_block: u32,
+    blocks_per_group: u32,
+    reserved_gdt_blocks: u16,
+    has_sparse_super: bool,
+    has_sparse_super2: bool,
+    backup_super_groups: &[u32; 2],
+    has_64bit: bool,
+    total_blocks: u64,
+) -> Option<BlockGroupDescriptor> {
+    let data_len = data.len();
+    let candidates = [
+        locate_primary_descriptor_offset(
+            data_len,
+            block_size,
+            desc_size,
+            primary_block,
+            descriptors_per_block,
+            group,
+        ),
+        locate_meta_descriptor_offset_group(
+            data_len,
+            block_size,
+            desc_size,
+            descriptors_per_block,
+            group,
+            has_meta_bg,
+            first_meta_bg,
+            first_data_block,
+            blocks_per_group,
+            reserved_gdt_blocks,
+            has_sparse_super,
+            has_sparse_super2,
+            backup_super_groups,
+        ),
+        locate_meta_descriptor_offset_same(
+            data_len,
+            block_size,
+            desc_size,
+            descriptors_per_block,
+            group,
+            has_meta_bg,
+            first_meta_bg,
+            first_data_block,
+            blocks_per_group,
+            reserved_gdt_blocks,
+            has_sparse_super,
+            has_sparse_super2,
+            backup_super_groups,
+        ),
+    ];
+
+    for offset in candidates.into_iter().flatten() {
+        if let Some(descriptor) =
+            BlockGroupDescriptor::parse_at(data, offset, desc_size, has_64bit, total_blocks)
+        {
+            return Some(descriptor);
+        }
+    }
+    None
+}
+
+fn locate_primary_descriptor_offset(
+    data_len: usize,
+    block_size: usize,
+    desc_size: usize,
+    primary_block: u64,
+    descriptors_per_block: usize,
+    group: u32,
+) -> Option<usize> {
+    let block_index = (group as usize) / descriptors_per_block;
+    let descriptor_index = (group as usize) % descriptors_per_block;
+    let block = primary_block.checked_add(block_index as u64)?;
+    if block > (usize::MAX / block_size) as u64 {
+        return None;
+    }
+    let base = (block as usize) * block_size + descriptor_index * desc_size;
+    if base + desc_size <= data_len {
+        Some(base)
+    } else {
+        None
+    }
+}
+
+fn locate_meta_descriptor_offset_group(
+    data_len: usize,
+    block_size: usize,
+    desc_size: usize,
+    descriptors_per_block: usize,
+    group: u32,
+    has_meta_bg: bool,
+    first_meta_bg: u32,
+    first_data_block: u32,
+    blocks_per_group: u32,
+    reserved_gdt_blocks: u16,
+    has_sparse_super: bool,
+    has_sparse_super2: bool,
+    backup_super_groups: &[u32; 2],
+) -> Option<usize> {
+    if !has_meta_bg || descriptors_per_block == 0 {
+        return None;
+    }
+    if first_meta_bg != 0 && group < first_meta_bg {
+        return None;
+    }
+    let per_block = descriptors_per_block as u32;
+    let base_group = group / per_block * per_block;
+    locate_descriptor_in_group(
+        data_len,
+        block_size,
+        desc_size,
+        descriptors_per_block,
+        base_group,
+        group,
+        first_data_block,
+        blocks_per_group,
+        reserved_gdt_blocks,
+        has_sparse_super,
+        has_sparse_super2,
+        backup_super_groups,
+    )
+}
+
+fn locate_meta_descriptor_offset_same(
+    data_len: usize,
+    block_size: usize,
+    desc_size: usize,
+    descriptors_per_block: usize,
+    group: u32,
+    has_meta_bg: bool,
+    first_meta_bg: u32,
+    first_data_block: u32,
+    blocks_per_group: u32,
+    reserved_gdt_blocks: u16,
+    has_sparse_super: bool,
+    has_sparse_super2: bool,
+    backup_super_groups: &[u32; 2],
+) -> Option<usize> {
+    if !has_meta_bg || descriptors_per_block == 0 {
+        return None;
+    }
+    if first_meta_bg != 0 && group < first_meta_bg {
+        return None;
+    }
+    locate_descriptor_in_group(
+        data_len,
+        block_size,
+        desc_size,
+        descriptors_per_block,
+        group,
+        group,
+        first_data_block,
+        blocks_per_group,
+        reserved_gdt_blocks,
+        has_sparse_super,
+        has_sparse_super2,
+        backup_super_groups,
+    )
+}
+
+fn locate_descriptor_in_group(
+    data_len: usize,
+    block_size: usize,
+    desc_size: usize,
+    descriptors_per_block: usize,
+    base_group: u32,
+    target_group: u32,
+    first_data_block: u32,
+    blocks_per_group: u32,
+    reserved_gdt_blocks: u16,
+    has_sparse_super: bool,
+    has_sparse_super2: bool,
+    backup_super_groups: &[u32; 2],
+) -> Option<usize> {
+    if target_group < base_group || descriptors_per_block == 0 {
+        return None;
+    }
+    let start_block = group_first_block(first_data_block, blocks_per_group, base_group)?;
+    let mut block = start_block;
+    if group_has_superblock(
+        base_group,
+        has_sparse_super,
+        has_sparse_super2,
+        backup_super_groups,
+    ) {
+        block = block.checked_add(1)?;
+    }
+    block = block.checked_add(reserved_gdt_blocks as u64)?;
+    let descriptors_in_block = descriptors_per_block as u64;
+    let index = (target_group - base_group) as u64;
+    let block_increment = index / descriptors_in_block;
+    let offset_in_block = index % descriptors_in_block;
+    block = block.checked_add(block_increment)?;
+    if block > (usize::MAX / block_size) as u64 {
+        return None;
+    }
+    let base = (block as usize) * block_size + offset_in_block as usize * desc_size;
+    if base + desc_size <= data_len {
+        Some(base)
+    } else {
+        None
+    }
+}
+
+fn group_first_block(first_data_block: u32, blocks_per_group: u32, group: u32) -> Option<u64> {
+    let base = (group as u64).checked_mul(blocks_per_group as u64)?;
+    base.checked_add(first_data_block as u64)
+}
+
+fn group_has_superblock(
+    group: u32,
+    has_sparse_super: bool,
+    has_sparse_super2: bool,
+    backup_super_groups: &[u32; 2],
+) -> bool {
+    if group == 0 {
+        return true;
+    }
+    if has_sparse_super2 {
+        return backup_super_groups
+            .iter()
+            .copied()
+            .filter(|&g| g != 0)
+            .any(|g| g == group);
+    }
+    if !has_sparse_super {
+        return true;
+    }
+    if group == 1 {
+        return true;
+    }
+    is_power_of_base(group, 3) || is_power_of_base(group, 5) || is_power_of_base(group, 7)
+}
+
+fn is_power_of_base(mut value: u32, base: u32) -> bool {
+    if base < 2 {
+        return value == 1;
+    }
+    while value % base == 0 {
+        value /= base;
+    }
+    value == 1
 }
 
 impl Inode {
