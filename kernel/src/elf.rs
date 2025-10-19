@@ -36,6 +36,21 @@ const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
 
+/// Classification of an executable image based on its ELF type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageKind {
+    /// A fixed-address executable (ET_EXEC).
+    Static,
+    /// A position-independent image that requires a load bias (ET_DYN).
+    PositionIndependent,
+}
+
+impl ImageKind {
+    fn is_position_independent(self) -> bool {
+        matches!(self, ImageKind::PositionIndependent)
+    }
+}
+
 const DEFAULT_STACK_FLAGS: SegmentFlags = SegmentFlags {
     readable: true,
     writable: true,
@@ -114,6 +129,7 @@ pub struct ExecutableImage {
     interpreter: Option<String>,
     stack_flags: SegmentFlags,
     tls: Option<TlsTemplate>,
+    kind: ImageKind,
 }
 
 impl ExecutableImage {
@@ -150,6 +166,12 @@ impl ExecutableImage {
         if e_type != ET_EXEC && e_type != ET_DYN {
             return Err(ElfError::UnsupportedType);
         }
+
+        let kind = if e_type == ET_DYN {
+            ImageKind::PositionIndependent
+        } else {
+            ImageKind::Static
+        };
 
         let e_machine = read_u16(data, 18);
         if e_machine != EM_X86_64 {
@@ -337,6 +359,7 @@ impl ExecutableImage {
             interpreter,
             stack_flags,
             tls,
+            kind,
         })
     }
 
@@ -354,6 +377,7 @@ impl ExecutableImage {
             interpreter: None,
             stack_flags: DEFAULT_STACK_FLAGS,
             tls: None,
+            kind: ImageKind::Static,
         })
     }
 
@@ -365,6 +389,43 @@ impl ExecutableImage {
     /// Loadable segments extracted from the ELF binary.
     pub fn segments(&self) -> &[ExecutableSegment] {
         &self.segments
+    }
+
+    /// Returns the underlying ELF image kind.
+    pub fn kind(&self) -> ImageKind {
+        self.kind
+    }
+
+    /// Returns true when the image is position-independent and requires a load bias.
+    pub fn is_position_independent(&self) -> bool {
+        self.kind.is_position_independent()
+    }
+
+    /// Lowest virtual address referenced by the image's segments.
+    pub fn min_virtual_address(&self) -> u64 {
+        self.segments
+            .iter()
+            .map(|segment| segment.virtual_addr)
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// Exclusive upper bound of the image's virtual address space.
+    pub fn max_virtual_address(&self) -> u64 {
+        self.segments
+            .iter()
+            .map(|segment| segment.virtual_addr + segment.mem_size as u64)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Maximum alignment requested by any loadable segment.
+    pub fn max_alignment(&self) -> u64 {
+        self.segments
+            .iter()
+            .map(|segment| segment.align.max(1))
+            .max()
+            .unwrap_or(1)
     }
 
     /// Optional interpreter path extracted from the program headers.

@@ -9,6 +9,9 @@ const PAGE_SIZE: u64 = 4096;
 const DEFAULT_STACK_TOP: u64 = 0x0000_7FFF_F000;
 const DEFAULT_STACK_SIZE: usize = 128 * 1024;
 const USER_RFLAGS: u64 = 0x0000_0000_0000_0202;
+const DEFAULT_PROGRAM_BASE: u64 = 0x0040_0000;
+const INTERPRETER_BASE_START: u64 = 0x0200_0000;
+const LOAD_GAP: u64 = 0x0020_0000;
 
 bitflags::bitflags! {
     /// Access flags for user mappings.
@@ -185,9 +188,12 @@ pub struct AddressSpace {
 impl AddressSpace {
     /// Builds an address space from an ELF image and stack configuration.
     pub fn from_executable(image: &ExecutableImage, stack_config: StackConfig) -> Self {
+        let placement = layout_image(image, DEFAULT_PROGRAM_BASE);
+        let entry = placement.entry;
+        let segments = placement.segments;
         Self::from_segment_mappings(
-            image.entry_point(),
-            image.segments().iter().map(segment_mapping),
+            entry,
+            segments.into_iter(),
             image.stack_flags(),
             stack_config,
         )
@@ -200,15 +206,17 @@ impl AddressSpace {
         stack_config: StackConfig,
     ) -> Self {
         let combined_flags = merge_segment_flags(program.stack_flags(), interpreter.stack_flags());
-        let mut segments: Vec<SegmentMapping> = program
-            .segments()
-            .iter()
-            .chain(interpreter.segments())
-            .map(segment_mapping)
-            .collect();
+        let program_layout = layout_image(program, DEFAULT_PROGRAM_BASE);
+        let preferred_interpreter_start = core::cmp::max(
+            program_layout.end.saturating_add(LOAD_GAP),
+            INTERPRETER_BASE_START,
+        );
+        let interpreter_layout = layout_image(interpreter, preferred_interpreter_start);
+        let mut segments = program_layout.segments;
+        segments.extend(interpreter_layout.segments);
         segments.sort_by_key(|segment| segment.base());
         Self::finish_address_space(
-            interpreter.entry_point(),
+            interpreter_layout.entry,
             segments,
             combined_flags,
             stack_config,
@@ -260,10 +268,51 @@ impl AddressSpace {
     }
 }
 
-fn segment_mapping(segment: &ExecutableSegment) -> SegmentMapping {
+#[derive(Debug)]
+struct ImagePlacement {
+    segments: Vec<SegmentMapping>,
+    entry: u64,
+    end: u64,
+}
+
+fn layout_image(image: &ExecutableImage, preferred_start: u64) -> ImagePlacement {
+    let min_addr = image.min_virtual_address();
+    let max_addr = image.max_virtual_address();
+    let bias = if image.is_position_independent() {
+        let align = image.max_alignment().max(PAGE_SIZE);
+        let preferred = core::cmp::max(preferred_start, min_addr);
+        let aligned_start = align_up(preferred, align);
+        aligned_start - min_addr
+    } else {
+        0
+    };
+
+    let mut segments: Vec<SegmentMapping> = image
+        .segments()
+        .iter()
+        .map(|segment| segment_mapping(segment, bias))
+        .collect();
+    segments.sort_by_key(|segment| segment.base());
+
+    let entry = image
+        .entry_point()
+        .checked_add(bias)
+        .expect("entry point overflow while applying load bias");
+    let end = max_addr
+        .checked_add(bias)
+        .expect("address space overflow while applying load bias");
+
+    ImagePlacement {
+        segments,
+        entry,
+        end,
+    }
+}
+
+fn segment_mapping(segment: &ExecutableSegment, bias: u64) -> SegmentMapping {
     let payload = segment.data.clone();
     SegmentMapping {
-        base: segment.virtual_addr,
+        base: segment.virtual_addr + bias,
         length: segment.mem_size,
         permissions: MemoryFlags::from_segment(segment.flags),
         payload,
