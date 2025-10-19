@@ -7,6 +7,9 @@ use crate::error::KernelError;
 
 use super::{gdt, idt, serial};
 
+#[cfg(any(feature = "hardware", feature = "boot"))]
+use x86_64::registers::model_specific::{Efer, EferFlags};
+
 bitflags! {
     /// x86-64 control register flags captured for virtualization and
     /// privilege separation between kernel and userland.
@@ -29,6 +32,12 @@ impl ArchBootstrap {
         trace!("Initializing CPU features for x86-64");
         serial::init();
         gdt::init();
+        #[cfg(any(feature = "hardware", feature = "boot"))]
+        unsafe {
+            let mut efer = Efer::read();
+            efer.remove(EferFlags::SYSTEM_CALL_EXTENSIONS);
+            Efer::write(efer);
+        }
         idt::init();
         Ok(())
     }

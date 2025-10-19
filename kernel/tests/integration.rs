@@ -65,6 +65,7 @@ fn posix_fork_exec_open_read_flow() {
             writable: false,
             executable: true,
         },
+        file_offset: 0,
     };
     let stub_image = ExecutableImage::from_parts(0x4000_0000, vec![stub_segment])
         .expect("stub executable valid");
@@ -91,7 +92,7 @@ fn posix_fork_exec_open_read_flow() {
         .user_context()
         .expect("user context present after exec");
     assert_eq!(context.frame().rip, stub_entry);
-    assert_eq!(context.frame().rsp, address_space.stack().top());
+    assert_eq!(context.frame().rsp, address_space.stack().initial_sp());
 
     let fd = layer
         .dispatch(parent.pid(), SyscallId::Open, &[2, 0])

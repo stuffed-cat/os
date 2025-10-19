@@ -130,6 +130,9 @@ pub struct ExecutableImage {
     stack_flags: SegmentFlags,
     tls: Option<TlsTemplate>,
     kind: ImageKind,
+    program_header_offset: u64,
+    program_header_entry_size: u16,
+    program_header_count: u16,
 }
 
 impl ExecutableImage {
@@ -179,10 +182,12 @@ impl ExecutableImage {
         }
 
         let e_entry = read_u64(data, 24);
-        let e_phoff =
-            usize::try_from(read_u64(data, 32)).map_err(|_| ElfError::BadProgramHeaderBounds)?;
-        let e_phentsize = read_u16(data, 54) as usize;
-        let e_phnum = read_u16(data, 56) as usize;
+        let e_phoff_raw = read_u64(data, 32);
+        let e_phoff = usize::try_from(e_phoff_raw).map_err(|_| ElfError::BadProgramHeaderBounds)?;
+        let e_phentsize_raw = read_u16(data, 54);
+        let e_phentsize = e_phentsize_raw as usize;
+        let e_phnum_raw = read_u16(data, 56);
+        let e_phnum = e_phnum_raw as usize;
 
         if e_phentsize == 0 {
             return Err(ElfError::BadProgramHeaderBounds);
@@ -324,6 +329,7 @@ impl ExecutableImage {
                         align,
                         data: segment_data,
                         flags,
+                        file_offset: p_offset,
                     });
                 }
                 _ => {}
@@ -360,6 +366,9 @@ impl ExecutableImage {
             stack_flags,
             tls,
             kind,
+            program_header_offset: e_phoff_raw,
+            program_header_entry_size: e_phentsize_raw,
+            program_header_count: e_phnum_raw,
         })
     }
 
@@ -378,6 +387,9 @@ impl ExecutableImage {
             stack_flags: DEFAULT_STACK_FLAGS,
             tls: None,
             kind: ImageKind::Static,
+            program_header_offset: 0,
+            program_header_entry_size: 0,
+            program_header_count: 0,
         })
     }
 
@@ -442,6 +454,38 @@ impl ExecutableImage {
     pub fn tls_template(&self) -> Option<&TlsTemplate> {
         self.tls.as_ref()
     }
+
+    /// Returns the file offset of the program header table.
+    pub fn program_header_offset(&self) -> u64 {
+        self.program_header_offset
+    }
+
+    /// Returns the size in bytes of each program header entry.
+    pub fn program_header_entry_size(&self) -> u16 {
+        self.program_header_entry_size
+    }
+
+    /// Returns the number of program header entries in the table.
+    pub fn program_header_count(&self) -> u16 {
+        self.program_header_count
+    }
+
+    /// Returns the virtual address of the program header table after applying the provided load bias.
+    pub fn program_header_virtual_address(&self, load_bias: u64) -> Option<u64> {
+        if self.program_header_count == 0 {
+            return None;
+        }
+        let offset = self.program_header_offset;
+        for segment in &self.segments {
+            let start = segment.file_offset;
+            let end = start + segment.file_size as u64;
+            if offset >= start && offset < end {
+                let delta = offset - start;
+                return Some(segment.virtual_addr + delta + load_bias);
+            }
+        }
+        None
+    }
 }
 
 /// A single loadable segment from the executable.
@@ -459,6 +503,8 @@ pub struct ExecutableSegment {
     pub data: Vec<u8>,
     /// Access permissions extracted from the program header.
     pub flags: SegmentFlags,
+    /// File offset (`p_offset`) where the segment payload starts.
+    pub file_offset: u64,
 }
 
 /// Template describing a thread-local storage image.

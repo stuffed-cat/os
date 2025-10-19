@@ -17,7 +17,10 @@ use crate::{
     fs::{self, Credentials, FsError},
     memory::{Capability, MemoryManager, PageTableHandle},
     scheduler::{SchedulingClass, ThreadState, ThreadStatus},
-    user::{AddressSpace, StackConfig, UserContext},
+    user::{
+        prepare_initial_stack, AddressSpace, AddressSpaceBuild, StackConfig, StackUserIds,
+        UserContext,
+    },
 };
 use log::trace;
 
@@ -289,15 +292,40 @@ impl Process {
         memory: Option<&MemoryManager>,
     ) -> Result<(), SubsystemError> {
         let stack_config = StackConfig::default();
-        let address_space = match interpreter.as_ref() {
-            Some(interp) => AddressSpace::from_executable_pair(&primary, interp, stack_config),
-            None => AddressSpace::from_executable(&primary, stack_config),
+        let AddressSpaceBuild {
+            mut space,
+            program: program_layout,
+            interpreter: interpreter_layout,
+        } = AddressSpace::build(&primary, interpreter.as_ref(), stack_config);
+
+        let argv = alloc::vec![program.clone()];
+        let env_pairs: Vec<(String, String)> = self.env_snapshot().into_iter().collect();
+        let ids = StackUserIds {
+            uid: self.uid(),
+            gid: self.gid(),
+            euid: self.uid(),
+            egid: self.gid(),
         };
-        let stack_top = address_space.stack().top();
-        let context = UserContext::for_entry(address_space.entry_point(), stack_top);
+
+        let stack_init = prepare_initial_stack(
+            space.stack(),
+            &argv,
+            &env_pairs,
+            &program_layout,
+            interpreter_layout.as_ref(),
+            space.entry_point(),
+            ids,
+            &program,
+        )?;
+
+        let stack_pointer = stack_init.stack_pointer;
+        space
+            .stack_mut()
+            .set_initial_state(stack_pointer, stack_init.image);
+        let context = UserContext::for_entry(space.entry_point(), stack_pointer);
 
         let handle = if let Some(manager) = memory {
-            Some(manager.map_address_space(&address_space)?)
+            Some(manager.map_address_space(&space)?)
         } else {
             None
         };
@@ -305,7 +333,7 @@ impl Process {
         *self.program.write() = Some(program);
         *self.executable.write() = Some(primary);
         *self.interpreter.write() = interpreter;
-        *self.address_space.write() = Some(address_space.clone());
+        *self.address_space.write() = Some(space.clone());
         *self.user_context.write() = Some(context.clone());
 
         self.reset_threads();

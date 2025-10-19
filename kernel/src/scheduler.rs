@@ -440,9 +440,16 @@ impl Scheduler {
     pub fn configure_timer(&'static self, frequency_hz: u64) {
         let hz = frequency_hz.max(1);
         self.tick_frequency.store(hz, AtomicOrdering::SeqCst);
-        #[cfg(feature = "hardware")]
+        trace!("scheduler: configuring timer at {} Hz", hz);
+        #[cfg(any(feature = "hardware", feature = "boot"))]
         {
+            trace!("scheduler: initializing PIT timer for hardware");
+            // Add explicit serial prints to aid debugging on minimal boot builds
+            // so we can tell whether PIT init returns.
+            crate::arch::x86_64::serial::write_str("scheduler: about to init PIT\r\n");
             crate::arch::x86_64::timer::init(hz as u32);
+            crate::arch::x86_64::serial::write_str("scheduler: PIT init returned\r\n");
+            trace!("scheduler: PIT timer initialized");
         }
         #[cfg(feature = "std")]
         self.spawn_host_timer(hz);
@@ -578,6 +585,7 @@ impl Scheduler {
     pub fn evaluate_timer_tick(&self) -> TimerTickOutcome {
         let mut inner = self.inner.lock();
         inner.tick = inner.tick.saturating_add(1);
+        trace!("scheduler: evaluate_timer_tick #{}", inner.tick);
         Self::wake_sleepers(&mut inner);
         let preempted = Self::advance_current(&mut inner);
         let next = if inner.need_resched {

@@ -10,6 +10,8 @@ use core::arch::naked_asm;
 #[cfg(feature = "hardware")]
 use core::mem::transmute;
 #[cfg(feature = "hardware")]
+use core::ptr;
+#[cfg(feature = "hardware")]
 use x86_64::registers::control::{Cr3, Cr3Flags};
 #[cfg(feature = "hardware")]
 use x86_64::registers::rflags::RFlags;
@@ -190,19 +192,27 @@ pub fn init() {
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(gdt::double_fault_ist_index());
         }
-        #[cfg(feature = "hardware")]
+        #[cfg(any(feature = "hardware", feature = "boot"))]
         unsafe {
             let handler: extern "C" fn() -> ! = timer_interrupt_trampoline;
             let converted: extern "x86-interrupt" fn(InterruptStackFrame) = transmute(handler);
             idt[InterruptIndex::Timer.as_u8()].set_handler_fn(converted);
         }
-        #[cfg(not(feature = "hardware"))]
+        #[cfg(not(any(feature = "hardware", feature = "boot")))]
         idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
         idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
         idt.page_fault.set_handler_fn(page_fault_handler);
         idt.general_protection_fault
             .set_handler_fn(general_protection_fault_handler);
-        #[cfg(feature = "hardware")]
+        #[cfg(any(feature = "hardware", feature = "boot"))]
+        unsafe {
+            let handler: extern "C" fn() -> ! = invalid_opcode_trampoline;
+            let converted: extern "x86-interrupt" fn(InterruptStackFrame) = transmute(handler);
+            idt.invalid_opcode.set_handler_fn(converted);
+        }
+        #[cfg(not(any(feature = "hardware", feature = "boot")))]
+        idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+        #[cfg(any(feature = "hardware", feature = "boot"))]
         unsafe {
             let handler: extern "C" fn() -> ! = syscall_interrupt_trampoline;
             let converted: extern "x86-interrupt" fn(InterruptStackFrame) = transmute(handler);
@@ -251,6 +261,11 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     );
 }
 
+#[cfg(not(feature = "hardware"))]
+extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
+    panic!("INVALID OPCODE: {:?}", stack_frame);
+}
+
 #[cfg(feature = "hardware")]
 unsafe extern "C" fn timer_interrupt_handler(
     regs: *mut SavedRegisters,
@@ -258,6 +273,9 @@ unsafe extern "C" fn timer_interrupt_handler(
 ) {
     let regs = &mut *regs;
     let frame = &mut *frame;
+
+    crate::arch::x86_64::serial::write_str(">> TIMER INTERRUPT HANDLER ENTERED\r\n");
+    trace!("timer interrupt");
 
     if let Some(table) = ProcessTable::global() {
         if let Some(root) = table.kernel_root_frame() {
@@ -346,6 +364,84 @@ unsafe extern "C" fn syscall_interrupt_handler(
     };
 
     let mut context = UserContext::from_trap_frame(regs.snapshot(frame));
+
+    let result = SyscallDispatcher::global()
+        .ok_or_else(|| KernelError::Unimplemented("syscall dispatcher not registered"))
+        .and_then(|dispatcher| dispatcher.handle_trap(entry.pid, context.frame_mut()));
+
+    if let Err(err) = result {
+        context
+            .frame_mut()
+            .set_return_value(encode_kernel_error(err));
+    }
+
+    regs.apply_user_context(&context);
+    write_user_frame(frame, &context);
+
+    if let Some(root) = proc.page_table_root() {
+        switch_address_space(root);
+    }
+}
+
+#[cfg(feature = "hardware")]
+unsafe extern "C" fn invalid_opcode_handler(
+    regs: *mut SavedRegisters,
+    frame: *mut InterruptStackFrameValue,
+) {
+    let regs = &mut *regs;
+    let frame = &mut *frame;
+
+    let fault_ip = frame.instruction_pointer.as_u64();
+    let opcode = unsafe {
+        [
+            ptr::read(fault_ip as *const u8),
+            ptr::read(fault_ip.wrapping_add(1) as *const u8),
+        ]
+    };
+
+    if opcode != [0x0f, 0x05] {
+        panic!(
+            "INVALID OPCODE at {fault_ip:#x}: {:02x} {:02x}",
+            opcode[0], opcode[1]
+        );
+    }
+
+    if let Some(table) = ProcessTable::global() {
+        if let Some(root) = table.kernel_root_frame() {
+            switch_address_space(root);
+        }
+    }
+
+    let Some(scheduler) = Scheduler::global() else {
+        return;
+    };
+
+    let Some(entry) = scheduler.current_thread() else {
+        return;
+    };
+
+    if entry.class != SchedulingClass::User {
+        return;
+    }
+
+    let Some(table) = ProcessTable::global() else {
+        return;
+    };
+
+    let Some(proc) = table.lookup(entry.pid) else {
+        return;
+    };
+
+    let mut context = UserContext::from_trap_frame(regs.snapshot(frame));
+    let return_ip = context.frame().rip.wrapping_add(2);
+    let flags = context.frame().rflags;
+
+    {
+        let frame_mut = context.frame_mut();
+        frame_mut.rip = return_ip;
+        frame_mut.rcx = return_ip;
+        frame_mut.r11 = flags;
+    }
 
     let result = SyscallDispatcher::global()
         .ok_or_else(|| KernelError::Unimplemented("syscall dispatcher not registered"))
@@ -460,6 +556,51 @@ extern "C" fn syscall_interrupt_trampoline() -> ! {
         "iretq",
         frame_offset = const 15 * 8,
         handler = sym syscall_interrupt_handler
+    );
+}
+
+#[cfg(feature = "hardware")]
+#[unsafe(naked)]
+extern "C" fn invalid_opcode_trampoline() -> ! {
+    naked_asm!(
+        "push rbp",
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
+        "push rbx",
+        "push rax",
+        "mov rdi, rsp",
+        "lea rsi, [rsp + {frame_offset}]",
+        "sub rsp, 8",
+        "call {handler}",
+        "add rsp, 8",
+        "pop rax",
+        "pop rbx",
+        "pop rcx",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        "pop rbp",
+        "iretq",
+        frame_offset = const 15 * 8,
+        handler = sym invalid_opcode_handler
     );
 }
 

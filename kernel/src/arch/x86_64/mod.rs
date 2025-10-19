@@ -3,9 +3,9 @@
 mod boot;
 pub mod context;
 pub mod gdt;
-#[cfg(feature = "hardware")]
+#[cfg(any(feature = "hardware", feature = "boot"))]
 pub mod idt;
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(any(feature = "hardware", feature = "boot")))]
 pub mod idt {
     //! Stub IDT module used when hardware features are disabled.
     /// Stub IDT initialization used for host testing without hardware features.
@@ -33,9 +33,9 @@ pub mod framebuffer {
 }
 pub mod power;
 pub mod serial;
-#[cfg(feature = "hardware")]
+#[cfg(any(feature = "hardware", feature = "boot"))]
 pub mod timer;
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(any(feature = "hardware", feature = "boot")))]
 pub mod timer {
     //! Stub timer interface for host testing when hardware timers are unavailable.
     /// Stub timer initializer used in std builds.

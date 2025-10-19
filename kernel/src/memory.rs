@@ -7,7 +7,7 @@ use spin::RwLock;
 use crate::error::SubsystemError;
 
 #[cfg(any(feature = "alloc", feature = "std"))]
-use crate::user::{AddressSpace, MemoryFlags, SegmentMapping, Stack};
+use crate::user::{AddressSpace, MemoryFlags, SegmentMapping, Stack, StackImage};
 
 #[cfg(any(feature = "alloc", feature = "std"))]
 use alloc::vec::Vec;
@@ -456,6 +456,9 @@ impl MemoryManager {
                     .flush();
                 handle.as_mut().record_mapping(frame);
             }
+            if let Some(image) = stack.image() {
+                self.copy_stack_image_into_frame(frame, stack, image, page);
+            }
         }
         Ok(())
     }
@@ -522,6 +525,37 @@ impl MemoryManager {
                 .flush();
         }
         Ok(())
+    }
+
+    fn copy_stack_image_into_frame(
+        &self,
+        frame: PhysFrame,
+        stack: &Stack,
+        image: &StackImage,
+        page: Page<Size4KiB>,
+    ) {
+        let page_start = page.start_address().as_u64();
+        let page_end = page_start + Size4KiB::SIZE;
+        let image_start = stack.base() + image.offset() as u64;
+        let image_end = image_start + image.data().len() as u64;
+
+        let copy_start = core::cmp::max(image_start, page_start);
+        let copy_end = core::cmp::min(image_end, page_end);
+        if copy_end <= copy_start {
+            return;
+        }
+
+        let payload_offset = (copy_start - image_start) as usize;
+        let copy_len = (copy_end - copy_start) as usize;
+        let dest_offset = (copy_start - page_start) as usize;
+
+        let phys = frame.start_address().as_u64();
+        let virt = self.phys_offset + phys;
+        unsafe {
+            let dest = virt.as_mut_ptr::<u8>().add(dest_offset);
+            let src = &image.data()[payload_offset..payload_offset + copy_len];
+            ptr::copy_nonoverlapping(src.as_ptr(), dest, copy_len);
+        }
     }
 
     /// Returns the physical memory offset used by the mapper.

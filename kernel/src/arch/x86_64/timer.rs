@@ -1,5 +1,5 @@
 //! x86-64 PIT timer programming utilities for preemptive scheduling.
-#![cfg(feature = "hardware")]
+#![cfg(any(feature = "hardware", feature = "boot"))]
 
 use spin::Mutex;
 use x86_64::instructions::port::Port;

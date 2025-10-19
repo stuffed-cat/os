@@ -15,7 +15,7 @@ use crate::users;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::string::String;
-use log::info;
+use log::{info, trace};
 #[cfg(not(feature = "std"))]
 use log::warn;
 use pc_keyboard::layouts::Us104Key;
@@ -154,8 +154,11 @@ impl ShellSubsystem {
         process_table.register_global();
         let scheduler = Box::leak(Box::new(Scheduler::new()));
         scheduler.start_preemption();
+    // Emit an immediate serial trace so we can observe that preemption started.
+    crate::arch::x86_64::serial::write_str("shell: scheduler started_preemption\r\n");
         let dispatcher = Box::leak(Box::new(SyscallDispatcher::new(process_table)));
         dispatcher.register_global();
+    crate::arch::x86_64::serial::write_str("shell: syscall dispatcher registered\r\n");
 
         Self {
             process_table,
@@ -173,7 +176,9 @@ impl ShellSubsystem {
             profile.shell.clone()
         };
 
+        trace!("shell: spawning initial user process");
         let process = self.process_table.spawn();
+        trace!("shell: spawn completed with pid={}", process.pid().as_u64());
         process.set_credentials(profile.uid, profile.gid, profile.groups.clone());
         process.set_cwd(profile.home.clone());
         process.set_env(String::from("HOME"), profile.home.clone());
@@ -186,7 +191,9 @@ impl ShellSubsystem {
         );
         process.set_env(String::from("TERM"), String::from("nexa-console"));
 
+        trace!("shell: executing {}", shell_path);
         self.process_table.exec(process.pid(), shell_path)?;
+        trace!("shell: exec completed");
 
         let (tid, _) = process
             .main_thread()
@@ -196,6 +203,7 @@ impl ShellSubsystem {
             .thread_state(tid)
             .map(|state| state.priority())
             .unwrap_or(ThreadPriority::Normal);
+        trace!("shell: enqueueing process for scheduling");
         self.scheduler
             .enqueue(RunQueueEntry::user(process.pid(), tid, priority));
         Ok(())
@@ -250,9 +258,16 @@ impl Subsystem for ShellSubsystem {
         }
 
         if !self.init_spawned {
-            self.launch_initial_user()?;
-            self.init_spawned = true;
-            info!("initial user shell spawned");
+            match self.launch_initial_user() {
+                Ok(()) => {
+                    self.init_spawned = true;
+                    info!("initial user shell spawned");
+                }
+                Err(e) => {
+                    log::error!("failed to launch initial user: {:?}", e);
+                    return Err(e);
+                }
+            }
         }
 
         Ok(())

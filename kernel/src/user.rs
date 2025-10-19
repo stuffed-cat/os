@@ -1,14 +1,35 @@
 //! User mode scaffolding: address space layout, stack management, and trap context.
 
-use alloc::vec::Vec;
+use alloc::vec;
+use alloc::{format, string::String, vec::Vec};
 use core::fmt;
 
-use crate::elf::{ExecutableImage, ExecutableSegment, SegmentFlags};
+use crate::{
+    elf::{ExecutableImage, ExecutableSegment, SegmentFlags},
+    error::SubsystemError,
+};
 
 const PAGE_SIZE: u64 = 4096;
 const DEFAULT_STACK_TOP: u64 = 0x0000_7FFF_F000;
 const DEFAULT_STACK_SIZE: usize = 128 * 1024;
 const USER_RFLAGS: u64 = 0x0000_0000_0000_0202;
+
+const AUXV_AT_NULL: u64 = 0;
+const AUXV_AT_PHDR: u64 = 3;
+const AUXV_AT_PHENT: u64 = 4;
+const AUXV_AT_PHNUM: u64 = 5;
+const AUXV_AT_PAGESZ: u64 = 6;
+const AUXV_AT_BASE: u64 = 7;
+const AUXV_AT_ENTRY: u64 = 9;
+const AUXV_AT_UID: u64 = 11;
+const AUXV_AT_EUID: u64 = 12;
+const AUXV_AT_GID: u64 = 13;
+const AUXV_AT_EGID: u64 = 14;
+const AUXV_AT_CLKTCK: u64 = 17;
+const AUXV_AT_SECURE: u64 = 23;
+const AUXV_AT_RANDOM: u64 = 25;
+const AUXV_AT_EXECFN: u64 = 31;
+
 const DEFAULT_PROGRAM_BASE: u64 = 0x0040_0000;
 const INTERPRETER_BASE_START: u64 = 0x0200_0000;
 const LOAD_GAP: u64 = 0x0020_0000;
@@ -17,12 +38,14 @@ bitflags::bitflags! {
     /// Access flags for user mappings.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct MemoryFlags: u8 {
+
         /// Mapping is readable from user mode.
         const READ = 1 << 0;
         /// Mapping is writable from user mode.
         const WRITE = 1 << 1;
         /// Mapping is executable from user mode.
         const EXEC = 1 << 2;
+
         /// Mapping is user accessible (as opposed to kernel only).
         const USER = 1 << 3;
     }
@@ -81,6 +104,15 @@ pub struct Stack {
     base: u64,
     size: usize,
     permissions: MemoryFlags,
+    initial_sp: u64,
+    image: Option<StackImage>,
+}
+
+/// Serialized payload describing bytes to copy into a stack mapping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StackImage {
+    offset: usize,
+    data: Vec<u8>,
 }
 
 impl Stack {
@@ -107,6 +139,8 @@ impl Stack {
             base,
             size: aligned_size,
             permissions,
+            initial_sp: aligned_top,
+            image: None,
         }
     }
 
@@ -128,6 +162,46 @@ impl Stack {
     /// Permissions configured for the stack mapping.
     pub fn permissions(&self) -> MemoryFlags {
         self.permissions
+    }
+
+    /// Returns the initial stack pointer configured for the process.
+    pub fn initial_sp(&self) -> u64 {
+        self.initial_sp
+    }
+
+    /// Returns the prepared stack image, if any.
+    pub fn image(&self) -> Option<&StackImage> {
+        self.image.as_ref()
+    }
+
+    /// Updates the initial stack contents and starting pointer.
+    pub fn set_initial_state(&mut self, sp: u64, image: Option<StackImage>) {
+        let mapped_top = self.base + self.size as u64;
+        assert!(
+            sp >= self.base && sp <= mapped_top,
+            "stack pointer out of range"
+        );
+        if let Some(ref img) = image {
+            assert!(img.offset <= self.size, "stack image offset outside range");
+            assert!(
+                img.offset + img.data.len() <= self.size,
+                "stack image exceeds stack bounds"
+            );
+        }
+        self.initial_sp = sp;
+        self.image = image;
+    }
+}
+
+impl StackImage {
+    /// Starting offset from the stack base where data should be copied.
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// Returns the raw bytes that should be copied into the stack.
+    pub fn data(&self) -> &[u8] {
+        &self.data
     }
 }
 
@@ -188,15 +262,7 @@ pub struct AddressSpace {
 impl AddressSpace {
     /// Builds an address space from an ELF image and stack configuration.
     pub fn from_executable(image: &ExecutableImage, stack_config: StackConfig) -> Self {
-        let placement = layout_image(image, DEFAULT_PROGRAM_BASE);
-        let entry = placement.entry;
-        let segments = placement.segments;
-        Self::from_segment_mappings(
-            entry,
-            segments.into_iter(),
-            image.stack_flags(),
-            stack_config,
-        )
+        Self::build(image, None, stack_config).space
     }
 
     /// Builds an address space that maps both the primary executable and its interpreter.
@@ -205,22 +271,7 @@ impl AddressSpace {
         interpreter: &ExecutableImage,
         stack_config: StackConfig,
     ) -> Self {
-        let combined_flags = merge_segment_flags(program.stack_flags(), interpreter.stack_flags());
-        let program_layout = layout_image(program, DEFAULT_PROGRAM_BASE);
-        let preferred_interpreter_start = core::cmp::max(
-            program_layout.end.saturating_add(LOAD_GAP),
-            INTERPRETER_BASE_START,
-        );
-        let interpreter_layout = layout_image(interpreter, preferred_interpreter_start);
-        let mut segments = program_layout.segments;
-        segments.extend(interpreter_layout.segments);
-        segments.sort_by_key(|segment| segment.base());
-        Self::finish_address_space(
-            interpreter_layout.entry,
-            segments,
-            combined_flags,
-            stack_config,
-        )
+        Self::build(program, Some(interpreter), stack_config).space
     }
 
     /// Program entry point virtual address.
@@ -233,12 +284,393 @@ impl AddressSpace {
         &self.stack
     }
 
+    /// Returns a mutable reference to the stack metadata.
+    pub fn stack_mut(&mut self) -> &mut Stack {
+        &mut self.stack
+    }
+
     /// Returns an iterator over the segment mappings.
     pub fn segments(&self) -> &[SegmentMapping] {
         &self.segments
     }
+
+    /// Builds an address space and returns both the mapping and layout metadata.
+    pub fn build(
+        program: &ExecutableImage,
+        interpreter: Option<&ExecutableImage>,
+        stack_config: StackConfig,
+    ) -> AddressSpaceBuild {
+        let stack_size = stack_config.size();
+        let program_placement = layout_image(program, DEFAULT_PROGRAM_BASE);
+        let program_layout = ProgramLayoutInfo::from_image(program, &program_placement, stack_size);
+        let program_entry = program_placement.entry;
+        let program_end = program_placement.end;
+        let program_segments = program_placement.segments.clone();
+
+        match interpreter {
+            Some(interp) => {
+                let combined_flags =
+                    merge_segment_flags(program.stack_flags(), interp.stack_flags());
+                let preferred_interpreter_start =
+                    core::cmp::max(program_end.saturating_add(LOAD_GAP), INTERPRETER_BASE_START);
+                let interpreter_placement = layout_image(interp, preferred_interpreter_start);
+                let interpreter_layout =
+                    ProgramLayoutInfo::from_image(interp, &interpreter_placement, stack_size);
+                let interpreter_entry = interpreter_placement.entry;
+                let mut segments = program_segments.clone();
+                segments.extend(interpreter_placement.segments.clone());
+                segments.sort_by_key(|segment| segment.base());
+                let space = Self::finish_address_space(
+                    interpreter_entry,
+                    segments,
+                    combined_flags,
+                    stack_config,
+                );
+                AddressSpaceBuild {
+                    space,
+                    program: program_layout,
+                    interpreter: Some(interpreter_layout),
+                }
+            }
+            None => {
+                let space = Self::finish_address_space(
+                    program_entry,
+                    program_segments,
+                    program.stack_flags(),
+                    stack_config,
+                );
+                AddressSpaceBuild {
+                    space,
+                    program: program_layout,
+                    interpreter: None,
+                }
+            }
+        }
+    }
 }
 
+/// Describes key layout attributes for a loaded executable image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgramLayoutInfo {
+    base_address: u64,
+    entry_point: u64,
+    stack_size: usize,
+    program_headers: Option<ProgramHeaderTable>,
+}
+
+impl ProgramLayoutInfo {
+    fn from_image(image: &ExecutableImage, placement: &ImagePlacement, stack_size: usize) -> Self {
+        let base_address = placement
+            .segments
+            .iter()
+            .map(SegmentMapping::base)
+            .min()
+            .unwrap_or(0);
+        let program_headers = image
+            .program_header_virtual_address(placement.bias)
+            .map(|address| ProgramHeaderTable {
+                address,
+                entry_size: image.program_header_entry_size(),
+                count: image.program_header_count(),
+            });
+        Self {
+            base_address,
+            entry_point: placement.entry,
+            stack_size,
+            program_headers,
+        }
+    }
+
+    /// Base virtual address at which the executable was loaded.
+    pub fn base_address(&self) -> u64 {
+        self.base_address
+    }
+
+    /// Entry point virtual address after relocation.
+    pub fn entry_point(&self) -> u64 {
+        self.entry_point
+    }
+
+    /// Size of the stack reserved for this image.
+    pub fn stack_size(&self) -> usize {
+        self.stack_size
+    }
+
+    /// Program header metadata if available.
+    pub fn program_headers(&self) -> Option<&ProgramHeaderTable> {
+        self.program_headers.as_ref()
+    }
+}
+
+/// Captures the program header table location exposed to user space.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgramHeaderTable {
+    /// Virtual address of the first program header entry.
+    pub address: u64,
+    /// Size in bytes of each program header entry.
+    pub entry_size: u16,
+    /// Number of entries present in the table.
+    pub count: u16,
+}
+
+/// Result of building an address space, including metadata useful for process setup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AddressSpaceBuild {
+    /// Fully prepared address space mapping.
+    pub space: AddressSpace,
+    /// Layout information for the primary executable.
+    pub program: ProgramLayoutInfo,
+    /// Layout information for the interpreter, if present.
+    pub interpreter: Option<ProgramLayoutInfo>,
+}
+
+/// Effective user and group identifiers exposed to user space via auxv entries.
+#[derive(Clone, Copy, Debug)]
+pub struct StackUserIds {
+    /// Real user identifier.
+    pub uid: u32,
+    /// Real group identifier.
+    pub gid: u32,
+    /// Effective user identifier.
+    pub euid: u32,
+    /// Effective group identifier.
+    pub egid: u32,
+}
+
+/// Result of preparing the initial stack image for a freshly exec'd process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StackInitialization {
+    /// Stack pointer where user execution should begin.
+    pub stack_pointer: u64,
+    /// Optional byte payload that must be copied into the stack mapping.
+    pub image: Option<StackImage>,
+}
+
+/// Builds argc/argv/envp/auxv layout for a new process stack.
+pub fn prepare_initial_stack(
+    stack: &Stack,
+    argv: &[String],
+    env: &[(String, String)],
+    program_layout: &ProgramLayoutInfo,
+    interpreter_layout: Option<&ProgramLayoutInfo>,
+    entry_point: u64,
+    ids: StackUserIds,
+    exec_path: &str,
+) -> Result<StackInitialization, SubsystemError> {
+    let mut builder = StackInitializer::new(stack);
+
+    let mut argv_pointers = Vec::with_capacity(argv.len());
+    for arg in argv {
+        let ptr = builder.push_cstring(arg).map_err(SubsystemError::from)?;
+        argv_pointers.push(ptr);
+    }
+
+    let mut env_pointers = Vec::with_capacity(env.len());
+    for (key, value) in env {
+        let entry = format!("{}={}", key, value);
+        let ptr = builder.push_cstring(&entry).map_err(SubsystemError::from)?;
+        env_pointers.push(ptr);
+    }
+
+    let execfn_ptr = builder
+        .push_cstring(exec_path)
+        .map_err(SubsystemError::from)?;
+
+    let random_seed = entry_point ^ stack.top();
+    let random_bytes = pseudo_random_bytes(random_seed);
+    let random_ptr = builder
+        .push_bytes(&random_bytes, 16)
+        .map_err(SubsystemError::from)?;
+
+    builder.align_down(16).map_err(SubsystemError::from)?;
+
+    let (phdr, phent, phnum) = if let Some(headers) = program_layout.program_headers.as_ref() {
+        (
+            headers.address,
+            u64::from(headers.entry_size),
+            u64::from(headers.count),
+        )
+    } else {
+        (0, 0, 0)
+    };
+
+    let mut auxv = Vec::new();
+    auxv.push((AUXV_AT_PHDR, phdr));
+    auxv.push((AUXV_AT_PHENT, phent));
+    auxv.push((AUXV_AT_PHNUM, phnum));
+    auxv.push((AUXV_AT_PAGESZ, PAGE_SIZE));
+    if let Some(layout) = interpreter_layout {
+        auxv.push((AUXV_AT_BASE, layout.base_address));
+    }
+    auxv.push((AUXV_AT_ENTRY, entry_point));
+    auxv.push((AUXV_AT_UID, ids.uid as u64));
+    auxv.push((AUXV_AT_EUID, ids.euid as u64));
+    auxv.push((AUXV_AT_GID, ids.gid as u64));
+    auxv.push((AUXV_AT_EGID, ids.egid as u64));
+    auxv.push((AUXV_AT_SECURE, 0));
+    auxv.push((AUXV_AT_CLKTCK, 100));
+    auxv.push((AUXV_AT_EXECFN, execfn_ptr));
+    auxv.push((AUXV_AT_RANDOM, random_ptr));
+    auxv.push((AUXV_AT_NULL, 0));
+
+    for (key, value) in auxv.iter().rev() {
+        builder.push_u64(*value).map_err(SubsystemError::from)?;
+        builder.push_u64(*key).map_err(SubsystemError::from)?;
+    }
+
+    let mut env_entries = env_pointers;
+    env_entries.push(0);
+    for ptr in env_entries.iter().rev() {
+        builder.push_u64(*ptr).map_err(SubsystemError::from)?;
+    }
+
+    let mut argv_entries = argv_pointers;
+    argv_entries.push(0);
+    for ptr in argv_entries.iter().rev() {
+        builder.push_u64(*ptr).map_err(SubsystemError::from)?;
+    }
+
+    builder.align_down(16).map_err(SubsystemError::from)?;
+
+    debug_assert_eq!(builder.current_sp() & 0xF, 0);
+
+    let argc = (argv_entries.len() - 1) as u64;
+    builder.push_u64(argc).map_err(SubsystemError::from)?;
+
+    debug_assert_eq!(builder.current_sp() & 0xF, 8);
+
+    let result = builder.finalize().map_err(SubsystemError::from)?;
+    Ok(StackInitialization {
+        stack_pointer: result.sp,
+        image: result.image,
+    })
+}
+
+struct StackInitializer {
+    base: u64,
+    size: usize,
+    sp: u64,
+    writes: Vec<(u64, Vec<u8>)>,
+}
+
+impl StackInitializer {
+    fn new(stack: &Stack) -> Self {
+        Self {
+            base: stack.base,
+            size: stack.size,
+            sp: stack.top(),
+            writes: Vec::new(),
+        }
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8], align: usize) -> Result<u64, StackBuilderError> {
+        let len = bytes.len() as u64;
+        let mut new_sp = self
+            .sp
+            .checked_sub(len)
+            .ok_or(StackBuilderError::Overflow)?;
+        if align > 1 {
+            let mask = (align as u64) - 1;
+            new_sp &= !mask;
+        }
+        if new_sp < self.base {
+            return Err(StackBuilderError::Overflow);
+        }
+        self.sp = new_sp;
+        let addr = self.sp;
+        self.writes.push((addr, bytes.to_vec()));
+        Ok(addr)
+    }
+
+    fn push_cstring(&mut self, value: &str) -> Result<u64, StackBuilderError> {
+        let mut bytes = Vec::with_capacity(value.len() + 1);
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(0);
+        self.push_bytes(&bytes, 1)
+    }
+
+    fn push_u64(&mut self, value: u64) -> Result<u64, StackBuilderError> {
+        self.push_bytes(&value.to_le_bytes(), core::mem::size_of::<u64>())
+    }
+
+    fn align_down(&mut self, align: usize) -> Result<(), StackBuilderError> {
+        if align <= 1 {
+            return Ok(());
+        }
+        let mask = (align as u64) - 1;
+        let aligned = self.sp & !mask;
+        if aligned < self.base {
+            return Err(StackBuilderError::Overflow);
+        }
+        self.sp = aligned;
+        Ok(())
+    }
+
+    fn current_sp(&self) -> u64 {
+        self.sp
+    }
+
+    fn finalize(self) -> Result<StackBuildResult, StackBuilderError> {
+        let top = self.base + self.size as u64;
+        let used = top
+            .checked_sub(self.sp)
+            .ok_or(StackBuilderError::Overflow)? as usize;
+        if used == 0 {
+            return Ok(StackBuildResult {
+                sp: self.sp,
+                image: None,
+            });
+        }
+        let mut data = vec![0u8; used];
+        for (addr, bytes) in self.writes {
+            let start = addr
+                .checked_sub(self.sp)
+                .ok_or(StackBuilderError::Overflow)? as usize;
+            let end = start + bytes.len();
+            if end > data.len() {
+                return Err(StackBuilderError::Overflow);
+            }
+            data[start..end].copy_from_slice(&bytes);
+        }
+        Ok(StackBuildResult {
+            sp: self.sp,
+            image: Some(StackImage {
+                offset: (self.sp - self.base) as usize,
+                data,
+            }),
+        })
+    }
+}
+
+struct StackBuildResult {
+    sp: u64,
+    image: Option<StackImage>,
+}
+
+#[derive(Debug)]
+enum StackBuilderError {
+    Overflow,
+}
+
+impl From<StackBuilderError> for SubsystemError {
+    fn from(_: StackBuilderError) -> Self {
+        SubsystemError::Runtime("initial stack construction overflow")
+    }
+}
+
+fn pseudo_random_bytes(seed: u64) -> [u8; 16] {
+    let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let mut output = [0u8; 16];
+    for chunk in output.chunks_mut(8) {
+        state ^= state << 7;
+        state ^= state >> 9;
+        state ^= state << 8;
+        let bytes = state.to_le_bytes();
+        let len = chunk.len();
+        chunk.copy_from_slice(&bytes[..len]);
+    }
+    output
+}
 impl AddressSpace {
     fn from_segment_mappings(
         entry_point: u64,
@@ -273,6 +705,7 @@ struct ImagePlacement {
     segments: Vec<SegmentMapping>,
     entry: u64,
     end: u64,
+    bias: u64,
 }
 
 fn layout_image(image: &ExecutableImage, preferred_start: u64) -> ImagePlacement {
@@ -306,6 +739,7 @@ fn layout_image(image: &ExecutableImage, preferred_start: u64) -> ImagePlacement
         segments,
         entry,
         end,
+        bias,
     }
 }
 
@@ -442,6 +876,7 @@ mod tests {
                 writable: false,
                 executable: true,
             },
+            file_offset: 0,
         }];
         let image = ExecutableImage::from_parts(0x401000, segments).expect("image valid");
         let layout = AddressSpace::from_executable(&image, StackConfig::default());

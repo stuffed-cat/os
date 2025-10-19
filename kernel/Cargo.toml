@@ -16,6 +16,7 @@ std = ["alloc"]
 alloc = []
 hardware = ["x86_64/abi_x86_interrupt"]
 baremetal = ["alloc", "hardware"]
+boot = ["baremetal"]
 
 [dependencies]
 bitflags = "2.4"

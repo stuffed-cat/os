@@ -265,21 +265,22 @@ impl<'a> PosixLayer<'a> {
 
                 #[cfg(not(feature = "std"))]
                 {
-                    let mut total = 0;
-                    while total < buffer.len() {
-                        let read = shell::read_console(&mut buffer[total..]);
+                    // Block until at least one byte is available
+                    loop {
+                        let read = shell::read_console(buffer);
                         if read > 0 {
-                            total += read;
-                            break;
+                            return Ok(read as u64);
                         }
 
+                        // No data yet, sleep for a short duration then retry
                         if let Some(scheduler) = Scheduler::global() {
-                            scheduler.yield_current();
+                            use core::time::Duration;
+                            scheduler.sleep_current(Duration::from_millis(10));
                         } else {
-                            break;
+                            // If scheduler not available, return 0 (shouldn't happen)
+                            return Ok(0);
                         }
                     }
-                    Ok(total as u64)
                 }
             }
             Descriptor::Pipe {

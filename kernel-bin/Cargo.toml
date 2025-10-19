@@ -11,7 +11,7 @@ default = []
 boot = []
 
 [dependencies]
-kernel = { path = "../kernel", default-features = false, features = ["baremetal"] }
+kernel = { path = "../kernel", default-features = false, features = ["boot"] }
 x86_64 = { version = "0.15", default-features = false, features = ["instructions"] }
 spin = "0.9"
 uart_16550 = "0.2"

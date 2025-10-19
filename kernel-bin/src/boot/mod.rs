@@ -63,6 +63,11 @@ pub fn start(boot_info: &'static mut BootInfo, allocator: &'static LockedHeap) -
     hal.enable_interrupts();
     serial::write_str("kernel: interrupts enabled\r\n");
 
+    // Initialize IDT and load it before creating kernel
+    kernel::arch::x86_64::idt::init();
+    kernel::arch::x86_64::idt::load();
+    serial::write_str("kernel: IDT initialized\r\n");
+
     let mut kernel = KernelBuilder::default()
         .with_hal(hal)
         .with_subsystem(kernel::shell::ShellSubsystem::new())
