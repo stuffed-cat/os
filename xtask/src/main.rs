@@ -217,6 +217,7 @@ fn generate_command_binaries(workspace_root: &Path) -> Result<()> {
     }
 
     copy_userland_execs(workspace_root, &bin_dir)?;
+    copy_runtime_libraries(workspace_root)?;
 
     Ok(())
 }
@@ -284,6 +285,66 @@ fn copy_userland_execs(workspace_root: &Path, bin_dir: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn copy_runtime_libraries(workspace_root: &Path) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = workspace_root; // suppress unused warning on non-Linux hosts.
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let assets_dir = workspace_root.join("assets").join("rootfs");
+
+        let targets = [
+            (
+                Path::new("/lib64/ld-linux-x86-64.so.2"),
+                assets_dir.join("lib64").join("ld-linux-x86-64.so.2"),
+            ),
+            (
+                Path::new("/lib/x86_64-linux-gnu/libc.so.6"),
+                assets_dir
+                    .join("lib")
+                    .join("x86_64-linux-gnu")
+                    .join("libc.so.6"),
+            ),
+            (
+                Path::new("/lib/x86_64-linux-gnu/libgcc_s.so.1"),
+                assets_dir
+                    .join("lib")
+                    .join("x86_64-linux-gnu")
+                    .join("libgcc_s.so.1"),
+            ),
+        ];
+
+        for (src, dest) in targets.iter() {
+            if !src.exists() {
+                bail!(
+                    "required runtime library {} not found on host; install glibc development files",
+                    src.display()
+                );
+            }
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "failed to create runtime lib directory {}",
+                        parent.display()
+                    )
+                })?;
+            }
+            fs::copy(src, dest).with_context(|| {
+                format!(
+                    "failed to copy runtime library from {} to {}",
+                    src.display(),
+                    dest.display()
+                )
+            })?;
+        }
+
+        Ok(())
+    }
 }
 
 fn build_command_module(command_id: u8, command_name: &str) -> Result<Vec<u8>> {

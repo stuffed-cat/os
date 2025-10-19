@@ -26,3 +26,7 @@ third_party/
 assets/rootfs.*
 assets/rootfs/bin/
 !assets/rootfs/bin/.gitkeep
+assets/rootfs/lib/
+!assets/rootfs/lib/.gitkeep
+assets/rootfs/lib64/
+!assets/rootfs/lib64/.gitkeep

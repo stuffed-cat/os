@@ -4,7 +4,7 @@
 
 ## 文档结构
 
-- [`architecture.md`](architecture.md)：系统架构、关键模块与混合内核设计要点。
+- [`architecture.md`](architecture.md)：系统架构、关键模块、用户态 shell 启动流程与最新技术路线。
 - [`development.md`](development.md)：开发环境准备、常用命令与测试策略。
 - [`modules.md`](modules.md)：内核与用户态各模块的职责、关键类型以及交互关系。
 - [`elf.md`](elf.md)：ELF64 加载流程、段校验逻辑、TLS 模板与栈权限处理。

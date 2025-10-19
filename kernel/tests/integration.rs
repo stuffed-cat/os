@@ -182,13 +182,22 @@ fn user_preemption_preserves_user_context() {
     process.add_thread(tid1, ThreadState::new_user(ctx1.clone(), root1));
     process.add_thread(tid2, ThreadState::new_user(ctx2.clone(), root2));
 
-    scheduler.enqueue(RunQueueEntry::user(process.pid(), tid1, ThreadPriority::Normal));
-    scheduler.enqueue(RunQueueEntry::user(process.pid(), tid2, ThreadPriority::Normal));
+    scheduler.enqueue(RunQueueEntry::user(
+        process.pid(),
+        tid1,
+        ThreadPriority::Normal,
+    ));
+    scheduler.enqueue(RunQueueEntry::user(
+        process.pid(),
+        tid2,
+        ThreadPriority::Normal,
+    ));
 
     let first = scheduler.pick_next().expect("first thread scheduled");
     assert_eq!(first.tid, tid1);
-    let (mut running_ctx, running_root) =
-        process.take_thread_runtime(tid1).expect("context for first thread");
+    let (mut running_ctx, running_root) = process
+        .take_thread_runtime(tid1)
+        .expect("context for first thread");
     assert_eq!(running_root, root1);
     running_ctx.frame_mut().rax = 0x99;
 
@@ -199,8 +208,9 @@ fn user_preemption_preserves_user_context() {
             assert!(process.store_thread_context(tid1, running_ctx.clone()));
             let next = outcome.next.expect("next thread selected");
             assert_eq!(next.tid, tid2);
-            let (queued_ctx, queued_root) =
-                process.take_thread_runtime(tid2).expect("context for second thread");
+            let (queued_ctx, queued_root) = process
+                .take_thread_runtime(tid2)
+                .expect("context for second thread");
             assert_eq!(queued_root, root2);
             assert_eq!(queued_ctx.frame().rax, ctx2.frame().rax);
             assert!(process.store_thread_context(tid2, queued_ctx));
@@ -220,6 +230,8 @@ fn kernel_context_round_trip() {
     context.r12 = 0x1234_5678_9abc_def0;
 
     assert!(process.store_kernel_context(tid, context.clone()));
-    let restored = process.take_kernel_context(tid).expect("kernel context present");
+    let restored = process
+        .take_kernel_context(tid)
+        .expect("kernel context present");
     assert_eq!(restored.r12, context.r12);
 }

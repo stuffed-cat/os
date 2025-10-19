@@ -162,6 +162,16 @@ impl ThreadState {
         self.page_table_root
     }
 
+    /// Updates the CR3 root frame backing this thread's address space.
+    pub fn set_page_table_root(&mut self, root: PhysFrame) {
+        self.page_table_root = Some(root);
+    }
+
+    /// Clears the stored page table root for this thread.
+    pub fn clear_page_table_root(&mut self) {
+        self.page_table_root = None;
+    }
+
     /// Consumes the stored user context and returns it together with the page table root.
     pub fn take_runtime_state(&mut self) -> Option<(UserContext, PhysFrame)> {
         let context = self.context.take()?;
@@ -582,6 +592,16 @@ impl Scheduler {
     /// Returns the total number of scheduler ticks observed.
     pub fn current_tick(&self) -> u64 {
         self.inner.lock().tick
+    }
+
+    /// Returns the currently running thread, if one is scheduled.
+    pub fn current_thread(&self) -> Option<RunQueueEntry> {
+        let inner = self.inner.lock();
+        let running = match inner.current {
+            Some(running) => running,
+            None => return None,
+        };
+        inner.threads.get(&running.key).map(|info| info.entry)
     }
 
     fn duration_to_ticks(&self, duration: Duration) -> u64 {

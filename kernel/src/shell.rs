@@ -1,42 +1,150 @@
-//! Userland shell coordinator running inside the kernel event loop.
+//! Shell bootstrapper that spawns the initial user-mode process and bridges
+//! console input between interrupts and the POSIX layer.
 
 use crate::arch::x86_64::serial;
 use crate::core::{KernelContext, Subsystem, SubsystemId};
 use crate::error::SubsystemError;
-use crate::fs::{self, EntryKind as FsEntryKind, FsError as KernelFsError};
 use crate::memory::MemoryManager;
 use crate::process::ProcessTable;
 #[cfg(not(feature = "std"))]
 use crate::scheduler::SchedulingClass;
 use crate::scheduler::{RunQueueEntry, Scheduler, ThreadPriority, ThreadStatus};
-use crate::session::{self, UserSession};
-use crate::users::{self, UserError, UserProfile};
+use crate::session;
+use crate::syscall::SyscallDispatcher;
+use crate::users;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
-use alloc::format;
-use alloc::string::ToString;
-use alloc::vec::Vec;
-#[cfg(not(feature = "std"))]
-use core::task::Poll;
+use alloc::string::String;
 use log::info;
 #[cfg(not(feature = "std"))]
 use log::warn;
-use spin::Mutex;
-use userland::{
-    AuthError, BareShell, DirEntry, EntryKind, ExecResult, FsError as ShellFsError, ShellFs,
-    ShellIo, ShellSystem, SystemError, UserAdminError, UserIdentity,
-};
+use pc_keyboard::layouts::Us104Key;
+use pc_keyboard::{DecodedKey, HandleControl, Keyboard, ScancodeSet1};
+use spin::{Lazy, Mutex};
 
 const SCANCODE_QUEUE_CAPACITY: usize = 256;
+const CONSOLE_BUFFER_CAPACITY: usize = 4096;
 
-static SCANCODE_QUEUE: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
+struct ConsoleState {
+    keyboard: Keyboard<Us104Key, ScancodeSet1>,
+    scancodes: VecDeque<u8>,
+    buffer: VecDeque<u8>,
+}
 
-/// Shell subsystem bridging keyboard interrupts and the userland shell loop.
+impl ConsoleState {
+    fn new() -> Self {
+        Self {
+            keyboard: Keyboard::new(ScancodeSet1::new(), Us104Key, HandleControl::Ignore),
+            scancodes: VecDeque::with_capacity(SCANCODE_QUEUE_CAPACITY),
+            buffer: VecDeque::with_capacity(CONSOLE_BUFFER_CAPACITY),
+        }
+    }
+
+    fn push_scancode(&mut self, scancode: u8) {
+        if self.scancodes.len() >= SCANCODE_QUEUE_CAPACITY {
+            self.scancodes.pop_front();
+        }
+        self.scancodes.push_back(scancode);
+        self.process_scancodes();
+    }
+
+    fn process_scancodes(&mut self) {
+        while let Some(code) = self.scancodes.pop_front() {
+            if let Ok(Some(event)) = self.keyboard.add_byte(code) {
+                if let Some(decoded) = self.keyboard.process_keyevent(event) {
+                    if let DecodedKey::Unicode(ch) = decoded {
+                        self.queue_char(ch);
+                    }
+                }
+            }
+        }
+    }
+
+    fn queue_char(&mut self, ch: char) {
+        match ch {
+            '\r' => {
+                self.push_byte(b'\n');
+                serial::write_str("\r\n");
+            }
+            '\n' => {
+                self.push_byte(b'\n');
+                serial::write_str("\r\n");
+            }
+            '\u{8}' | '\u{7f}' => {
+                if self.buffer.pop_back().is_some() {
+                    serial::write_str("\u{8} \u{20} \u{8}");
+                }
+            }
+            other => {
+                let mut buf = [0u8; 4];
+                let encoded = other.encode_utf8(&mut buf);
+                for byte in encoded.as_bytes() {
+                    self.push_byte(*byte);
+                }
+                serial::write_str(encoded);
+            }
+        }
+    }
+
+    fn push_byte(&mut self, byte: u8) {
+        if self.buffer.len() >= CONSOLE_BUFFER_CAPACITY {
+            self.buffer.pop_front();
+        }
+        self.buffer.push_back(byte);
+    }
+
+    fn read(&mut self, out: &mut [u8]) -> usize {
+        if out.is_empty() {
+            return 0;
+        }
+        self.process_scancodes();
+        let mut count = 0;
+        while count < out.len() {
+            match self.buffer.pop_front() {
+                Some(byte) => {
+                    out[count] = byte;
+                    count += 1;
+                    if byte == b'\n' {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+        count
+    }
+
+    fn has_data(&mut self) -> bool {
+        self.process_scancodes();
+        !self.buffer.is_empty()
+    }
+}
+
+static CONSOLE: Lazy<Mutex<ConsoleState>> = Lazy::new(|| Mutex::new(ConsoleState::new()));
+
+/// Enqueues a raw keyboard scancode produced by the hardware interrupt handler.
+pub fn enqueue_scancode(scancode: u8) {
+    let mut console = CONSOLE.lock();
+    console.push_scancode(scancode);
+}
+
+/// Reads buffered console input into the provided slice, returning the number of bytes copied.
+pub fn read_console(buffer: &mut [u8]) -> usize {
+    let mut console = CONSOLE.lock();
+    console.read(buffer)
+}
+
+/// Returns whether buffered console input is currently available.
+pub fn console_has_data() -> bool {
+    let mut console = CONSOLE.lock();
+    console.has_data()
+}
+
+/// Shell subsystem responsible for launching the initial user process.
 pub struct ShellSubsystem {
-    shell: BareShell<SerialShellIo, KernelShellFs, KernelShellSystem>,
     process_table: &'static ProcessTable,
-    #[cfg_attr(feature = "std", allow(dead_code))]
     scheduler: &'static Scheduler,
+    init_spawned: bool,
 }
 
 impl ShellSubsystem {
@@ -46,21 +154,57 @@ impl ShellSubsystem {
         process_table.register_global();
         let scheduler = Box::leak(Box::new(Scheduler::new()));
         scheduler.start_preemption();
-        let system = KernelShellSystem::new(process_table, scheduler);
+        let dispatcher = Box::leak(Box::new(SyscallDispatcher::new(process_table)));
+        dispatcher.register_global();
 
         Self {
-            shell: BareShell::new(SerialShellIo, KernelShellFs, system),
             process_table,
             scheduler,
+            init_spawned: false,
         }
     }
 
-    fn poll_shell(&mut self) {
-        self.shell.poll();
+    fn launch_initial_user(&self) -> Result<(), SubsystemError> {
+        session::reset_to_root();
+        let profile = users::root_profile();
+        let shell_path = if profile.shell.is_empty() {
+            String::from("/bin/sh")
+        } else {
+            profile.shell.clone()
+        };
+
+        let process = self.process_table.spawn();
+        process.set_credentials(profile.uid, profile.gid, profile.groups.clone());
+        process.set_cwd(profile.home.clone());
+        process.set_env(String::from("HOME"), profile.home.clone());
+        process.set_env(String::from("PWD"), profile.home.clone());
+        process.set_env(String::from("USER"), profile.username.clone());
+        process.set_env(String::from("SHELL"), shell_path.clone());
+        process.set_env(
+            String::from("PATH"),
+            String::from("/bin:/usr/bin:/usr/local/bin"),
+        );
+        process.set_env(String::from("TERM"), String::from("nexa-console"));
+
+        self.process_table.exec(process.pid(), shell_path)?;
+
+        let (tid, _) = process
+            .main_thread()
+            .ok_or(SubsystemError::Runtime("exec produced no runnable thread"))?;
+        process.set_thread_status(tid, ThreadStatus::Ready);
+        let priority = process
+            .thread_state(tid)
+            .map(|state| state.priority())
+            .unwrap_or(ThreadPriority::Normal);
+        self.scheduler
+            .enqueue(RunQueueEntry::user(process.pid(), tid, priority));
+        Ok(())
     }
 
     #[cfg(not(feature = "std"))]
     fn run_ready_threads(&mut self) {
+        use core::task::Poll;
+
         while let Poll::Ready(entry) = self.scheduler.tick() {
             match entry.class {
                 SchedulingClass::User => {
@@ -104,420 +248,19 @@ impl Subsystem for ShellSubsystem {
                 unsafe { &*(hal.memory() as *const MemoryManager) };
             self.process_table.bind_memory_manager(manager);
         }
-        info!("userland shell initialized");
+
+        if !self.init_spawned {
+            self.launch_initial_user()?;
+            self.init_spawned = true;
+            info!("initial user shell spawned");
+        }
+
         Ok(())
     }
 
     fn tick(&mut self, _ctx: &KernelContext) -> Result<(), SubsystemError> {
-        self.poll_shell();
         #[cfg(not(feature = "std"))]
         self.run_ready_threads();
         Ok(())
-    }
-}
-
-/// Serial-backed shell IO implementation.
-struct SerialShellIo;
-
-impl ShellIo for SerialShellIo {
-    fn next_scancode(&mut self) -> Option<u8> {
-        let mut queue = SCANCODE_QUEUE.lock();
-        queue.pop_front()
-    }
-
-    fn write_str(&mut self, s: &str) {
-        serial::write_str(s);
-    }
-}
-
-struct KernelShellFs;
-
-#[derive(Clone, Copy)]
-struct KernelShellSystem {
-    process_table: &'static ProcessTable,
-    scheduler: &'static Scheduler,
-    hostname: &'static str,
-}
-
-impl KernelShellSystem {
-    fn new(process_table: &'static ProcessTable, scheduler: &'static Scheduler) -> Self {
-        Self {
-            process_table,
-            scheduler,
-            hostname: "nexa-os",
-        }
-    }
-}
-
-impl ShellFs for KernelShellFs {
-    fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>, ShellFsError> {
-        match fs::list_dir(path) {
-            Ok(entries) => Ok(entries
-                .into_iter()
-                .map(|entry| DirEntry {
-                    name: entry.name,
-                    kind: match entry.kind {
-                        FsEntryKind::Directory => EntryKind::Directory,
-                        FsEntryKind::File => EntryKind::File,
-                    },
-                    size: entry.size,
-                    mode: entry.mode,
-                    uid: entry.uid,
-                    gid: entry.gid,
-                    inode: entry.inode,
-                })
-                .collect()),
-            Err(KernelFsError::NotInitialized | KernelFsError::Unsupported) => {
-                Err(ShellFsError::Unavailable)
-            }
-            Err(KernelFsError::InvalidImage) => Err(ShellFsError::Corrupt),
-            Err(KernelFsError::AlreadyExists) => Err(ShellFsError::Corrupt),
-            Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
-            Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
-            Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
-            Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
-            Err(KernelFsError::DirectoryNotEmpty) => Err(ShellFsError::DirectoryNotEmpty),
-        }
-    }
-
-    fn read_file(&self, path: &str) -> Result<Vec<u8>, ShellFsError> {
-        match fs::read_file(path) {
-            Ok(data) => Ok(data),
-            Err(KernelFsError::NotInitialized | KernelFsError::Unsupported) => {
-                Err(ShellFsError::Unavailable)
-            }
-            Err(KernelFsError::InvalidImage) => Err(ShellFsError::Corrupt),
-            Err(KernelFsError::AlreadyExists) => Err(ShellFsError::Corrupt),
-            Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
-            Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
-            Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
-            Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
-            Err(KernelFsError::DirectoryNotEmpty) => Err(ShellFsError::DirectoryNotEmpty),
-        }
-    }
-
-    fn create_file(&self, path: &str, mode: u16) -> Result<(), ShellFsError> {
-        match fs::create_file(path, mode) {
-            Ok(_) => Ok(()),
-            Err(KernelFsError::NotInitialized | KernelFsError::Unsupported) => {
-                Err(ShellFsError::Unavailable)
-            }
-            Err(KernelFsError::InvalidImage) => Err(ShellFsError::Corrupt),
-            Err(KernelFsError::AlreadyExists) => Err(ShellFsError::AlreadyExists),
-            Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
-            Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
-            Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
-            Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
-            Err(KernelFsError::DirectoryNotEmpty) => Err(ShellFsError::DirectoryNotEmpty),
-        }
-    }
-
-    fn create_dir(&self, path: &str, mode: u16) -> Result<(), ShellFsError> {
-        match fs::create_dir(path, mode) {
-            Ok(_) => Ok(()),
-            Err(KernelFsError::NotInitialized | KernelFsError::Unsupported) => {
-                Err(ShellFsError::Unavailable)
-            }
-            Err(KernelFsError::InvalidImage) => Err(ShellFsError::Corrupt),
-            Err(KernelFsError::AlreadyExists) => Err(ShellFsError::AlreadyExists),
-            Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
-            Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
-            Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
-            Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
-            Err(KernelFsError::DirectoryNotEmpty) => Err(ShellFsError::DirectoryNotEmpty),
-        }
-    }
-
-    fn remove_file(&self, path: &str) -> Result<(), ShellFsError> {
-        match fs::remove_file(path) {
-            Ok(_) => Ok(()),
-            Err(KernelFsError::NotInitialized | KernelFsError::Unsupported) => {
-                Err(ShellFsError::Unavailable)
-            }
-            Err(KernelFsError::InvalidImage) => Err(ShellFsError::Corrupt),
-            Err(KernelFsError::AlreadyExists) => Err(ShellFsError::Corrupt),
-            Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
-            Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
-            Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
-            Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
-            Err(KernelFsError::DirectoryNotEmpty) => Err(ShellFsError::DirectoryNotEmpty),
-        }
-    }
-
-    fn remove_dir(&self, path: &str) -> Result<(), ShellFsError> {
-        match fs::remove_dir(path) {
-            Ok(_) => Ok(()),
-            Err(KernelFsError::NotInitialized | KernelFsError::Unsupported) => {
-                Err(ShellFsError::Unavailable)
-            }
-            Err(KernelFsError::InvalidImage) => Err(ShellFsError::Corrupt),
-            Err(KernelFsError::AlreadyExists) => Err(ShellFsError::Corrupt),
-            Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
-            Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
-            Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
-            Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
-            Err(KernelFsError::DirectoryNotEmpty) => Err(ShellFsError::DirectoryNotEmpty),
-        }
-    }
-
-    fn write_file(
-        &self,
-        path: &str,
-        offset: usize,
-        data: &[u8],
-        truncate: bool,
-    ) -> Result<usize, ShellFsError> {
-        match fs::write_file(path, offset, data, truncate) {
-            Ok(written) => Ok(written),
-            Err(KernelFsError::NotInitialized | KernelFsError::Unsupported) => {
-                Err(ShellFsError::Unavailable)
-            }
-            Err(KernelFsError::InvalidImage) => Err(ShellFsError::Corrupt),
-            Err(KernelFsError::AlreadyExists) => Err(ShellFsError::Corrupt),
-            Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
-            Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
-            Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
-            Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
-            Err(KernelFsError::DirectoryNotEmpty) => Err(ShellFsError::DirectoryNotEmpty),
-        }
-    }
-
-    fn chmod(&self, path: &str, mode: u16) -> Result<(), ShellFsError> {
-        match fs::chmod(path, mode) {
-            Ok(_) => Ok(()),
-            Err(KernelFsError::NotInitialized | KernelFsError::Unsupported) => {
-                Err(ShellFsError::Unavailable)
-            }
-            Err(KernelFsError::InvalidImage) => Err(ShellFsError::Corrupt),
-            Err(KernelFsError::AlreadyExists) => Err(ShellFsError::Corrupt),
-            Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
-            Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
-            Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
-            Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
-            Err(KernelFsError::DirectoryNotEmpty) => Err(ShellFsError::DirectoryNotEmpty),
-        }
-    }
-
-    fn chown(&self, path: &str, uid: u32, gid: u32) -> Result<(), ShellFsError> {
-        match fs::chown(path, uid, gid) {
-            Ok(_) => Ok(()),
-            Err(KernelFsError::NotInitialized | KernelFsError::Unsupported) => {
-                Err(ShellFsError::Unavailable)
-            }
-            Err(KernelFsError::InvalidImage) => Err(ShellFsError::Corrupt),
-            Err(KernelFsError::AlreadyExists) => Err(ShellFsError::Corrupt),
-            Err(KernelFsError::NotFound) => Err(ShellFsError::NotFound),
-            Err(KernelFsError::PermissionDenied) => Err(ShellFsError::PermissionDenied),
-            Err(KernelFsError::NotDirectory) => Err(ShellFsError::NotDirectory),
-            Err(KernelFsError::NotFile) => Err(ShellFsError::NotFile),
-            Err(KernelFsError::DirectoryNotEmpty) => Err(ShellFsError::DirectoryNotEmpty),
-        }
-    }
-}
-
-impl ShellSystem for KernelShellSystem {
-    fn reboot(&self) -> Result<(), SystemError> {
-        #[cfg(feature = "hardware")]
-        {
-            crate::arch::x86_64::power::reboot();
-            return Ok(());
-        }
-
-        #[cfg(not(feature = "hardware"))]
-        {
-            Err(SystemError::Unsupported)
-        }
-    }
-
-    fn shutdown(&self) -> Result<(), SystemError> {
-        #[cfg(feature = "hardware")]
-        {
-            crate::arch::x86_64::power::shutdown();
-            return Ok(());
-        }
-
-        #[cfg(not(feature = "hardware"))]
-        {
-            Err(SystemError::Unsupported)
-        }
-    }
-
-    fn exec(
-        &self,
-        path: &str,
-        args: &[&str],
-        cwd: &str,
-        env: &[(&str, &str)],
-    ) -> Result<ExecResult, SystemError> {
-        let process = self.process_table.spawn();
-        let pid = process.pid();
-
-        process.set_cwd(cwd.to_string());
-        process.set_env("PWD".to_string(), cwd.to_string());
-
-        let display = path.rsplit('/').next().unwrap_or(path);
-        process.set_env("ARGV0".to_string(), display.to_string());
-        process.set_env("ARGC".to_string(), (args.len() + 1).to_string());
-        for (index, arg) in args.iter().enumerate() {
-            process.set_env(format!("ARG{}", index + 1), (*arg).to_string());
-        }
-
-        for &(key, value) in env {
-            process.set_env(key.to_string(), value.to_string());
-        }
-
-        let program = path.to_string();
-        if let Err(err) = self.process_table.exec(pid, program) {
-            return Err(map_exec_error(err));
-        }
-
-        let (tid, _) = process
-            .main_thread()
-            .ok_or(SystemError::InvalidExecutable)?;
-        process.set_thread_status(tid, ThreadStatus::Ready);
-        let priority = process
-            .thread_state(tid)
-            .map(|state| state.priority())
-            .unwrap_or(ThreadPriority::Normal);
-        self.scheduler
-            .enqueue(RunQueueEntry::user(pid, tid, priority));
-
-        Ok(ExecResult { pid: pid.as_u64() })
-    }
-
-    fn current_user(&self) -> UserIdentity {
-        session_to_identity(session::current_session())
-    }
-
-    fn authenticate(&self, username: &str, password: &str) -> Result<UserIdentity, AuthError> {
-        match users::authenticate(username, password) {
-            Ok(profile) => Ok(profile_to_identity(&profile)),
-            Err(err) => Err(map_user_error_to_auth(err)),
-        }
-    }
-
-    fn set_session(&self, user: &UserIdentity) -> Result<UserIdentity, AuthError> {
-        match users::get_user(&user.username) {
-            Some(profile) => {
-                session::set_session(&profile);
-                Ok(session_to_identity(session::current_session()))
-            }
-            None => Err(AuthError::NotFound),
-        }
-    }
-
-    fn create_user(
-        &self,
-        username: &str,
-        password: &str,
-        home: Option<&str>,
-    ) -> Result<UserIdentity, UserAdminError> {
-        match users::add_user(username, password, home, None) {
-            Ok(profile) => Ok(profile_to_identity(&profile)),
-            Err(err) => Err(map_user_error_to_admin(err)),
-        }
-    }
-
-    fn set_password(&self, username: &str, password: &str) -> Result<(), UserAdminError> {
-        match users::set_password(username, password) {
-            Ok(()) => Ok(()),
-            Err(err) => Err(map_user_error_to_admin(err)),
-        }
-    }
-
-    fn list_users(&self) -> Result<Vec<UserIdentity>, UserAdminError> {
-        Ok(users::list_users()
-            .into_iter()
-            .map(|profile| profile_to_identity(&profile))
-            .collect())
-    }
-
-    fn lookup_user(&self, username: &str) -> Option<UserIdentity> {
-        users::get_user(username).map(|profile| profile_to_identity(&profile))
-    }
-
-    fn hostname(&self) -> &str {
-        self.hostname
-    }
-}
-
-/// Enqueues a raw keyboard scancode for shell processing.
-pub fn enqueue_scancode(scancode: u8) {
-    let mut queue = SCANCODE_QUEUE.lock();
-    if queue.len() >= SCANCODE_QUEUE_CAPACITY {
-        queue.pop_front();
-    }
-    queue.push_back(scancode);
-}
-
-fn map_exec_error(err: SubsystemError) -> SystemError {
-    match err {
-        SubsystemError::Runtime(msg) => match msg {
-            "executable not found" => SystemError::NotFound,
-            "filesystem unavailable" => SystemError::FilesystemUnavailable,
-            "permission denied" => SystemError::PermissionDenied,
-            "invalid executable magic"
-            | "unsupported elf class"
-            | "unsupported elf endian"
-            | "unsupported elf type"
-            | "unsupported elf arch"
-            | "corrupt program header"
-            | "corrupt segment"
-            | "executable truncated"
-            | "executable missing segments"
-            | "interpreter truncated"
-            | "interpreter invalid magic"
-            | "interpreter unsupported class"
-            | "interpreter unsupported endian"
-            | "interpreter unsupported type"
-            | "interpreter unsupported arch"
-            | "interpreter corrupt program header"
-            | "interpreter corrupt segment"
-            | "interpreter missing segments"
-            | "interpreter recursion detected" => SystemError::InvalidExecutable,
-            "interpreter not found" => SystemError::MissingInterpreter,
-            "interpreter read failure" => SystemError::Failed,
-            _ => SystemError::Failed,
-        },
-        SubsystemError::Init(_) | SubsystemError::Resource(_) => SystemError::Failed,
-    }
-}
-
-fn profile_to_identity(profile: &UserProfile) -> UserIdentity {
-    UserIdentity {
-        username: profile.username.clone(),
-        uid: profile.uid,
-        gid: profile.gid,
-        groups: profile.groups.clone(),
-        home: profile.home.clone(),
-        shell: profile.shell.clone(),
-    }
-}
-
-fn session_to_identity(session: UserSession) -> UserIdentity {
-    UserIdentity {
-        username: session.username,
-        uid: session.uid,
-        gid: session.gid,
-        groups: session.groups,
-        home: session.home,
-        shell: session.shell,
-    }
-}
-
-fn map_user_error_to_auth(err: UserError) -> AuthError {
-    match err {
-        UserError::AlreadyExists => AuthError::Unsupported,
-        UserError::NotFound => AuthError::NotFound,
-        UserError::InvalidPassword | UserError::AuthenticationFailed => AuthError::InvalidPassword,
-    }
-}
-
-fn map_user_error_to_admin(err: UserError) -> UserAdminError {
-    match err {
-        UserError::AlreadyExists => UserAdminError::AlreadyExists,
-        UserError::NotFound => UserAdminError::NotFound,
-        UserError::InvalidPassword => UserAdminError::InvalidPassword,
-        UserError::AuthenticationFailed => UserAdminError::PermissionDenied,
     }
 }

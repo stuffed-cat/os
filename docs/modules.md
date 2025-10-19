@@ -29,11 +29,13 @@
 ### `process`
 - **职责**：进程表（`ProcessTable`）、线程状态、文件描述符表、`exec`/`fork` 生命周期管理。
 - **关键类型**：`Process`、`ThreadState`、`UserContext`。
+- **近期更新**：`exec` 会解析 ELF 的 `PT_INTERP` 段，把主程序与解释器镜像同时写入进程控制块，并根据 `AddressSpace::from_executable_pair` 构造统一的用户地址空间；`fork` 后会调用 `rebuild_user_page_tables` 重建独立的 CR3。
 - **交互**：与 `scheduler` 协商线程调度，与 `fs` 进行文件读写，与 `elf` 协作加载可执行文件，并经 `syscall` 接口暴露给用户态。
 
 ### `scheduler`
 - **职责**：基于时间片的抢占式调度器，支持内核/用户线程优先级队列与定时器中断。
 - **关键类型**：`Scheduler`、`RunQueueEntry`、`ThreadStatus`。
+- **近期更新**：新增 `set_page_table_root`/`clear_page_table_root`，在用户线程运行前设置对应的 CR3；`tick` 可直接在无 host timer 的配置下驱动运行队列。
 - **交互**：通过 `hal` 获取时钟中断，调度 `process` 提供的线程，向 `ipc` 通知线程阻塞/唤醒事件。
 
 ### `ipc`
@@ -54,6 +56,7 @@
 ### `posix`
 - **职责**：POSIX 兼容层，把 Linux syscall 编号/errno 对应到内核内部实现。
 - **关键类型**：`PosixLayer`、`Errno`、路径规范化函数。
+- **近期更新**：`Descriptor::StdIn` 会调用 `shell::read_console` 提供阻塞式终端输入，`exec` 路径会为解释器注册环境变量（如 `INTERPRETER`、`INTERPRETEE`）。
 - **交互**：`syscall` 调用 `PosixLayer::dispatch` 处理 `read/open/fork/exec` 等操作。
 
 ### `syscall`
@@ -73,21 +76,20 @@
 - **交互**：`process::set_program_image` 调用 `AddressSpace::from_executable` 构造映射，并根据 ELF 的 `stack_flags` 与自定义 `StackConfig` 合并栈权限；`syscall` 在陷入/返回时读写 `TrapFrame`。
 
 ### `shell`
-- **职责**：内核内置的简易 shell 调度 `userland` 的命令以及 bare shell 的内建指令。
-- **关键类型**：`ShellSubsystem`、`KernelShellFs`、`KernelShellSystem`。
-- **交互**：监听串口输入（通过 `arch::x86_64::serial`），调用 `userland::BareShell`，并利用 `kernel::fs` 实现文件访问。
+- **职责**：管理串口/键盘输入缓冲，并在引导完成后通过 `ProcessTable::exec` 启动真实的用户态 shell（默认 `/bin/sh`）。
+- **关键类型**：`ShellSubsystem`、`ConsoleState`。
+- **交互**：监听键盘中断（`arch::x86_64::idt`），译码成 Unicode 后通过串口回显，同时把数据缓存到 `tty:stdin`；初始化阶段配置全局 `ProcessTable`、`Scheduler` 与 `SyscallDispatcher` 的单例引用。
 
 ## userland crate
 
-`userland` 提供 POSIX 风格的原型用户态，包括标准 shell、syscall 演示工具和 bare-metal 环境命令。
+`userland` 提供 POSIX 风格的原型用户态，包括标准 shell、syscall 演示工具和 bare-metal 环境命令；`xtask` 默认会编译其发布版二进制并放入根文件系统供 `/bin/sh` 启动。
 
 ### `bare_shell`
-- **职责**：在无操作系统环境下工作的简化 shell，支持 `ls`, `cd`, `cp`, `mv`, `touch`, `rm`, `mkdir`, `rmdir` 等命令。
+- **职责**：在无操作系统环境下工作的简化 shell，仍用于单元测试和离线工具链验证；内核默认不再调用它。
 - **结构**：主要类型 `BareShell<Io, Fs, Sys>`，`commands` 子模块拆分每个文件操作实现。
 - **交互**：通过 `ShellFs` trait 与内核/模拟文件系统通信，通过 `ShellSystem` trait 执行 `reboot`、`shutdown` 等控制操作。
 
-### `shell`
-- **职责**：std 环境下的交互式 shell，解析命令、历史、管道等，最终通过 `syscall` 与内核通信。
+- **职责**：std 环境下的交互式 shell，解析命令、历史、管道等，最终通过 `syscall` 与内核通信；编译产物即 `/bin/sh`。
 
 ### `command_util`
 - **职责**：为 std shell 的各个二进制工具提供公共解析/输出函数。

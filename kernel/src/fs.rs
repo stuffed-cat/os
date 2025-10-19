@@ -438,7 +438,11 @@ pub fn init_from_ramdisk(ramdisk_addr: u64, len: u64) -> Result<(), FsError> {
 
     // SAFETY: caller guarantees that the physical memory is accessible via the
     // provided offset and that it remains valid for the lifetime of the kernel.
-    let data = unsafe { core::slice::from_raw_parts(virt_start as *const u8, len) };
+    let data = unsafe { core::slice::from_raw_parts_mut(virt_start as *mut u8, len) };
+    init_from_slice(data)
+}
+
+fn init_from_slice(data: &'static mut [u8]) -> Result<(), FsError> {
     let fs = Ext2Fs::parse(data)?;
     let variant = fs.kind();
     serial::write_fmt(format_args!("fs: detected {:?} image\r\n", variant));
@@ -446,6 +450,12 @@ pub fn init_from_ramdisk(ramdisk_addr: u64, len: u64) -> Result<(), FsError> {
     let mut guard = FILESYSTEM.lock();
     *guard = Some(fs);
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn init_from_bytes_for_test(bytes: Vec<u8>) -> Result<(), FsError> {
+    let leaked = Box::leak(bytes.into_boxed_slice());
+    init_from_slice(leaked)
 }
 
 /// Lists directory entries for the provided absolute path.
@@ -626,6 +636,8 @@ pub fn write_file_with_credentials(
 
     loop {
         let mut overlay = FILE_OVERLAY.lock();
+        let mut pending_persist: Option<OverlayFile> = None;
+        let mut completed_write: Option<usize> = None;
         match overlay.entry(normalized.clone()) {
             alloc::collections::btree_map::Entry::Occupied(mut occ) => {
                 match occ.get_mut() {
@@ -662,6 +674,7 @@ pub fn write_file_with_credentials(
                             }
                             buffer[offset..offset + data.len()].copy_from_slice(data);
                             file.size = buffer.len() as u64;
+                            pending_persist = Some(file.clone());
                             let written = data.len();
                             record_journal(
                                 JournalOp::Write,
@@ -672,7 +685,7 @@ pub fn write_file_with_credentials(
                                     truncated: truncate,
                                 },
                             );
-                            return Ok(written);
+                            completed_write = Some(written);
                         }
                     }
                 }
@@ -684,7 +697,7 @@ pub fn write_file_with_credentials(
                 if require_metadata {
                     // Drop lock to load metadata/data before inserting.
                 } else {
-                    let mut buffer = data_cache.clone().unwrap_or_else(Vec::new);
+                    let mut buffer = data_cache.clone().unwrap_or_else(|| Vec::new());
                     if truncate {
                         buffer.clear();
                     }
@@ -705,6 +718,7 @@ pub fn write_file_with_credentials(
                         gid: metadata.gid,
                         source: OverlaySource::Shadowed,
                     };
+                    pending_persist = Some(overlay_file.clone());
                     vacant.insert(OverlayEntry::File(overlay_file));
                     let written = data.len();
                     record_journal(
@@ -716,10 +730,19 @@ pub fn write_file_with_credentials(
                             truncated: truncate,
                         },
                     );
-                    return Ok(written);
+                    completed_write = Some(written);
                 }
             }
         }
+
+        if let Some(written) = completed_write {
+            drop(overlay);
+            if let Some(snapshot) = pending_persist {
+                persist_shadowed_file(&normalized, &snapshot)?;
+            }
+            return Ok(written);
+        }
+
         drop(overlay);
 
         if require_metadata {
@@ -742,6 +765,34 @@ pub fn write_file_with_credentials(
 /// Truncates a file to zero length using the overlay layer.
 pub fn truncate_file_with_credentials(path: &str, creds: &Credentials) -> Result<(), FsError> {
     write_file_with_credentials(path, creds, 0, &[], true).map(|_| ())
+}
+
+fn persist_shadowed_file(path: &str, file: &OverlayFile) -> Result<(), FsError> {
+    if file.source != OverlaySource::Shadowed {
+        return Ok(());
+    }
+    let data = match &file.data {
+        Some(buffer) => buffer,
+        None => return Ok(()),
+    };
+
+    {
+        let mut guard = FILESYSTEM.lock();
+        let fs = guard.as_mut().ok_or(FsError::NotInitialized)?;
+        fs.write_existing_file(path, data, file.size)?;
+    }
+
+    let mut overlay = FILE_OVERLAY.lock();
+    if let Some(entry) = overlay.get_mut(path) {
+        if let OverlayEntry::File(existing) = entry {
+            if existing.source == OverlaySource::Shadowed {
+                existing.data = None;
+                existing.size = file.size;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Retrieves minimal file metadata while enforcing access permissions.
@@ -1238,7 +1289,7 @@ struct BlockGroupDescriptor {
 }
 
 struct Ext2Fs<'a> {
-    data: &'a [u8],
+    data: &'a mut [u8],
     block_size: usize,
     inode_size: usize,
     inodes_per_group: u32,
@@ -1259,7 +1310,7 @@ struct Inode {
 }
 
 impl<'a> Ext2Fs<'a> {
-    fn parse(data: &'a [u8]) -> Result<Self, FsError> {
+    fn parse(data: &'a mut [u8]) -> Result<Self, FsError> {
         if data.len() < SUPERBLOCK_OFFSET + SUPERBLOCK_LENGTH {
             return Err(FsError::InvalidImage);
         }
@@ -1385,7 +1436,7 @@ impl<'a> Ext2Fs<'a> {
         let mut block_groups = Vec::with_capacity(block_group_count as usize);
         for group in 0..block_group_count {
             let descriptor = locate_block_group_descriptor(
-                data,
+                &*data,
                 group,
                 descriptor_size,
                 block_size,
@@ -1497,6 +1548,57 @@ impl<'a> Ext2Fs<'a> {
 
         data.truncate(inode.size as usize);
         Ok(data)
+    }
+
+    fn write_existing_file(&mut self, path: &str, data: &[u8], size: u64) -> Result<(), FsError> {
+        let creds = Credentials::root();
+        let inode_num = self.resolve_path(path, &creds)?;
+        let inode = self.load_inode(inode_num)?;
+        if !inode.is_regular_file() {
+            return Err(FsError::NotFile);
+        }
+
+        let blocks = self.collect_blocks(&inode)?;
+        let capacity = blocks
+            .len()
+            .checked_mul(self.block_size)
+            .ok_or(FsError::InvalidImage)?;
+        let target_len = size as usize;
+        if data.len() != target_len {
+            return Err(FsError::Unsupported);
+        }
+        if target_len > capacity {
+            return Err(FsError::Unsupported);
+        }
+
+        let mut written = 0usize;
+        for block_number in blocks.iter() {
+            if *block_number == 0 {
+                if written < target_len {
+                    return Err(FsError::Unsupported);
+                }
+                break;
+            }
+            let block_slice = self.block_mut(*block_number)?;
+            if written < target_len {
+                let remaining = target_len - written;
+                let to_copy = cmp::min(remaining, block_slice.len());
+                block_slice[..to_copy].copy_from_slice(&data[written..written + to_copy]);
+                if to_copy < block_slice.len() {
+                    block_slice[to_copy..].fill(0);
+                }
+                written += to_copy;
+            } else {
+                block_slice.fill(0);
+            }
+        }
+
+        if written < target_len {
+            return Err(FsError::Unsupported);
+        }
+
+        self.update_inode_size(inode_num, size)?;
+        Ok(())
     }
 
     fn metadata(&self, path: &str, creds: &Credentials) -> Result<NodeMetadata, FsError> {
@@ -1634,6 +1736,13 @@ impl<'a> Ext2Fs<'a> {
     }
 
     fn load_inode(&self, inode_number: u32) -> Result<Inode, FsError> {
+        let inode_offset = self.inode_offset(inode_number)?;
+        let inode_end = inode_offset + self.inode_size;
+        let inode_raw = &self.data[inode_offset..inode_end];
+        Ok(Inode::parse(inode_raw))
+    }
+
+    fn inode_offset(&self, inode_number: u32) -> Result<usize, FsError> {
         if inode_number == 0 {
             return Err(FsError::InvalidImage);
         }
@@ -1657,8 +1766,24 @@ impl<'a> Ext2Fs<'a> {
         if inode_end > self.data.len() {
             return Err(FsError::InvalidImage);
         }
-        let inode_raw = &self.data[inode_offset..inode_end];
-        Ok(Inode::parse(inode_raw))
+        Ok(inode_offset)
+    }
+
+    fn update_inode_size(&mut self, inode_number: u32, new_size: u64) -> Result<(), FsError> {
+        let offset = self.inode_offset(inode_number)?;
+        if self.inode_size < 8 {
+            return Err(FsError::InvalidImage);
+        }
+        let inode_slice = &mut self.data[offset..offset + self.inode_size];
+        let size_lo = (new_size as u32).to_le_bytes();
+        inode_slice[4..8].copy_from_slice(&size_lo);
+        if self.inode_size >= 112 {
+            let size_hi = ((new_size >> 32) as u32).to_le_bytes();
+            inode_slice[108..112].copy_from_slice(&size_hi);
+        } else if new_size >> 32 != 0 {
+            return Err(FsError::Unsupported);
+        }
+        Ok(())
     }
 
     fn block_offset(&self, block: u64) -> Result<usize, FsError> {
@@ -1681,6 +1806,15 @@ impl<'a> Ext2Fs<'a> {
             return Err(FsError::InvalidImage);
         }
         Ok(&self.data[offset..end])
+    }
+
+    fn block_mut(&mut self, block_number: u64) -> Result<&mut [u8], FsError> {
+        let offset = self.block_offset(block_number)?;
+        let end = offset + self.block_size;
+        if end > self.data.len() {
+            return Err(FsError::InvalidImage);
+        }
+        Ok(&mut self.data[offset..end])
     }
 
     fn collect_blocks(&self, inode: &Inode) -> Result<Vec<u64>, FsError> {
@@ -1766,7 +1900,6 @@ impl<'a> Ext2Fs<'a> {
 
         Ok(blocks)
     }
-
     fn collect_extent_node(
         &self,
         node: &[u8],
@@ -2281,21 +2414,6 @@ fn detect_ext_filesystem_kind(
 }
 
 #[cfg(test)]
-fn read_u64(data: &[u8], offset: usize) -> u64 {
-    let bytes = [
-        data[offset],
-        data[offset + 1],
-        data[offset + 2],
-        data[offset + 3],
-        data[offset + 4],
-        data[offset + 5],
-        data[offset + 6],
-        data[offset + 7],
-    ];
-    u64::from_le_bytes(bytes)
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use spin::Mutex as SpinMutex;
@@ -2304,8 +2422,8 @@ mod tests {
 
     #[test]
     fn parse_rootfs_image() {
-        let bytes = include_bytes!("../../assets/rootfs.ext4");
-        let fs = Ext2Fs::parse(bytes).expect("parse ext4");
+        let mut bytes = include_bytes!("../../assets/rootfs.ext4").to_vec();
+        let fs = Ext2Fs::parse(bytes.as_mut_slice()).expect("parse ext4");
         assert!(matches!(fs.kind(), ExtFilesystemKind::Ext4));
         let creds = Credentials::root();
         let entries = fs.list_dir("/", &creds).expect("list root");
@@ -2316,8 +2434,8 @@ mod tests {
 
     #[test]
     fn read_readme_file() {
-        let bytes = include_bytes!("../../assets/rootfs.ext4");
-        let fs = Ext2Fs::parse(bytes).expect("parse ext4");
+        let mut bytes = include_bytes!("../../assets/rootfs.ext4").to_vec();
+        let fs = Ext2Fs::parse(bytes.as_mut_slice()).expect("parse ext4");
         let creds = Credentials::root();
         let data = fs.read_file("/README", &creds).expect("read README");
         assert!(!data.is_empty());
@@ -2325,41 +2443,17 @@ mod tests {
 
     #[test]
     fn bin_contains_command_binaries() {
-        let bytes = include_bytes!("../../assets/rootfs.ext4");
-        let fs = Ext2Fs::parse(bytes).expect("parse ext4");
+        let mut bytes = include_bytes!("../../assets/rootfs.ext4").to_vec();
+        let fs = Ext2Fs::parse(bytes.as_mut_slice()).expect("parse ext4");
         let creds = Credentials::root();
         let entries = fs.list_dir("/bin", &creds).expect("list /bin");
         let names: Vec<String> = entries.into_iter().map(|entry| entry.name).collect();
         let expected_commands = [
-            ("help", 0u8),
-            ("history", 1u8),
-            ("ls", 2u8),
-            ("pwd", 3u8),
-            ("cd", 4u8),
-            ("cat", 5u8),
-            ("echo", 6u8),
-            ("touch", 7u8),
-            ("mkdir", 8u8),
-            ("rmdir", 9u8),
-            ("rm", 10u8),
-            ("cp", 11u8),
-            ("mv", 12u8),
-            ("reboot", 13u8),
-            ("shutdown", 14u8),
-            ("sh", 15u8),
-            ("chmod", 16u8),
-            ("chown", 17u8),
-            ("whoami", 18u8),
-            ("id", 19u8),
-            ("users", 20u8),
-            ("su", 21u8),
-            ("useradd", 22u8),
-            ("passwd", 23u8),
-            ("setsid", 24u8),
-            ("cttyhack", 25u8),
+            "bash", "cat", "cd", "cp", "cttyhack", "echo", "help", "history", "ls", "mkdir", "mv",
+            "pwd", "reboot", "rm", "rmdir", "setsid", "sh", "shutdown", "touch",
         ];
 
-        for (command, expected_id) in expected_commands {
+        for command in expected_commands {
             assert!(
                 names.contains(&command.to_string()),
                 "missing /bin/{command} binary"
@@ -2371,12 +2465,6 @@ mod tests {
                         data.starts_with(&[0x7F, b'E', b'L', b'F']),
                         "{command} must be an ELF binary"
                     );
-                    if let Some(id) = parse_command_id(&data) {
-                        assert_eq!(
-                            id, expected_id,
-                            "{command} must encode builtin id {expected_id}"
-                        );
-                    }
                 }
                 Err(FsError::Unsupported) => continue,
                 Err(other) => {
@@ -2389,21 +2477,34 @@ mod tests {
     #[test]
     fn overlay_write_roundtrip() {
         let _guard = TEST_FS_GUARD.lock();
-        let bytes = include_bytes!("../../assets/rootfs.ext4");
-        let fs = Ext2Fs::parse(bytes).expect("parse ext4");
-        {
-            let mut guard = FILESYSTEM.lock();
-            *guard = Some(fs);
-        }
+        FILE_OVERLAY.lock().clear();
+        FILESYSTEM.lock().take();
+        __clear_journal_for_tests();
+
+        init_from_bytes_for_test(include_bytes!("../../assets/rootfs.ext4").to_vec())
+            .expect("init filesystem");
 
         let creds = Credentials::root();
         let payload = b"Hello overlay";
 
         write_file_with_credentials("/README", &creds, 0, payload, true).expect("write overlay");
-        let data = read_file_with_credentials("/README", &creds).expect("read overlay");
-        assert!(data.starts_with(payload));
+        {
+            let guard = FILESYSTEM.lock();
+            let fs = guard.as_ref().expect("filesystem initialized");
+            let data = fs.read_file("/README", &creds).expect("read baseline");
+            assert!(data.starts_with(payload));
+        }
+
+        let overlay_state = FILE_OVERLAY.lock();
+        if let Some(OverlayEntry::File(file)) = overlay_state.get("/README") {
+            assert!(file.data.is_none());
+        }
+        drop(overlay_state);
 
         FILE_OVERLAY.lock().clear();
+        let data = read_file_with_credentials("/README", &creds).expect("read persisted file");
+        assert!(data.starts_with(payload));
+
         FILESYSTEM.lock().take();
     }
 
@@ -2414,12 +2515,8 @@ mod tests {
         FILE_OVERLAY.lock().clear();
         FILESYSTEM.lock().take();
 
-        let bytes = include_bytes!("../../assets/rootfs.ext4");
-        let fs = Ext2Fs::parse(bytes).expect("parse ext4");
-        {
-            let mut guard = FILESYSTEM.lock();
-            *guard = Some(fs);
-        }
+        init_from_bytes_for_test(include_bytes!("../../assets/rootfs.ext4").to_vec())
+            .expect("init filesystem");
 
         let creds = Credentials::root();
         let path = "/journal.log";
@@ -2455,108 +2552,4 @@ mod tests {
         let ext4_by_inode = detect_ext_filesystem_kind(1, INODE_SIZE_DEFAULT + 64, 0, 0, 0);
         assert_eq!(ext4_by_inode, ExtFilesystemKind::Ext4);
     }
-}
-
-#[cfg(test)]
-const SHT_NOTE: u32 = 7;
-#[cfg(test)]
-const COMMAND_NOTE_TYPE: u32 = 0x4D43_4221;
-#[cfg(test)]
-const COMMAND_NOTE_MAGIC: u32 = 0x214D_4342;
-
-#[cfg(test)]
-fn parse_command_id(data: &[u8]) -> Option<u8> {
-    if data.len() < 64 || &data[0..4] != b"\x7FELF" {
-        return None;
-    }
-
-    let shoff = read_u64(data, 40) as usize;
-    let shentsize = read_u16(data, 58) as usize;
-    let shnum = read_u16(data, 60) as usize;
-    let shstrndx = read_u16(data, 62) as usize;
-
-    if shentsize == 0 || shnum == 0 || shstrndx >= shnum {
-        return None;
-    }
-
-    if shoff + shentsize * shnum > data.len() {
-        return None;
-    }
-
-    let shstr_header = shoff + shstrndx * shentsize;
-    let shstr_offset = read_u64(data, shstr_header + 24) as usize;
-    let shstr_size = read_u64(data, shstr_header + 32) as usize;
-    if shstr_offset + shstr_size > data.len() {
-        return None;
-    }
-    let shstrtab = &data[shstr_offset..shstr_offset + shstr_size];
-
-    for index in 1..shnum {
-        let header_offset = shoff + index * shentsize;
-        let sh_type = read_u32(data, header_offset + 4);
-        if sh_type != SHT_NOTE {
-            continue;
-        }
-
-        let section_name = read_c_str(shstrtab, read_u32(data, header_offset) as usize)?;
-        if section_name != ".note.bcm" {
-            continue;
-        }
-
-        let note_offset = read_u64(data, header_offset + 24) as usize;
-        let note_size = read_u64(data, header_offset + 32) as usize;
-        if note_offset + note_size > data.len() {
-            return None;
-        }
-        let mut cursor = 0usize;
-        let note = &data[note_offset..note_offset + note_size];
-        while cursor + 12 <= note.len() {
-            let namesz = u32::from_le_bytes(note[cursor..cursor + 4].try_into().ok()?) as usize;
-            let descsz = u32::from_le_bytes(note[cursor + 4..cursor + 8].try_into().ok()?) as usize;
-            let note_type =
-                u32::from_le_bytes(note[cursor + 8..cursor + 12].try_into().ok()?) as u32;
-            cursor += 12;
-
-            let name_end = align_to(cursor + namesz, 4);
-            if name_end > note.len() {
-                break;
-            }
-            let desc_start = name_end;
-            let desc_end = align_to(desc_start + descsz, 4);
-            if desc_end > note.len() {
-                break;
-            }
-
-            if note_type == COMMAND_NOTE_TYPE && descsz >= 12 {
-                let descriptor = &note[desc_start..desc_start + descsz];
-                let magic = u32::from_le_bytes(descriptor[0..4].try_into().ok()?);
-                let version = u32::from_le_bytes(descriptor[4..8].try_into().ok()?);
-                let command_id = u32::from_le_bytes(descriptor[8..12].try_into().ok()?);
-                if magic == COMMAND_NOTE_MAGIC && version == 1 {
-                    return u8::try_from(command_id).ok();
-                }
-            }
-
-            cursor = desc_end;
-        }
-    }
-
-    None
-}
-
-#[cfg(test)]
-fn align_to(value: usize, align: usize) -> usize {
-    if align == 0 {
-        return value;
-    }
-    (value + align - 1) & !(align - 1)
-}
-
-#[cfg(test)]
-fn read_c_str<'a>(data: &'a [u8], offset: usize) -> Option<&'a str> {
-    if offset >= data.len() {
-        return None;
-    }
-    let end = data[offset..].iter().position(|&b| b == 0)? + offset;
-    core::str::from_utf8(&data[offset..end]).ok()
 }

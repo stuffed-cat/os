@@ -185,21 +185,34 @@ pub struct AddressSpace {
 impl AddressSpace {
     /// Builds an address space from an ELF image and stack configuration.
     pub fn from_executable(image: &ExecutableImage, stack_config: StackConfig) -> Self {
-        let mut segments: Vec<SegmentMapping> = image
+        Self::from_segment_mappings(
+            image.entry_point(),
+            image.segments().iter().map(segment_mapping),
+            image.stack_flags(),
+            stack_config,
+        )
+    }
+
+    /// Builds an address space that maps both the primary executable and its interpreter.
+    pub fn from_executable_pair(
+        program: &ExecutableImage,
+        interpreter: &ExecutableImage,
+        stack_config: StackConfig,
+    ) -> Self {
+        let combined_flags = merge_segment_flags(program.stack_flags(), interpreter.stack_flags());
+        let mut segments: Vec<SegmentMapping> = program
             .segments()
             .iter()
-            .map(|segment| segment_mapping(segment))
+            .chain(interpreter.segments())
+            .map(segment_mapping)
             .collect();
-        segments.sort_by_key(|segment| segment.base);
-        let stack_permissions =
-            stack_config.permissions() | MemoryFlags::from_segment(image.stack_flags());
-        let stack =
-            Stack::with_permissions(stack_config.top(), stack_config.size(), stack_permissions);
-        Self {
-            entry_point: image.entry_point(),
+        segments.sort_by_key(|segment| segment.base());
+        Self::finish_address_space(
+            interpreter.entry_point(),
             segments,
-            stack,
-        }
+            combined_flags,
+            stack_config,
+        )
     }
 
     /// Program entry point virtual address.
@@ -218,6 +231,35 @@ impl AddressSpace {
     }
 }
 
+impl AddressSpace {
+    fn from_segment_mappings(
+        entry_point: u64,
+        segments: impl IntoIterator<Item = SegmentMapping>,
+        stack_flags: SegmentFlags,
+        stack_config: StackConfig,
+    ) -> Self {
+        let mut segments: Vec<SegmentMapping> = segments.into_iter().collect();
+        segments.sort_by_key(|segment| segment.base());
+        Self::finish_address_space(entry_point, segments, stack_flags, stack_config)
+    }
+
+    fn finish_address_space(
+        entry_point: u64,
+        segments: Vec<SegmentMapping>,
+        stack_flags: SegmentFlags,
+        stack_config: StackConfig,
+    ) -> Self {
+        let stack_permissions = stack_config.permissions() | MemoryFlags::from_segment(stack_flags);
+        let stack =
+            Stack::with_permissions(stack_config.top(), stack_config.size(), stack_permissions);
+        Self {
+            entry_point,
+            segments,
+            stack,
+        }
+    }
+}
+
 fn segment_mapping(segment: &ExecutableSegment) -> SegmentMapping {
     let payload = segment.data.clone();
     SegmentMapping {
@@ -233,6 +275,14 @@ fn align_up(value: u64, align: u64) -> u64 {
         value
     } else {
         value + (align - (value % align))
+    }
+}
+
+fn merge_segment_flags(a: SegmentFlags, b: SegmentFlags) -> SegmentFlags {
+    SegmentFlags {
+        readable: a.readable || b.readable,
+        writable: a.writable || b.writable,
+        executable: a.executable || b.executable,
     }
 }
 

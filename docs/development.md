@@ -42,43 +42,23 @@ mke2fs -t ext4 -O ^has_journal,^metadata_csum -d assets/rootfs -b 1024 -m 0 asse
 
 > 提示：上述命令依赖 `mke2fs`（e2fsprogs）工具。镜像大小为 16 MiB；如需更多空间，可调整最后的块数量参数。`-O` 参数用于禁用当前内核尚未实现的 ext4 特性（journal、metadata checksum）。从现在起，镜像可启用 ext4 的 `64bit` 与 `flex_bg` 扩展，无需额外参数即可兼容。
 
-#### Bare shell 内置命令
+#### 用户态 Shell 与命令集合
 
-重新生成 `rootfs.ext4` 后，`/bin` 目录会包含一组“裸机命令二进制”（Bare Command Module，BCM）文件。每个命令对应一个最小化的 64 位 ELF，可通过 `.note.bcm` 段携带元数据：`namesz = 0`、`descsz = 12`，`type = 0x4D43_4221`，描述符内容分别是魔数 `0x214D_4342`、版本 `1` 和命令编号（同 `BuiltinCommand` 枚举）。shell 仅依赖这段 note 来解析命令身份，真正的行为仍由内核内置实现——未来引入 `exec` 时，可把这些占位 ELF 替换成真实可执行文件。当前版本的 shell 在内核态解释以下命令：
+当前内核在 `ShellSubsystem::init` 中直接 `exec` `/bin/sh`，由用户态 shell 负责解析与调度命令。`xtask bootimage` 会自动：
 
-| 命令 | 功能 | 备注 |
-|------|------|------|
-| `help` | 显示帮助 | |
-| `history` | 查看历史命令 | |
-| `ls [PATH]` | 列出目录内容 | 支持相对/绝对路径，可使用 `-a`/`--all`、`--color[=WHEN]` |
-| `pwd` | 显示当前工作目录 | |
-| `cd [PATH]` | 切换工作目录 | 多参数报错 |
-| `cat FILE...` | 打印文件内容 | 仅支持 ext4 镜像中的常规文件 |
-| `echo ARGS...` | 原样回显参数 | |
-| `touch PATH...` | 创建或更新文件 | 支持多路径参数，若文件不存在则创建 |
-| `mkdir DIR...` | 创建目录 | 父目录需已存在，支持一次创建多个目录 |
-| `rmdir DIR...` | 删除空目录 | 目录必须为空，当前不递归 |
-| `rm FILE...` | 删除常规文件 | 支持多个目标，仅作用于文件 |
-| `cp SRC DEST` | 复制文件 | 可复制到已有目录或指定新文件名 |
-| `mv SRC DEST` | 移动/重命名文件 | 仅针对常规文件，目录移动仍在规划 |
-| `chmod MODE PATH` | 修改权限位 | 支持八进制模式（如 `0644`） |
-| `chown USER[:GROUP] PATH` | 调整所有者 | 仅 root 可调用，组名可留空默认同用户 |
-| `whoami` | 显示当前用户名 | |
-| `id` | 显示 UID/GID/附加组 | |
-| `users` | 列出系统已注册用户 | |
-| `su USER [PASSWORD]` | 切换用户 | root 可省略密码；其他用户需提供密码 |
-| `useradd USER PASS [--home PATH]` | 新建用户 | 仅 root 可调用，默认家目录 `/home/USER` |
-| `passwd [USER] NEWPASS` | 修改密码 | 非 root 只能改自身密码 |
-| `setsid CMD [ARGS...]` | 在新会话中执行命令 | 当前实现为占位实现，直接转发到目标命令 |
-| `cttyhack CMD [ARGS...]` | 附加控制终端后执行命令 | 当前实现为占位实现，直接转发到目标命令 |
-| `reboot` | 请求重启 | 在 `hardware` 构建目标上调用 ACPI/键盘复位，其他配置打印提示 |
-| `shutdown` | 请求关机 | 同上 |
+1. 使用 `cargo build -p userland --release --bin sh` 等目标产出一组 ELF（二进制位于 `target/release/`）。
+2. 将它们复制到 `assets/rootfs/bin/`，包括 `sh`、`ls`、`cat`、`cp` 等工具。
+3. 重新打包 `assets/rootfs.ext4` 并写入镜像。
 
-> 注意：命令解析器位于 `userland/src/bare_shell.rs`，会读取 `/bin/<command>` 的裸机命令二进制并调度到对应内置实现。彩色输出基于 ANSI 转义序列，如需关闭可执行 `ls --color=never`。
+因此 `/bin` 中的命令已经是真正的用户态程序，它们通过 `userland::syscall` 模块编码 POSIX 请求，与内核的 `PosixLayer` 交互。若要添加新的命令，可在 `xtask/src/main.rs` 中：
 
-#### 用户态 syscall 原型命令
+1. 将命令名加入 `commands` 数组，确保编译器会构建对应的 `userland` 二进制。
+2. 如需兼容旧版 BCM 框架，可在 `BCM_COMMANDS` 常量里注册占位符。
+3. 运行 `cargo run -p xtask --features bootimage -- rootfs`（或 `bootimage` 子命令）重新构建根文件系统。
 
-`userland` crate 现额外提供 `ls`、`cat` 两个 `std` 环境下的 CLI，它们使用 `SyscallRequest` 编码器序列化 POSIX 调用（`open`/`read` 等），方便在 Step 5 中替换 shell 内置逻辑。执行 `cargo build -p userland --release --bin ls --bin cat` 后，`xtask rootfs` 会把生成的 ELF 直接拷贝到 `assets/rootfs/bin/ls`、`assets/rootfs/bin/cat`，供后续在真正的 `exec` 流程中加载。
+也可以手动把编译好的 ELF 拷贝到 `assets/rootfs/bin/` 后再次运行 `bootimage`，工具会自动重新生成 ext4 镜像。
+
+用户态 shell 依赖一组环境变量（`HOME`、`PWD`、`USER`、`SHELL` 等）由内核在 `exec` 前设置，可根据需要在 `Process::set_env` 调用处添加更多默认配置。
 
 ### 构建裸机镜像
 

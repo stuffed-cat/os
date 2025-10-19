@@ -1,6 +1,7 @@
 //! System call dispatch table bridging userland and kernel services.
 
 use log::debug;
+use spin::Once;
 
 use crate::{
     error::{KernelError, SubsystemError},
@@ -74,6 +75,8 @@ pub struct SyscallDispatcher<'a> {
     posix: PosixLayer<'a>,
 }
 
+static GLOBAL_DISPATCHER: Once<&'static SyscallDispatcher<'static>> = Once::new();
+
 impl<'a> SyscallDispatcher<'a> {
     /// Creates a dispatcher.
     pub fn new(process_table: &'a ProcessTable) -> Self {
@@ -105,6 +108,18 @@ impl<'a> SyscallDispatcher<'a> {
     /// Returns the underlying POSIX layer for explicit operations.
     pub fn posix(&self) -> &PosixLayer<'a> {
         &self.posix
+    }
+}
+
+impl SyscallDispatcher<'static> {
+    /// Registers a global syscall dispatcher instance.
+    pub fn register_global(&'static self) {
+        GLOBAL_DISPATCHER.call_once(|| self);
+    }
+
+    /// Returns the registered global dispatcher, if any.
+    pub fn global() -> Option<&'static SyscallDispatcher<'static>> {
+        GLOBAL_DISPATCHER.get().copied()
     }
 }
 

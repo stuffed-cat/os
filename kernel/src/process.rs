@@ -16,7 +16,7 @@ use crate::{
     error::SubsystemError,
     fs::{self, Credentials, FsError},
     memory::{Capability, MemoryManager, PageTableHandle},
-    scheduler::{ThreadState, ThreadStatus},
+    scheduler::{SchedulingClass, ThreadState, ThreadStatus},
     user::{AddressSpace, StackConfig, UserContext},
 };
 use log::trace;
@@ -104,6 +104,7 @@ pub struct Process {
     parent: RwLock<Option<Pid>>,
     program: RwLock<Option<String>>,
     executable: RwLock<Option<ExecutableImage>>,
+    interpreter: RwLock<Option<ExecutableImage>>,
     address_space: RwLock<Option<AddressSpace>>,
     page_table: RwLock<Option<PageTableHandle>>,
     user_context: RwLock<Option<UserContext>>,
@@ -131,6 +132,7 @@ impl Process {
             parent: RwLock::new(None),
             program: RwLock::new(None),
             executable: RwLock::new(None),
+            interpreter: RwLock::new(None),
             address_space: RwLock::new(None),
             page_table: RwLock::new(None),
             user_context: RwLock::new(None),
@@ -282,32 +284,45 @@ impl Process {
     pub fn set_program_image(
         &self,
         program: String,
-        image: ExecutableImage,
+        primary: ExecutableImage,
+        interpreter: Option<ExecutableImage>,
         memory: Option<&MemoryManager>,
     ) -> Result<(), SubsystemError> {
-        let address_space = AddressSpace::from_executable(&image, StackConfig::default());
+        let stack_config = StackConfig::default();
+        let address_space = match interpreter.as_ref() {
+            Some(interp) => AddressSpace::from_executable_pair(&primary, interp, stack_config),
+            None => AddressSpace::from_executable(&primary, stack_config),
+        };
         let stack_top = address_space.stack().top();
         let context = UserContext::for_entry(address_space.entry_point(), stack_top);
 
-        if let Some(manager) = memory {
-            let handle = manager.map_address_space(&address_space)?;
-            *self.page_table.write() = Some(handle);
+        let handle = if let Some(manager) = memory {
+            Some(manager.map_address_space(&address_space)?)
         } else {
-            self.page_table.write().take();
-        }
+            None
+        };
 
         *self.program.write() = Some(program);
-        *self.executable.write() = Some(image);
+        *self.executable.write() = Some(primary);
+        *self.interpreter.write() = interpreter;
         *self.address_space.write() = Some(address_space.clone());
         *self.user_context.write() = Some(context.clone());
 
-        // Refresh thread table with an initial user thread representing the exec'd image.
         self.reset_threads();
-        if let Some(root) = self.page_table_root() {
-            let tid = self.allocate_tid();
-            let thread_state = ThreadState::new_user(context, root);
-            self.add_thread(tid, thread_state);
+
+        match handle {
+            Some(handle) => {
+                let root = handle.root();
+                *self.page_table.write() = Some(handle);
+                let tid = self.allocate_tid();
+                let thread_state = ThreadState::new_user(context, root);
+                self.add_thread(tid, thread_state);
+            }
+            None => {
+                self.page_table.write().take();
+            }
         }
+
         Ok(())
     }
 
@@ -319,6 +334,11 @@ impl Process {
     /// Retrieves the parsed executable image for the process, if any.
     pub fn executable_image(&self) -> Option<ExecutableImage> {
         self.executable.read().clone()
+    }
+
+    /// Retrieves the parsed interpreter image for the process, if any.
+    pub fn interpreter_image(&self) -> Option<ExecutableImage> {
+        self.interpreter.read().clone()
     }
 
     /// Returns the synthesized user address space for this process, if available.
@@ -334,6 +354,36 @@ impl Process {
     /// Returns the physical frame for the process's root page table, if mapped.
     pub fn page_table_root(&self) -> Option<PhysFrame> {
         self.page_table.read().as_ref().map(|handle| handle.root())
+    }
+
+    /// Rebuilds the user page tables from the stored address space layout.
+    pub fn rebuild_user_page_tables(&self, manager: &MemoryManager) -> Result<(), SubsystemError> {
+        let layout = self
+            .address_space
+            .read()
+            .clone()
+            .ok_or(SubsystemError::Runtime("address space missing"))?;
+        let handle = manager.map_address_space(&layout)?;
+        let root = handle.root();
+        *self.page_table.write() = Some(handle);
+        let mut threads = self.threads.write();
+        for state in threads.values_mut() {
+            if state.class() == SchedulingClass::User {
+                state.set_page_table_root(root);
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes any installed user page tables and detaches CR3 roots from threads.
+    pub fn clear_user_page_tables(&self) {
+        self.page_table.write().take();
+        let mut threads = self.threads.write();
+        for state in threads.values_mut() {
+            if state.class() == SchedulingClass::User {
+                state.clear_page_table_root();
+            }
+        }
     }
 
     /// Replaces the stored user context.
@@ -519,13 +569,14 @@ impl Process {
         *target.capabilities.write() = self.capabilities.read().clone();
         *target.program.write() = self.program.read().clone();
         *target.executable.write() = self.executable.read().clone();
+        *target.interpreter.write() = self.interpreter.read().clone();
         *target.address_space.write() = self.address_space.read().clone();
-        target.page_table.write().take();
         *target.user_context.write() = self.user_context.read().clone();
         target
             .next_tid
             .store(self.next_tid.load(Ordering::SeqCst), Ordering::SeqCst);
         *target.threads.write() = self.threads.read().clone();
+        target.clear_user_page_tables();
         *target.fds.write() = self.fds.read().clone();
         *target.fd_offsets.write() = self.fd_offsets.read().clone();
         target
@@ -610,6 +661,11 @@ impl ProcessTable {
             .map(|ptr| unsafe { ptr.as_ref() })
     }
 
+    /// Returns the physical frame backing the kernel's page table root.
+    pub fn kernel_root_frame(&self) -> Option<PhysFrame> {
+        self.memory_manager().map(MemoryManager::kernel_root_frame)
+    }
+
     /// Spawns a new process.
     pub fn spawn(&self) -> Arc<Process> {
         let pid = self.allocate_pid();
@@ -647,12 +703,7 @@ impl ProcessTable {
     }
 
     /// Stores a kernel context snapshot for the provided process/thread pair.
-    pub fn store_kernel_context(
-        &self,
-        pid: Pid,
-        tid: Tid,
-        context: KernelContext,
-    ) -> bool {
+    pub fn store_kernel_context(&self, pid: Pid, tid: Tid, context: KernelContext) -> bool {
         self.lookup(pid)
             .map(|proc| proc.store_kernel_context(tid, context))
             .unwrap_or(false)
@@ -666,6 +717,11 @@ impl ProcessTable {
         let child = self.spawn();
         child.set_parent(parent);
         parent_proc.clone_state_into(&child);
+        if let Some(manager) = self.memory_manager() {
+            if child.address_space().is_some() {
+                child.rebuild_user_page_tables(manager)?;
+            }
+        }
         Ok(child.pid())
     }
 
@@ -676,7 +732,7 @@ impl ProcessTable {
             .ok_or(SubsystemError::Runtime("process not found"))?;
 
         if let Some(image) = self.exec_overrides.read().get(&program).cloned() {
-            proc.set_program_image(program, image, self.memory_manager())?;
+            proc.set_program_image(program, image, None, self.memory_manager())?;
             return Ok(());
         }
 
@@ -695,7 +751,7 @@ impl ProcessTable {
             Err(_) => return Err(SubsystemError::Runtime("exec read failure")),
         };
 
-        let mut image = ExecutableImage::parse(&data).map_err(|err| match err {
+        let program_image = ExecutableImage::parse(&data).map_err(|err| match err {
             ElfError::Truncated => SubsystemError::Runtime("executable truncated"),
             ElfError::BadMagic => SubsystemError::Runtime("invalid executable magic"),
             ElfError::UnsupportedClass => SubsystemError::Runtime("unsupported elf class"),
@@ -720,7 +776,9 @@ impl ProcessTable {
             }
         })?;
 
-        if let Some(interpreter_path) = image.interpreter().map(|s| String::from(s)) {
+        let mut interpreter_image = None;
+
+        if let Some(interpreter_path) = program_image.interpreter().map(|s| String::from(s)) {
             if interpreter_path == program {
                 return Err(SubsystemError::Runtime("interpreter recursion detected"));
             }
@@ -738,7 +796,7 @@ impl ProcessTable {
                 Err(_) => return Err(SubsystemError::Runtime("interpreter read failure")),
             };
 
-            let interpreter_image =
+            let parsed_interpreter =
                 ExecutableImage::parse(&interp_bytes).map_err(|err| match err {
                     ElfError::Truncated => SubsystemError::Runtime("interpreter truncated"),
                     ElfError::BadMagic => SubsystemError::Runtime("interpreter invalid magic"),
@@ -787,12 +845,16 @@ impl ProcessTable {
                 })?;
 
             proc.set_env(String::from("INTERPRETEE"), program.clone());
-            proc.set_env(String::from("INTERPRETER"), interpreter_path.clone());
-            image = interpreter_image;
-            proc.set_program_image(interpreter_path, image, self.memory_manager())?;
-        } else {
-            proc.set_program_image(program, image, self.memory_manager())?;
+            proc.set_env(String::from("INTERPRETER"), interpreter_path);
+            interpreter_image = Some(parsed_interpreter);
         }
+
+        proc.set_program_image(
+            program,
+            program_image,
+            interpreter_image,
+            self.memory_manager(),
+        )?;
         Ok(())
     }
 

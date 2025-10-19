@@ -1,6 +1,6 @@
 //! Interrupt Descriptor Table initialization and handlers.
 
-use log::trace;
+use log::{error, trace};
 use spin::Once;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
@@ -18,6 +18,8 @@ use x86_64::structures::idt::InterruptStackFrameValue;
 #[cfg(feature = "hardware")]
 use x86_64::structures::paging::PhysFrame;
 #[cfg(feature = "hardware")]
+use x86_64::PrivilegeLevel;
+#[cfg(feature = "hardware")]
 use x86_64::VirtAddr;
 
 use super::{
@@ -29,12 +31,16 @@ use crate::scheduler::Scheduler;
 use crate::shell;
 #[cfg(feature = "hardware")]
 use crate::{
+    error::KernelError,
     process::{KernelContext, ProcessTable},
     scheduler::{SchedulingClass, TimerTickOutcome},
+    syscall::SyscallDispatcher,
     user::{TrapFrame, UserContext},
 };
 
 static IDT: Once<InterruptDescriptorTable> = Once::new();
+
+const SYSCALL_VECTOR: u8 = 0x80;
 
 #[cfg(feature = "hardware")]
 #[repr(C)]
@@ -112,7 +118,10 @@ fn write_user_frame(frame: &mut InterruptStackFrameValue, context: &UserContext)
 }
 
 #[cfg(feature = "hardware")]
-fn snapshot_kernel_context(regs: &SavedRegisters, frame: &InterruptStackFrameValue) -> KernelContext {
+fn snapshot_kernel_context(
+    regs: &SavedRegisters,
+    frame: &InterruptStackFrameValue,
+) -> KernelContext {
     KernelContext {
         rax: regs.rax,
         rbx: regs.rbx,
@@ -193,6 +202,14 @@ pub fn init() {
         idt.page_fault.set_handler_fn(page_fault_handler);
         idt.general_protection_fault
             .set_handler_fn(general_protection_fault_handler);
+        #[cfg(feature = "hardware")]
+        unsafe {
+            let handler: extern "C" fn() -> ! = syscall_interrupt_trampoline;
+            let converted: extern "x86-interrupt" fn(InterruptStackFrame) = transmute(handler);
+            idt[SYSCALL_VECTOR]
+                .set_handler_fn(converted)
+                .set_privilege_level(PrivilegeLevel::Ring3);
+        }
         idt
     });
 }
@@ -242,6 +259,12 @@ unsafe extern "C" fn timer_interrupt_handler(
     let regs = &mut *regs;
     let frame = &mut *frame;
 
+    if let Some(table) = ProcessTable::global() {
+        if let Some(root) = table.kernel_root_frame() {
+            switch_address_space(root);
+        }
+    }
+
     if let Some(scheduler) = Scheduler::global() {
         let TimerTickOutcome { preempted, next } = scheduler.evaluate_timer_tick();
 
@@ -286,6 +309,60 @@ unsafe extern "C" fn timer_interrupt_handler(
     }
 
     interrupts::notify_end_of_interrupt(InterruptIndex::Timer);
+}
+
+#[cfg(feature = "hardware")]
+unsafe extern "C" fn syscall_interrupt_handler(
+    regs: *mut SavedRegisters,
+    frame: *mut InterruptStackFrameValue,
+) {
+    let regs = &mut *regs;
+    let frame = &mut *frame;
+
+    if let Some(table) = ProcessTable::global() {
+        if let Some(root) = table.kernel_root_frame() {
+            switch_address_space(root);
+        }
+    }
+
+    let Some(scheduler) = Scheduler::global() else {
+        return;
+    };
+
+    let Some(entry) = scheduler.current_thread() else {
+        return;
+    };
+
+    if entry.class != SchedulingClass::User {
+        return;
+    }
+
+    let Some(table) = ProcessTable::global() else {
+        return;
+    };
+
+    let Some(proc) = table.lookup(entry.pid) else {
+        return;
+    };
+
+    let mut context = UserContext::from_trap_frame(regs.snapshot(frame));
+
+    let result = SyscallDispatcher::global()
+        .ok_or_else(|| KernelError::Unimplemented("syscall dispatcher not registered"))
+        .and_then(|dispatcher| dispatcher.handle_trap(entry.pid, context.frame_mut()));
+
+    if let Err(err) = result {
+        context
+            .frame_mut()
+            .set_return_value(encode_kernel_error(err));
+    }
+
+    regs.apply_user_context(&context);
+    write_user_frame(frame, &context);
+
+    if let Some(root) = proc.page_table_root() {
+        switch_address_space(root);
+    }
 }
 
 #[cfg(not(feature = "hardware"))]
@@ -341,7 +418,65 @@ extern "C" fn timer_interrupt_trampoline() -> ! {
     );
 }
 
+#[cfg(feature = "hardware")]
+#[unsafe(naked)]
+extern "C" fn syscall_interrupt_trampoline() -> ! {
+    naked_asm!(
+        "push rbp",
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
+        "push rbx",
+        "push rax",
+        "mov rdi, rsp",
+        "lea rsi, [rsp + {frame_offset}]",
+        "sub rsp, 8",
+        "call {handler}",
+        "add rsp, 8",
+        "pop rax",
+        "pop rbx",
+        "pop rcx",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        "pop rbp",
+        "iretq",
+        frame_offset = const 15 * 8,
+        handler = sym syscall_interrupt_handler
+    );
+}
+
+#[cfg(feature = "hardware")]
+fn encode_kernel_error(err: KernelError) -> u64 {
+    error!("syscall error: {}", err);
+    u64::MAX
+}
+
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    #[cfg(feature = "hardware")]
+    if let Some(table) = ProcessTable::global() {
+        if let Some(root) = table.kernel_root_frame() {
+            switch_address_space(root);
+        }
+    }
+
     let scancode = keyboard::read_scancode();
     shell::enqueue_scancode(scancode);
     interrupts::notify_end_of_interrupt(InterruptIndex::Keyboard);

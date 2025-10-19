@@ -18,6 +18,9 @@ use crate::{
     syscall::SyscallId,
 };
 
+#[cfg(not(feature = "std"))]
+use crate::shell;
+
 /// POSIX errno values we expose to userland.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Errno {
@@ -254,7 +257,31 @@ impl<'a> PosixLayer<'a> {
         let buffer = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
 
         match self.classify_descriptor(&descriptor) {
-            Descriptor::StdIn => Ok(0),
+            Descriptor::StdIn => {
+                #[cfg(feature = "std")]
+                {
+                    Ok(0)
+                }
+
+                #[cfg(not(feature = "std"))]
+                {
+                    let mut total = 0;
+                    while total < buffer.len() {
+                        let read = shell::read_console(&mut buffer[total..]);
+                        if read > 0 {
+                            total += read;
+                            break;
+                        }
+
+                        if let Some(scheduler) = Scheduler::global() {
+                            scheduler.yield_current();
+                        } else {
+                            break;
+                        }
+                    }
+                    Ok(total as u64)
+                }
+            }
             Descriptor::Pipe {
                 id,
                 end: PipeEnd::Read,

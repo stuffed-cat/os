@@ -407,6 +407,7 @@ dependencies = [
  "bootloader_api",
  "font8x8",
  "log",
+ "pc-keyboard",
  "sha2",
  "spin",
  "uart_16550",
