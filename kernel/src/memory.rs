@@ -3,6 +3,7 @@
 use alloc::collections::BTreeMap;
 use core::ops::Range;
 use spin::RwLock;
+use log::trace;
 
 use crate::error::SubsystemError;
 
@@ -236,7 +237,6 @@ impl FramePool {
 
 /// Page table entries reserved for kernel space (upper canonical half).
 #[cfg(any(feature = "alloc", feature = "std"))]
-const KERNEL_PML4_SLOT_START: usize = 256;
 
 #[cfg(any(feature = "alloc", feature = "std"))]
 struct FrameAllocatorAdapter<'a> {
@@ -412,6 +412,14 @@ impl MemoryManager {
         let end_page = Page::containing_address(end);
         let flags = Self::flags_from_memory(segment.permissions());
 
+        trace!(
+            "memory: map segment [{:#x}, {:#x}) perms={:?} -> flags={:?}",
+            segment.base(),
+            segment.base() + segment.length() as u64,
+            segment.permissions(),
+            flags
+        );
+
         for page in Page::range_inclusive(start_page, end_page) {
             let frame = self
                 .allocate_zeroed_frame()
@@ -576,8 +584,21 @@ impl MemoryManager {
 
         self.with_page_table(root, |new_root| {
             self.with_page_table_read(self.kernel_root, |kernel_root| {
-                for index in KERNEL_PML4_SLOT_START..512 {
-                    new_root[index] = kernel_root[index].clone();
+                for index in 0..512 {
+                    let entry = &kernel_root[index];
+                    let flags = entry.flags();
+                    let is_kernel_mapping = flags.contains(PageTableFlags::PRESENT)
+                        && !flags.contains(PageTableFlags::USER_ACCESSIBLE);
+                    if is_kernel_mapping {
+                        // Clone the entry but clear NO_EXECUTE to allow user code execution
+                        let mut cloned_flags = flags;
+                        cloned_flags.remove(PageTableFlags::NO_EXECUTE);
+                        log::trace!("memory: cloning kernel pml4 entry {} -> original={:?} cleared_nx={:?}", index, flags, cloned_flags);
+                        
+                        // Rebuild the entry with cleared NX flag
+                        let addr = entry.addr();
+                        new_root[index].set_addr(addr, cloned_flags);
+                    }
                 }
             });
         });

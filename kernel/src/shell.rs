@@ -6,7 +6,7 @@ use crate::core::{KernelContext, Subsystem, SubsystemId};
 use crate::error::SubsystemError;
 use crate::memory::MemoryManager;
 use crate::process::ProcessTable;
-#[cfg(not(feature = "std"))]
+#[cfg(all(not(feature = "std"), not(feature = "hardware")))]
 use crate::scheduler::SchedulingClass;
 use crate::scheduler::{RunQueueEntry, Scheduler, ThreadPriority, ThreadStatus};
 use crate::session;
@@ -15,7 +15,9 @@ use crate::users;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::string::String;
-use log::{info, trace, error, warn};
+#[cfg(all(not(feature = "std"), not(feature = "hardware")))]
+use log::{error, warn};
+use log::{info, trace};
 use pc_keyboard::layouts::Us104Key;
 use pc_keyboard::{DecodedKey, HandleControl, Keyboard, ScancodeSet1};
 use spin::{Lazy, Mutex};
@@ -120,8 +122,22 @@ impl ConsoleState {
 
 static CONSOLE: Lazy<Mutex<ConsoleState>> = Lazy::new(|| Mutex::new(ConsoleState::new()));
 
-/// Global state to track if current process should be skipped due to exception
-static SKIP_CURRENT_PROCESS: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
+/// Tracks the thread currently executing in user mode.
+static CURRENT_THREAD: Lazy<Mutex<Option<RunQueueEntry>>> = Lazy::new(|| Mutex::new(None));
+
+/// Records the most recent user thread that faulted so the scheduler can log it.
+static FAILED_THREAD: Lazy<Mutex<Option<RunQueueEntry>>> = Lazy::new(|| Mutex::new(None));
+
+#[cfg(all(not(feature = "std"), not(feature = "hardware")))]
+fn set_current_thread(entry: RunQueueEntry) {
+    let mut current = CURRENT_THREAD.lock();
+    *current = Some(entry);
+}
+
+#[cfg(all(not(feature = "std"), not(feature = "hardware")))]
+fn clear_current_thread() {
+    CURRENT_THREAD.lock().take();
+}
 
 /// Enqueues a raw keyboard scancode produced by the hardware interrupt handler.
 pub fn enqueue_scancode(scancode: u8) {
@@ -131,8 +147,32 @@ pub fn enqueue_scancode(scancode: u8) {
 
 /// Called by exception handlers to signal that the current process should be skipped
 pub fn mark_current_process_failed() {
-    let mut skip = SKIP_CURRENT_PROCESS.lock();
-    *skip = true;
+    let current = if let Some(scheduler) = Scheduler::global() {
+        scheduler.current_thread()
+    } else {
+        None
+    };
+
+    let fallback = {
+        let mut guard = CURRENT_THREAD.lock();
+        guard.take()
+    };
+
+    if let Some(entry) = current.or(fallback) {
+        if let Some(table) = ProcessTable::global() {
+            if let Some(process) = table.lookup(entry.pid) {
+                process.set_thread_status(entry.tid, ThreadStatus::Dead);
+                process.mark_terminated(-1);
+            }
+        }
+
+        if let Some(scheduler) = Scheduler::global() {
+            scheduler.complete_current(ThreadStatus::Dead);
+        }
+
+        let mut failed = FAILED_THREAD.lock();
+        *failed = Some(entry);
+    }
 }
 
 /// Reads buffered console input into the provided slice, returning the number of bytes copied.
@@ -206,6 +246,24 @@ impl ShellSubsystem {
         let (tid, _) = process
             .main_thread()
             .ok_or(SubsystemError::Runtime("exec produced no runnable thread"))?;
+        let user_context = process.user_context();
+        trace!(
+            "shell: user context present? {}",
+            user_context.is_some()
+        );
+        match user_context {
+            Some(context) => {
+                let frame = context.frame();
+                trace!(
+                    "shell: initial user context rip={:#x} rsp={:#x}",
+                    frame.rip,
+                    frame.rsp
+                );
+            }
+            None => {
+                trace!("shell: initial user context missing");
+            }
+        }
         process.set_thread_status(tid, ThreadStatus::Ready);
         let priority = process
             .thread_state(tid)
@@ -217,32 +275,38 @@ impl ShellSubsystem {
         Ok(())
     }
 
-    #[cfg(not(feature = "std"))]
+    #[cfg(all(not(feature = "std"), not(feature = "hardware")))]
     fn run_ready_threads(&mut self) {
         use core::task::Poll;
 
         loop {
+            if let Some(failed) = FAILED_THREAD.lock().take() {
+                error!(
+                    "scheduler: terminated user process pid={} tid={} after exception",
+                    failed.pid.as_u64(),
+                    failed.tid.as_u64()
+                );
+                continue;
+            }
+
             match self.scheduler.tick() {
                 Poll::Ready(entry) => {
-                    // Check if this process should be skipped due to an exception
-                    {
-                        let should_skip = *SKIP_CURRENT_PROCESS.lock();
-                        if should_skip {
-                            *SKIP_CURRENT_PROCESS.lock() = false;
-                            error!("Skipping user process due to exception");
-                            continue;
-                        }
-                    }
+                    set_current_thread(entry);
 
                     match entry.class {
                         SchedulingClass::User => {
                             if let Some(process) = self.process_table.lookup(entry.pid) {
-                                if let Some((context, root)) = process.take_thread_runtime(entry.tid) {
+                                if let Some((context, root)) =
+                                    process.take_thread_runtime(entry.tid)
+                                {
                                     process.set_thread_status(entry.tid, ThreadStatus::Running);
                                     unsafe {
-                                        crate::arch::x86_64::context::enter_user_mode(&context, root);
+                                        crate::arch::x86_64::context::enter_user_mode(
+                                            &context, root,
+                                        );
                                     }
                                 } else {
+                                    clear_current_thread();
                                     warn!(
                                         "scheduler: missing user context for pid={} tid={}",
                                         entry.pid.as_u64(),
@@ -250,10 +314,12 @@ impl ShellSubsystem {
                                     );
                                 }
                             } else {
+                                clear_current_thread();
                                 warn!("scheduler: missing process for pid={}", entry.pid.as_u64());
                             }
                         }
                         SchedulingClass::Kernel => {
+                            clear_current_thread();
                             warn!(
                                 "scheduler: kernel thread scheduling not implemented (pid={} tid={})",
                                 entry.pid.as_u64(),
@@ -291,7 +357,7 @@ impl Subsystem for ShellSubsystem {
             x86_64::instructions::interrupts::disable();
             let result = self.launch_initial_user();
             x86_64::instructions::interrupts::enable();
-            
+
             match result {
                 Ok(()) => {
                     self.init_spawned = true;
@@ -308,7 +374,7 @@ impl Subsystem for ShellSubsystem {
     }
 
     fn tick(&mut self, _ctx: &KernelContext) -> Result<(), SubsystemError> {
-        #[cfg(not(feature = "std"))]
+        #[cfg(all(not(feature = "std"), not(feature = "hardware")))]
         self.run_ready_threads();
         Ok(())
     }

@@ -49,3 +49,5 @@ fn main() {
     let length = unsafe { libc_lite::strlen(c_string.as_ptr()) };
     println!("strlen(c string) => {length}");
 }
+
+

@@ -1,6 +1,6 @@
 //! Interrupt Descriptor Table initialization and handlers.
 
-use log::{error, trace};
+use log::{error, info, trace};
 use spin::Once;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
@@ -11,6 +11,8 @@ use core::arch::naked_asm;
 use core::mem::transmute;
 #[cfg(feature = "hardware")]
 use core::ptr;
+#[cfg(feature = "hardware")]
+use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "hardware")]
 use x86_64::registers::control::{Cr3, Cr3Flags};
 #[cfg(feature = "hardware")]
@@ -39,6 +41,9 @@ use crate::{
     syscall::SyscallDispatcher,
     user::{TrapFrame, UserContext},
 };
+
+#[cfg(feature = "hardware")]
+static LOGGED_USER_ENTRY: AtomicBool = AtomicBool::new(false);
 
 static IDT: Once<InterruptDescriptorTable> = Once::new();
 
@@ -240,7 +245,10 @@ pub fn load() {
 
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     if is_user_mode_exception(&stack_frame) {
-        trace!("User mode BREAKPOINT at {:#x}", stack_frame.instruction_pointer.as_u64());
+        trace!(
+            "User mode BREAKPOINT at {:#x}",
+            stack_frame.instruction_pointer.as_u64()
+        );
     } else {
         trace!("Kernel mode BREAKPOINT: {:?}", stack_frame);
     }
@@ -252,20 +260,12 @@ extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame,
             "User mode DOUBLE FAULT\nRIP: {:#x}",
             stack_frame.instruction_pointer.as_u64()
         );
-        
-        // Try to terminate the user process
-        if let Some(table) = ProcessTable::global() {
-            if let Some(current) = table.current_process() {
-                let pid = current.pid();
-                error!("Terminating process {} due to double fault", pid.as_u64());
-                current.mark_terminated(-1);
-            }
-        }
-        
+        crate::shell::mark_current_process_failed();
+
         // This is still fatal, but at least we tried to log it
         panic!("DOUBLE FAULT (USER): {:?}", stack_frame);
     }
-    
+
     panic!("DOUBLE FAULT (KERNEL): {:?}", stack_frame);
 }
 
@@ -275,32 +275,29 @@ extern "x86-interrupt" fn page_fault_handler(
 ) {
     if is_user_mode_exception(&stack_frame) {
         // User mode page fault - handle gracefully
+        let fault_address = Cr2::read().map(|addr| addr.as_u64()).unwrap_or(0);
+
         error!(
             "User mode PAGE FAULT\nRIP: {:#x}\nFaulted Address: {:#x}\nError Code: {:?}",
             stack_frame.instruction_pointer.as_u64(),
-            Cr2::read().as_u64(),
+            fault_address,
             error_code
         );
-        
-        // Try to terminate the user process
-        if let Some(table) = ProcessTable::global() {
-            if let Some(current) = table.current_process() {
-                let pid = current.pid();
-                error!("Terminating process {} due to page fault", pid.as_u64());
-                current.mark_terminated(-1);
-            }
-        }
-        
+
         crate::shell::mark_current_process_failed();
-        unsafe { x86_64::instructions::interrupts::enable() };
+        x86_64::instructions::interrupts::enable();
         return;
     }
-    
+
     // Kernel mode page fault - this is fatal
+    let cr2_val = Cr2::read().unwrap_or(VirtAddr::new(0));
+    let rip = stack_frame.instruction_pointer.as_u64();
+    let rsp = stack_frame.stack_pointer.as_u64();
     panic!(
-        "PAGE FAULT (KERNEL): {:?}\nAccessed Address: {:?}\nError Code: {:?}",
-        stack_frame,
-        Cr2::read(),
+        "PAGE FAULT (KERNEL): RIP={:#x} RSP={:#x}\nAccessed Address: {:#x}\nError Code: {:?}",
+        rip,
+        rsp,
+        cr2_val.as_u64(),
         error_code
     );
 }
@@ -316,24 +313,15 @@ extern "x86-interrupt" fn general_protection_fault_handler(
             stack_frame.instruction_pointer.as_u64(),
             error_code
         );
-        
-        // Try to terminate the user process gracefully
-        if let Some(table) = ProcessTable::global() {
-            if let Some(current) = table.current_process() {
-                let pid = current.pid();
-                error!("Terminating process {} due to GPF", pid.as_u64());
-                current.mark_terminated(-1); // Signal terminated
-            }
-        }
-        
+
         // Signal to shell to skip this process
         crate::shell::mark_current_process_failed();
-        
+
         // Re-enable interrupts and return to kernel
-        unsafe { x86_64::instructions::interrupts::enable() };
+        x86_64::instructions::interrupts::enable();
         return;
     }
-    
+
     // Kernel mode exception - this is fatal
     panic!(
         "GENERAL PROTECTION FAULT (KERNEL): {:?}\nError Code: {:#x}",
@@ -349,21 +337,11 @@ extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFram
             "User mode INVALID OPCODE\nRIP: {:#x}",
             stack_frame.instruction_pointer.as_u64()
         );
-        
-        // Try to terminate the user process
-        if let Some(table) = ProcessTable::global() {
-            if let Some(current) = table.current_process() {
-                let pid = current.pid();
-                error!("Terminating process {} due to invalid opcode", pid.as_u64());
-                current.mark_terminated(-1);
-            }
-        }
-        
         crate::shell::mark_current_process_failed();
-        unsafe { x86_64::instructions::interrupts::enable() };
+        x86_64::instructions::interrupts::enable();
         return;
     }
-    
+
     panic!("INVALID OPCODE (KERNEL): {:?}", stack_frame);
 }
 
@@ -403,16 +381,52 @@ unsafe extern "C" fn timer_interrupt_handler(
             }
         }
 
-        if let Some(entry) = next {
+        // Try to get the next thread to schedule (either from evaluate_timer_tick or pick_next)
+        let next_entry = next.or_else(|| scheduler.pick_next());
+
+        if let Some(entry) = next_entry {
             match entry.class {
                 SchedulingClass::User => {
                     if let Some(table) = ProcessTable::global() {
-                        if let Some((context, root)) =
-                            table.take_thread_context(entry.pid, entry.tid)
+                        if let Some(proc) = table.lookup(entry.pid) {
+                            if let Some((context, root)) = proc.take_thread_runtime(entry.tid) {
+                                static ENTRY_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+                                let count = ENTRY_COUNT.fetch_add(1, Ordering::Relaxed);
+                                if count < 10 || count % 50 == 0 {
+                                    let frame = context.frame();
+                                    log::trace!(
+                                        "timer: resuming user #{} pid={} tid={} rip={:#x}",
+                                        count,
+                                        entry.pid.as_u64(),
+                                        entry.tid.as_u64(),
+                                        frame.rip
+                                    );
+                                }
+                                log::trace!("timer: before apply_user_context");
+                                regs.apply_user_context(&context);
+                                log::trace!("timer: before write_user_frame");
+                                write_user_frame(frame, &context);
+                                log::trace!("timer: before switch_address_space cr3={:#x}", root.start_address().as_u64());
+                                switch_address_space(root);
+                                log::trace!("timer: after switch_address_space");
+                            } else if LOGGED_USER_ENTRY
+                                .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+                                .is_ok()
+                            {
+                                info!(
+                                    "timer: missing user context for pid={} tid={} (no runtime state)",
+                                    entry.pid.as_u64(),
+                                    entry.tid.as_u64()
+                                );
+                            }
+                        } else if LOGGED_USER_ENTRY
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+                            .is_ok()
                         {
-                            regs.apply_user_context(&context);
-                            write_user_frame(frame, &context);
-                            switch_address_space(root);
+                            info!(
+                                "timer: missing process for pid={} during scheduling",
+                                entry.pid.as_u64()
+                            );
                         }
                     }
                 }

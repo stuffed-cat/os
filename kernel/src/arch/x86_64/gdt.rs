@@ -1,5 +1,6 @@
 //! Global Descriptor Table setup for privileged execution.
 
+use log::trace;
 use spin::Once;
 use x86_64::instructions::segmentation::{Segment, CS, DS, ES, SS};
 use x86_64::instructions::tables::load_tss;
@@ -8,6 +9,8 @@ use x86_64::structures::tss::TaskStateSegment;
 use x86_64::VirtAddr;
 
 const DOUBLE_FAULT_IST_INDEX: usize = 0;
+const RING0_STACK_INDEX: usize = 0;
+const KERNEL_STACK_BYTES: usize = 4096;
 
 static TSS: Once<TaskStateSegment> = Once::new();
 static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
@@ -24,10 +27,23 @@ struct Selectors {
 pub fn init() {
     TSS.call_once(|| {
         let mut tss = TaskStateSegment::new();
-        static mut DOUBLE_FAULT_STACK: [u8; 4096] = [0; 4096];
-        let stack_start = VirtAddr::from_ptr(core::ptr::addr_of!(DOUBLE_FAULT_STACK));
-        let stack_end = stack_start + 4096;
-        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX] = stack_end;
+        static mut DOUBLE_FAULT_STACK: [u8; KERNEL_STACK_BYTES] = [0; KERNEL_STACK_BYTES];
+        static mut PRIVILEGE_STACK: [u8; KERNEL_STACK_BYTES] = [0; KERNEL_STACK_BYTES];
+
+        let df_stack_start = VirtAddr::from_ptr(core::ptr::addr_of!(DOUBLE_FAULT_STACK) as *const u8);
+    let df_stack_end = df_stack_start + KERNEL_STACK_BYTES as u64;
+    tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX] = df_stack_end;
+
+        let priv_stack_start = VirtAddr::from_ptr(core::ptr::addr_of!(PRIVILEGE_STACK) as *const u8);
+    let priv_stack_end = priv_stack_start + KERNEL_STACK_BYTES as u64;
+        tss.privilege_stack_table[RING0_STACK_INDEX] = priv_stack_end;
+
+        trace!(
+            "gdt: configured privilege stack top={:#x} df_ist={:#x}",
+            priv_stack_end.as_u64(),
+            df_stack_end.as_u64()
+        );
+
         tss
     });
 
