@@ -808,8 +808,20 @@ fn layout_image(image: &ExecutableImage, preferred_start: u64) -> ImagePlacement
         0
     };
 
-    let mut segments: Vec<SegmentMapping> = image
-        .segments()
+    // Create a mutable copy of segments for relocation
+    let mut exec_segments: Vec<ExecutableSegment> = image.segments().to_vec();
+    
+    // Apply relocations if the image has dynamic info
+    if image.is_position_independent() && bias != 0 {
+        log::trace!("user: applying relocations with bias=0x{:x}", bias);
+        crate::elf::apply_relocations(&mut exec_segments, image.dynamic_info(), bias);
+        log::trace!("user: relocations applied");
+    } else {
+        log::trace!("user: no relocations needed (PIE={} bias=0x{:x})", 
+            image.is_position_independent(), bias);
+    }
+
+    let mut segments: Vec<SegmentMapping> = exec_segments
         .iter()
         .map(|segment| segment_mapping(segment, bias))
         .collect();

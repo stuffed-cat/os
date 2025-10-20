@@ -409,24 +409,18 @@ impl MemoryManager {
         let end = VirtAddr::new(end_addr);
         let start_page = Page::containing_address(start);
         let end_page = Page::containing_address(end);
-        let mut flags = Self::flags_from_memory(segment.permissions());
+        let flags = Self::flags_from_memory(segment.permissions());
 
         trace!(
-            "memory: map segment [{:#x}, {:#x}) perms={:?} -> computed_flags={:?}",
+            "memory: map segment [{:#x}, {:#x}) perms={:?} -> page_flags={:?}",
             segment.base(),
             segment.base() + segment.length() as u64,
             segment.permissions(),
             flags
         );
-        
-        // x86_64 crate requires WRITABLE for initial page table setup
-        // We'll use set_flags to fix permissions after mapping
-        let needs_write_for_setup = !flags.contains(PageTableFlags::WRITABLE);
-        if needs_write_for_setup {
-            flags |= PageTableFlags::WRITABLE;
-            trace!("memory: temporarily adding WRITABLE for setup");
-        }
 
+        // Map pages with final correct permissions
+        // Data is copied via physical address mapping, so no WRITABLE needed
         for page in Page::range_inclusive(start_page, end_page) {
             let frame = self
                 .allocate_zeroed_frame()
@@ -439,22 +433,6 @@ impl MemoryManager {
                 handle.as_mut().record_mapping(frame);
             }
             self.copy_segment_into_frame(frame, segment, page);
-        }
-        
-        // Fix permissions for read-only segments
-        if needs_write_for_setup {
-            let correct_flags = Self::flags_from_memory(segment.permissions());
-            trace!("memory: fixing permissions to {:?}", correct_flags);
-            for page in Page::range_inclusive(start_page, end_page) {
-                unsafe {
-                    if mapper.translate_page(page).is_ok() {
-                        mapper
-                            .update_flags(page, correct_flags)
-                            .map_err(|_| SubsystemError::Runtime("failed to update page flags"))?
-                            .flush();
-                    }
-                }
-            }
         }
         
         Ok(())

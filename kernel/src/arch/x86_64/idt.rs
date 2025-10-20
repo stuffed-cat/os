@@ -75,12 +75,19 @@ fn dump_user_page_entry(addr: u64) {
                 (phys_offset + frame.start_address().as_u64()).as_u64() as *const PageTable;
             let table_ref = &*table_ptr;
             let entry = &table_ref[index];
+            
+            // Read raw entry value to check NX bit (bit 63)
+            let raw_entry = core::ptr::read_volatile(&table_ref[index] as *const _ as *const u64);
+            let nx_bit = (raw_entry >> 63) & 1;
+            
             serial::write_fmt(format_args!(
-                "pte L{} idx={} flags={:?} addr={:#x}\r\n",
+                "pte L{} idx={} flags={:?} addr={:#x} raw={:#x} NX={}\r\n",
                 4 - level,
                 index,
                 entry.flags(),
-                entry.addr().as_u64()
+                entry.addr().as_u64(),
+                raw_entry,
+                nx_bit
             ));
 
             if !entry.flags().contains(PageTableFlags::PRESENT) {
