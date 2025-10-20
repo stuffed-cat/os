@@ -4,6 +4,7 @@
 use crate::arch::x86_64::serial;
 use crate::core::{KernelContext, Subsystem, SubsystemId};
 use crate::error::SubsystemError;
+use crate::fs::{self, FsError as KernelFsError};
 use crate::memory::MemoryManager;
 use crate::process::ProcessTable;
 #[cfg(all(not(feature = "std"), not(feature = "hardware")))]
@@ -15,15 +16,26 @@ use crate::users;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::string::String;
+use alloc::vec::Vec;
 #[cfg(all(not(feature = "std"), not(feature = "hardware")))]
 use log::{error, warn};
 use log::trace;
 use pc_keyboard::layouts::Us104Key;
 use pc_keyboard::{DecodedKey, HandleControl, Keyboard, ScancodeSet1};
 use spin::{Lazy, Mutex};
+use userland::bare_shell::{
+    AuthError as BareAuthError, BareShell, DirEntry as BareDirEntry, EntryKind as BareEntryKind,
+    ExecResult as BareExecResult, FsError as BareFsError, ShellFs as BareShellFs,
+    ShellIo as BareShellIo, ShellSystem as BareShellSystem, SystemError as BareSystemError,
+    UserAdminError as BareUserAdminError, UserIdentity as BareUserIdentity,
+};
 
 const SCANCODE_QUEUE_CAPACITY: usize = 256;
 const CONSOLE_BUFFER_CAPACITY: usize = 4096;
+const ENABLE_USER_PROCESSES: bool = false;
+const DEFAULT_HOSTNAME: &str = "nexaos";
+
+type KernelBareShell = BareShell<KernelShellIo, KernelShellFs, KernelShellSystem>;
 
 struct ConsoleState {
     keyboard: Keyboard<Us104Key, ScancodeSet1>,
@@ -121,6 +133,8 @@ impl ConsoleState {
 }
 
 static CONSOLE: Lazy<Mutex<ConsoleState>> = Lazy::new(|| Mutex::new(ConsoleState::new()));
+static BARE_SHELL_SCANCODES: Lazy<Mutex<VecDeque<u8>>> =
+    Lazy::new(|| Mutex::new(VecDeque::with_capacity(SCANCODE_QUEUE_CAPACITY)));
 
 /// Tracks the thread currently executing in user mode.
 static CURRENT_THREAD: Lazy<Mutex<Option<RunQueueEntry>>> = Lazy::new(|| Mutex::new(None));
@@ -131,6 +145,263 @@ static FAILED_THREAD: Lazy<Mutex<Option<RunQueueEntry>>> = Lazy::new(|| Mutex::n
 /// Records details about the most recent user space fault.
 static LAST_USER_FAULT: Lazy<Mutex<Option<UserFaultRecord>>> =
     Lazy::new(|| Mutex::new(None));
+
+fn push_bare_shell_scancode(scancode: u8) {
+    let mut queue = BARE_SHELL_SCANCODES.lock();
+    if queue.len() >= SCANCODE_QUEUE_CAPACITY {
+        queue.pop_front();
+    }
+    queue.push_back(scancode);
+}
+
+fn serial_write(msg: &str) {
+    serial::write_str(msg);
+}
+
+struct KernelShellIo;
+
+impl BareShellIo for KernelShellIo {
+    fn next_scancode(&mut self) -> Option<u8> {
+        BARE_SHELL_SCANCODES.lock().pop_front()
+    }
+
+    fn write_str(&mut self, s: &str) {
+        serial_write(s);
+    }
+}
+
+struct KernelShellFs;
+
+impl KernelShellFs {
+    fn creds() -> crate::fs::Credentials {
+        session::current_credentials()
+    }
+
+    fn map_error(err: KernelFsError) -> BareFsError {
+        match err {
+            KernelFsError::NotInitialized | KernelFsError::Unsupported => BareFsError::Unavailable,
+            KernelFsError::InvalidImage => BareFsError::Corrupt,
+            KernelFsError::NotFound => BareFsError::NotFound,
+            KernelFsError::NotDirectory => BareFsError::NotDirectory,
+            KernelFsError::NotFile => BareFsError::NotFile,
+            KernelFsError::PermissionDenied => BareFsError::PermissionDenied,
+            KernelFsError::AlreadyExists => BareFsError::AlreadyExists,
+            KernelFsError::DirectoryNotEmpty => BareFsError::DirectoryNotEmpty,
+        }
+    }
+
+    fn convert_entry(entry: fs::DirEntry) -> BareDirEntry {
+        let kind = match entry.kind {
+            fs::EntryKind::Directory => BareEntryKind::Directory,
+            fs::EntryKind::File => BareEntryKind::File,
+        };
+        BareDirEntry {
+            name: entry.name,
+            kind,
+            size: entry.size,
+            mode: entry.mode,
+            uid: entry.uid,
+            gid: entry.gid,
+            inode: entry.inode,
+        }
+    }
+}
+
+impl BareShellFs for KernelShellFs {
+    fn list_dir(&self, path: &str) -> Result<Vec<BareDirEntry>, BareFsError> {
+        let creds = Self::creds();
+        fs::list_dir_with_credentials(path, &creds)
+            .map(|entries| entries.into_iter().map(Self::convert_entry).collect())
+            .map_err(Self::map_error)
+    }
+
+    fn read_file(&self, path: &str) -> Result<Vec<u8>, BareFsError> {
+        let creds = Self::creds();
+        fs::read_file_with_credentials(path, &creds).map_err(Self::map_error)
+    }
+
+    fn create_file(&self, path: &str, mode: u16) -> Result<(), BareFsError> {
+        let creds = Self::creds();
+        fs::create_file_with_credentials(path, &creds, mode).map_err(Self::map_error)
+    }
+
+    fn create_dir(&self, path: &str, mode: u16) -> Result<(), BareFsError> {
+        let creds = Self::creds();
+        fs::create_dir_with_credentials(path, &creds, mode).map_err(Self::map_error)
+    }
+
+    fn remove_file(&self, path: &str) -> Result<(), BareFsError> {
+        let creds = Self::creds();
+        fs::remove_file_with_credentials(path, &creds).map_err(Self::map_error)
+    }
+
+    fn remove_dir(&self, path: &str) -> Result<(), BareFsError> {
+        let creds = Self::creds();
+        fs::remove_dir_with_credentials(path, &creds).map_err(Self::map_error)
+    }
+
+    fn write_file(
+        &self,
+        path: &str,
+        offset: usize,
+        data: &[u8],
+        truncate: bool,
+    ) -> Result<usize, BareFsError> {
+        let creds = Self::creds();
+        fs::write_file_with_credentials(path, &creds, offset, data, truncate)
+            .map_err(Self::map_error)
+    }
+
+    fn chmod(&self, path: &str, mode: u16) -> Result<(), BareFsError> {
+        let creds = Self::creds();
+        fs::chmod_with_credentials(path, &creds, mode).map_err(Self::map_error)
+    }
+
+    fn chown(&self, path: &str, uid: u32, gid: u32) -> Result<(), BareFsError> {
+        let creds = Self::creds();
+        fs::chown_with_credentials(path, &creds, uid, gid).map_err(Self::map_error)
+    }
+}
+
+struct KernelShellSystem {
+    hostname: &'static str,
+}
+
+impl KernelShellSystem {
+    const fn new(hostname: &'static str) -> Self {
+        Self { hostname }
+    }
+
+    fn to_identity(profile: users::UserProfile) -> BareUserIdentity {
+        BareUserIdentity {
+            username: profile.username,
+            uid: profile.uid,
+            gid: profile.gid,
+            groups: profile.groups,
+            home: profile.home,
+            shell: profile.shell,
+        }
+    }
+
+    fn current_identity() -> BareUserIdentity {
+        let session = session::current_session();
+        BareUserIdentity {
+            username: session.username,
+            uid: session.uid,
+            gid: session.gid,
+            groups: session.groups,
+            home: session.home,
+            shell: session.shell,
+        }
+    }
+
+    fn require_root() -> Result<(), BareUserAdminError> {
+        let session = session::current_session();
+        if session.uid == 0 {
+            Ok(())
+        } else {
+            Err(BareUserAdminError::PermissionDenied)
+        }
+    }
+
+    fn map_user_error_admin(err: users::UserError) -> BareUserAdminError {
+        match err {
+            users::UserError::AlreadyExists => BareUserAdminError::AlreadyExists,
+            users::UserError::NotFound => BareUserAdminError::NotFound,
+            users::UserError::InvalidPassword => BareUserAdminError::InvalidPassword,
+            users::UserError::AuthenticationFailed => BareUserAdminError::PermissionDenied,
+        }
+    }
+
+    fn map_user_error_auth(err: users::UserError) -> BareAuthError {
+        match err {
+            users::UserError::NotFound => BareAuthError::NotFound,
+            users::UserError::InvalidPassword | users::UserError::AuthenticationFailed => {
+                BareAuthError::InvalidPassword
+            }
+            users::UserError::AlreadyExists => BareAuthError::Unsupported,
+        }
+    }
+}
+
+impl BareShellSystem for KernelShellSystem {
+    fn reboot(&self) -> Result<(), BareSystemError> {
+        Err(BareSystemError::Unsupported)
+    }
+
+    fn shutdown(&self) -> Result<(), BareSystemError> {
+        Err(BareSystemError::Unsupported)
+    }
+
+    fn exec(
+        &self,
+        _path: &str,
+        _args: &[&str],
+        _cwd: &str,
+        _env: &[(&str, &str)],
+    ) -> Result<BareExecResult, BareSystemError> {
+        Err(BareSystemError::Unsupported)
+    }
+
+    fn current_user(&self) -> BareUserIdentity {
+        Self::current_identity()
+    }
+
+    fn authenticate(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<BareUserIdentity, BareAuthError> {
+        users::authenticate(username, password)
+            .map(Self::to_identity)
+            .map_err(Self::map_user_error_auth)
+    }
+
+    fn set_session(&self, user: &BareUserIdentity) -> Result<BareUserIdentity, BareAuthError> {
+        if let Some(profile) = users::get_user(&user.username) {
+            session::set_session(&profile);
+            Ok(Self::to_identity(profile))
+        } else {
+            Err(BareAuthError::NotFound)
+        }
+    }
+
+    fn create_user(
+        &self,
+        username: &str,
+        password: &str,
+        home: Option<&str>,
+    ) -> Result<BareUserIdentity, BareUserAdminError> {
+        Self::require_root()?;
+        users::add_user(username, password, home, None)
+            .map(Self::to_identity)
+            .map_err(Self::map_user_error_admin)
+    }
+
+    fn set_password(&self, username: &str, password: &str) -> Result<(), BareUserAdminError> {
+        let session = session::current_session();
+        if session.uid != 0 && session.username != username {
+            return Err(BareUserAdminError::PermissionDenied);
+        }
+        users::set_password(username, password).map_err(Self::map_user_error_admin)
+    }
+
+    fn list_users(&self) -> Result<Vec<BareUserIdentity>, BareUserAdminError> {
+        Self::require_root()?;
+        Ok(users::list_users()
+            .into_iter()
+            .map(Self::to_identity)
+            .collect())
+    }
+
+    fn lookup_user(&self, username: &str) -> Option<BareUserIdentity> {
+        users::get_user(username).map(Self::to_identity)
+    }
+
+    fn hostname(&self) -> &str {
+        self.hostname
+    }
+}
 
 /// User space fault classification for diagnostics.
 #[derive(Clone, Copy, Debug)]
@@ -181,8 +452,11 @@ fn clear_current_thread() {
 
 /// Enqueues a raw keyboard scancode produced by the hardware interrupt handler.
 pub fn enqueue_scancode(scancode: u8) {
-    let mut console = CONSOLE.lock();
-    console.push_scancode(scancode);
+    push_bare_shell_scancode(scancode);
+    if ENABLE_USER_PROCESSES {
+        let mut console = CONSOLE.lock();
+        console.push_scancode(scancode);
+    }
 }
 
 /// Called by exception handlers to signal that the current process should be skipped
@@ -270,6 +544,7 @@ pub struct ShellSubsystem {
     process_table: &'static ProcessTable,
     scheduler: &'static Scheduler,
     init_spawned: bool,
+    bare_shell: KernelBareShell,
 }
 
 impl ShellSubsystem {
@@ -286,10 +561,19 @@ impl ShellSubsystem {
         dispatcher.register_global();
         crate::arch::x86_64::serial::write_str("shell: syscall dispatcher registered\r\n");
 
+        session::reset_to_root();
+        let bare_shell = BareShell::new(
+            KernelShellIo,
+            KernelShellFs,
+            KernelShellSystem::new(DEFAULT_HOSTNAME),
+        );
+        crate::arch::x86_64::serial::write_str("shell: bare shell initialized\r\n");
+
         Self {
             process_table,
             scheduler,
             init_spawned: false,
+            bare_shell,
         }
     }
 
@@ -362,6 +646,10 @@ impl ShellSubsystem {
         self.scheduler
             .enqueue(RunQueueEntry::user(process.pid(), tid, priority));
         Ok(())
+    }
+
+    fn poll_bare_shell(&mut self) {
+        self.bare_shell.poll();
     }
 
     #[cfg(all(not(feature = "std"), not(feature = "hardware")))]
@@ -446,7 +734,7 @@ impl Subsystem for ShellSubsystem {
         Scheduler::enable_timer_global();
         serial::write_str("shell: timer enabled in init\r\n");
 
-        if !self.init_spawned {
+        if ENABLE_USER_PROCESSES && !self.init_spawned {
             serial::write_str("shell: launching initial user\r\n");
             
             let result = self.launch_initial_user();
@@ -466,6 +754,9 @@ impl Subsystem for ShellSubsystem {
                     return Err(e);
                 }
             }
+        } else if !ENABLE_USER_PROCESSES && !self.init_spawned {
+            serial::write_str("shell: userspace launch disabled; running bare shell only\r\n");
+            self.init_spawned = true;
         }
 
         // Always re-enable interrupts if they were enabled before
@@ -480,6 +771,7 @@ impl Subsystem for ShellSubsystem {
     fn tick(&mut self, _ctx: &KernelContext) -> Result<(), SubsystemError> {
         #[cfg(all(not(feature = "std"), not(feature = "hardware")))]
         self.run_ready_threads();
+        self.poll_bare_shell();
         Ok(())
     }
 }
