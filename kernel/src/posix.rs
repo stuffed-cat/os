@@ -157,6 +157,19 @@ impl<'a> PosixLayer<'a> {
                 let millis = args.get(0).copied().unwrap_or_default();
                 self.sleep(millis)
             }
+            SyscallId::Brk => {
+                let addr = args.get(0).copied().unwrap_or_default();
+                self.brk(pid, addr)
+            }
+            SyscallId::Mmap => {
+                let _addr = args.get(0).copied().unwrap_or_default();
+                let length = args.get(1).copied().unwrap_or_default();
+                let _prot = args.get(2).copied().unwrap_or_default();
+                let _flags = args.get(3).copied().unwrap_or_default();
+                let _fd = args.get(4).copied().unwrap_or_default();
+                let _offset = args.get(5).copied().unwrap_or_default();
+                self.mmap(pid, length)
+            }
             _ => Err(Errno::NoImpl),
         }
     }
@@ -551,6 +564,21 @@ impl<'a> PosixLayer<'a> {
             }
             Ok(0)
         }
+    }
+
+    fn brk(&self, pid: Pid, addr: u64) -> Result<u64, Errno> {
+        let proc = self.process_table.lookup(pid).ok_or(Errno::NoEnt)?;
+        let result = proc.brk(addr);
+        log::info!("brk: pid={} addr=0x{:x} -> 0x{:x}", pid.as_u64(), addr, result);
+        Ok(result)
+    }
+
+    fn mmap(&self, pid: Pid, length: u64) -> Result<u64, Errno> {
+        let proc = self.process_table.lookup(pid).ok_or(Errno::NoEnt)?;
+        // Allocate from mmap region starting at 0x40000000 (1GB)
+        let addr = proc.allocate_mmap(length);
+        log::info!("mmap: pid={} length=0x{:x} -> 0x{:x}", pid.as_u64(), length, addr);
+        Ok(addr)
     }
 
     /// Normalizes POSIX path.

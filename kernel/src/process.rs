@@ -121,6 +121,8 @@ pub struct Process {
     gid: AtomicU32,
     groups: RwLock<Vec<u32>>,
     next_tid: AtomicU64,
+    program_break: AtomicU64,  // Heap break for brk/sbrk syscalls
+    mmap_next: AtomicU64,  // Next address for mmap allocations
 }
 
 impl Process {
@@ -149,6 +151,8 @@ impl Process {
             gid: AtomicU32::new(0),
             groups: RwLock::new(vec![0]),
             next_tid: AtomicU64::new(1),
+            program_break: AtomicU64::new(0x10000000),  // Initial brk at 256MB
+            mmap_next: AtomicU64::new(0x40000000),  // Start mmap at 1GB
         });
 
         process.set_fd(0, String::from("tty:stdin"));
@@ -186,6 +190,33 @@ impl Process {
     /// Returns whether the process has terminated.
     pub fn is_terminated(&self) -> bool {
         self.terminated.load(Ordering::SeqCst)
+    }
+
+    /// Gets or sets the program break (heap end).
+    /// If addr is 0, returns the current break.
+    /// Otherwise, attempts to set the break to addr.
+    /// Returns the current break (failure) for now since we don't map pages yet.
+    pub fn brk(&self, addr: u64) -> u64 {
+        let current = self.program_break.load(Ordering::SeqCst);
+        if addr == 0 {
+            current
+        } else {
+            // TODO: Actually map pages and expand heap
+            // For now, refuse to expand - return current brk to indicate failure
+            // This will force dynamic linker to fall back to mmap
+            current
+        }
+    }
+
+    /// Allocates a memory region via mmap (simplified, no actual mapping).
+    /// Returns the virtual address for the requested length.
+    pub fn allocate_mmap(&self, length: u64) -> u64 {
+        // Align length to page boundary
+        let aligned_length = (length + 0xfff) & !0xfff;
+        // Atomically allocate and advance
+        let addr = self.mmap_next.fetch_add(aligned_length, Ordering::SeqCst);
+        // TODO: Actually map pages  
+        addr
     }
 
     /// Registers a capability token.
@@ -340,10 +371,43 @@ impl Process {
         *self.address_space.write() = Some(space.clone());
         *self.user_context.write() = Some(context.clone());
 
+        // Calculate initial brk from loaded segments
+        let mut max_addr = 0u64;
+        for seg in space.segments() {
+            let seg_end = seg.base() + seg.length() as u64;
+            if seg_end > max_addr {
+                max_addr = seg_end;
+            }
+        }
+        // Align to next page boundary (4KB)
+        let brk_start = (max_addr + 0xfff) & !0xfff;
+        self.program_break.store(brk_start, Ordering::SeqCst);
+
         self.reset_threads();
 
         match handle {
             Some(handle) => {
+                // Pre-map heap region (16MB) for brk/mmap
+                if let Some(manager) = memory {
+                    let heap_size = 16 * 1024 * 1024; // 16MB
+                    log::info!("Pre-mapping heap region: {} bytes at 0x{:x}", heap_size, brk_start);
+                    
+                    use x86_64::structures::paging::PageTableFlags;
+                    let flags = PageTableFlags::PRESENT 
+                        | PageTableFlags::WRITABLE 
+                        | PageTableFlags::USER_ACCESSIBLE 
+                        | PageTableFlags::NO_EXECUTE;
+                    
+                    use x86_64::VirtAddr;
+                    if let Err(e) = manager.map_region(
+                        VirtAddr::new(brk_start),
+                        heap_size,
+                        flags,
+                    ) {
+                        log::warn!("Failed to pre-map heap: {:?}", e);
+                    }
+                }
+                
                 let root = handle.root();
                 *self.page_table.write() = Some(handle);
                 let tid = self.allocate_tid();

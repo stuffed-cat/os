@@ -43,6 +43,10 @@ pub enum SyscallId {
     GetCwd,
     /// POSIX `nanosleep` (millisecond placeholder) syscall.
     Sleep,
+    /// Memory management `brk` syscall (stub).
+    Brk,
+    /// Memory mapping `mmap` syscall (stub).
+    Mmap,
     /// Placeholder for future syscalls.
     Unknown(u64),
 }
@@ -65,6 +69,8 @@ impl From<u64> for SyscallId {
             80 => SyscallId::Chdir,
             79 => SyscallId::GetCwd,
             35 => SyscallId::Sleep,
+            12 => SyscallId::Brk,
+            9 => SyscallId::Mmap,
             other => SyscallId::Unknown(other),
         }
     }
@@ -102,6 +108,7 @@ impl<'a> SyscallDispatcher<'a> {
         ];
         let result = self.handle(pid, id, &args)?;
         frame.set_return_value(result);
+        log::debug!("syscall {:?} returned 0x{:x} to RAX", id, result);
         Ok(())
     }
 

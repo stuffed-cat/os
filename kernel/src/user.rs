@@ -616,14 +616,22 @@ pub fn prepare_initial_stack(
         builder.push_u64(*ptr).map_err(SubsystemError::from)?;
     }
 
+    // x86-64 ABI requires RSP to be 16-byte aligned at process entry (_start)
+    // After pushing argc, RSP should be misaligned by 8 (as if a call just happened)
+    // But we need to account for the fact that we're entering _start directly
+    // without a call, so we need RSP%16==0 BEFORE push argc
     builder.align_down(16).map_err(SubsystemError::from)?;
+    
+    // Push a dummy return address to simulate a call to _start
+    // This makes RSP%16==8, which is what we want before push argc
+    builder.push_u64(0).map_err(SubsystemError::from)?;
 
-    debug_assert_eq!(builder.current_sp() & 0xF, 0);
+    debug_assert_eq!(builder.current_sp() & 0xF, 8);
 
     let argc = (argv_entries.len() - 1) as u64;
     builder.push_u64(argc).map_err(SubsystemError::from)?;
 
-    debug_assert_eq!(builder.current_sp() & 0xF, 8);
+    debug_assert_eq!(builder.current_sp() & 0xF, 0);
 
     let result = builder.finalize().map_err(SubsystemError::from)?;
     Ok(StackInitialization {

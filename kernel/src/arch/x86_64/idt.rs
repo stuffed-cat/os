@@ -444,11 +444,24 @@ extern "x86-interrupt" fn general_protection_fault_handler(
         );
 
         #[cfg(feature = "hardware")]
-        serial::write_fmt(format_args!(
-            "\r\n=== USER GP FAULT ===\r\nRIP: {:#x}\r\nError Code: {:#x}\r\n",
-            stack_frame.instruction_pointer.as_u64(),
-            error_code
-        ));
+        {
+            let (rbp, rsp): (u64, u64);
+            unsafe {
+                core::arch::asm!(
+                    "mov {}, rbp",
+                    "mov {}, rsp",
+                    out(reg) rbp,
+                    out(reg) rsp,
+                );
+            }
+            serial::write_fmt(format_args!(
+                "\r\n=== USER GP FAULT ===\r\nRIP: {:#x}\r\nRSP: {:#x} (mod 16 = {})\r\nRBP: {:#x} (mod 16 = {})\r\nError Code: {:#x}\r\n",
+                stack_frame.instruction_pointer.as_u64(),
+                rsp, rsp & 0xF,
+                rbp, rbp & 0xF,
+                error_code
+            ));
+        }
 
         error!(
             "User mode GENERAL PROTECTION FAULT\nRIP: {:#x}\nError Code: {:#x}",
