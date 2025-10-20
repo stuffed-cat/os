@@ -45,9 +45,9 @@ const DT_RELAENT: u64 = 9;
 const DT_REL: u64 = 17;
 const DT_RELSZ: u64 = 18;
 const DT_RELENT: u64 = 19;
-const DT_RELR: u64 = 36;         // RELR relative relocations (compressed)
-const DT_RELRSZ: u64 = 35;       // Size of RELR table
-const DT_RELRENT: u64 = 37;      // Size of RELR entry
+const DT_RELR: u64 = 36; // RELR relative relocations (compressed)
+const DT_RELRSZ: u64 = 35; // Size of RELR table
+const DT_RELRENT: u64 = 37; // Size of RELR entry
 
 // x86_64 relocation types
 const R_X86_64_NONE: u32 = 0;
@@ -248,7 +248,8 @@ impl ExecutableImage {
                     if p_filesz > 0 {
                         let offset =
                             usize::try_from(p_offset).map_err(|_| ElfError::BadSegmentBounds)?;
-                        let size = usize::try_from(p_filesz).map_err(|_| ElfError::BadSegmentBounds)?;
+                        let size =
+                            usize::try_from(p_filesz).map_err(|_| ElfError::BadSegmentBounds)?;
                         if offset
                             .checked_add(size)
                             .map_or(true, |end| end > data.len())
@@ -637,17 +638,17 @@ fn read_u32(data: &[u8], offset: usize) -> u32 {
 fn parse_dynamic_section(data: &[u8]) -> Result<DynamicInfo, ElfError> {
     const DYNAMIC_ENTRY_SIZE: usize = 16;
     let mut info = DynamicInfo::default();
-    
+
     let entry_count = data.len() / DYNAMIC_ENTRY_SIZE;
     for i in 0..entry_count {
         let offset = i * DYNAMIC_ENTRY_SIZE;
         if offset + DYNAMIC_ENTRY_SIZE > data.len() {
             break;
         }
-        
+
         let d_tag = read_u64(data, offset);
         let d_val = read_u64(data, offset + 8);
-        
+
         match d_tag {
             DT_NULL => break,
             DT_RELA => info.rela_addr = Some(d_val),
@@ -656,13 +657,13 @@ fn parse_dynamic_section(data: &[u8]) -> Result<DynamicInfo, ElfError> {
             DT_REL => info.rel_addr = Some(d_val),
             DT_RELSZ => info.rel_size = Some(d_val),
             DT_RELENT => info.rel_ent = Some(d_val),
-            DT_RELRSZ => info.relr_size = Some(d_val),  // Note: size comes before address in DT_ numbers
+            DT_RELRSZ => info.relr_size = Some(d_val), // Note: size comes before address in DT_ numbers
             DT_RELR => info.relr_addr = Some(d_val),
             DT_RELRENT => info.relr_ent = Some(d_val),
             _ => {}
         }
     }
-    
+
     Ok(info)
 }
 
@@ -673,38 +674,42 @@ fn extract_relocations(
     _load_bias: u64,
 ) -> Vec<RelocationEntry> {
     let mut relocations = Vec::new();
-    
+
     // Try RELA first (most common for x86_64)
     if let (Some(rela_addr), Some(rela_size)) = (dynamic.rela_addr, dynamic.rela_size) {
         const RELA_ENTRY_SIZE: usize = 24; // sizeof(Elf64_Rela)
-        
-        log::trace!("elf: searching for RELA table at vaddr=0x{:x} size={}", rela_addr, rela_size);
-        
+
+        log::trace!(
+            "elf: searching for RELA table at vaddr=0x{:x} size={}",
+            rela_addr,
+            rela_size
+        );
+
         // Find which segment contains the RELA table
         for segment in segments {
             let seg_start = segment.virtual_addr;
             let seg_end = seg_start + segment.data.len() as u64;
-            
+
             log::trace!("elf: checking segment [0x{:x}, 0x{:x})", seg_start, seg_end);
-            
+
             if rela_addr >= seg_start && rela_addr < seg_end {
                 let table_offset = (rela_addr - seg_start) as usize;
                 let table_size = rela_size as usize;
-                
+
                 if table_offset + table_size <= segment.data.len() {
                     let table_data = &segment.data[table_offset..table_offset + table_size];
                     let entry_count = table_size / RELA_ENTRY_SIZE;
-                    
+
                     for i in 0..entry_count {
                         let entry_offset = i * RELA_ENTRY_SIZE;
                         if entry_offset + RELA_ENTRY_SIZE <= table_data.len() {
                             let r_offset = read_u64(table_data, entry_offset);
                             let r_info = read_u64(table_data, entry_offset + 8);
                             let r_addend = read_i64(table_data, entry_offset + 16);
-                            
+
                             let r_type = (r_info & 0xffffffff) as u32;
                             let r_sym = (r_info >> 32) as u32;
-                            
+
                             relocations.push(RelocationEntry {
                                 offset: r_offset,
                                 r_type,
@@ -718,30 +723,34 @@ fn extract_relocations(
             }
         }
     }
-    
+
     // Now try RELR (compressed relative relocations)
     if let (Some(relr_addr), Some(relr_size)) = (dynamic.relr_addr, dynamic.relr_size) {
-        log::trace!("elf: searching for RELR table at vaddr=0x{:x} size={}", relr_addr, relr_size);
-        
+        log::trace!(
+            "elf: searching for RELR table at vaddr=0x{:x} size={}",
+            relr_addr,
+            relr_size
+        );
+
         // Find which segment contains the RELR table
         for segment in segments {
             let seg_start = segment.virtual_addr;
             let seg_end = seg_start + segment.data.len() as u64;
-            
+
             if relr_addr >= seg_start && relr_addr < seg_end {
                 let table_offset = (relr_addr - seg_start) as usize;
                 let table_size = relr_size as usize;
-                
+
                 if table_offset + table_size <= segment.data.len() {
                     let table_data = &segment.data[table_offset..table_offset + table_size];
                     let entry_count = table_size / 8; // Each RELR entry is 8 bytes
-                    
+
                     let mut base_addr = 0u64;
                     for i in 0..entry_count {
                         let entry_offset = i * 8;
                         if entry_offset + 8 <= table_data.len() {
                             let entry = read_u64(table_data, entry_offset);
-                            
+
                             if entry & 1 == 0 {
                                 // LSB = 0: This is a base address
                                 base_addr = entry;
@@ -776,7 +785,7 @@ fn extract_relocations(
             }
         }
     }
-    
+
     relocations
 }
 
@@ -789,31 +798,34 @@ pub fn apply_relocations(
     let Some(dynamic_info) = dynamic else {
         return;
     };
-    
+
     let relocations = extract_relocations(segments, dynamic_info, load_bias);
-    
-    log::trace!("elf: found {} relocations, load_bias=0x{:x}", 
-        relocations.len(), load_bias);
-    
+
+    log::trace!(
+        "elf: found {} relocations, load_bias=0x{:x}",
+        relocations.len(),
+        load_bias
+    );
+
     let mut applied_count = 0;
     let mut code_segment_modified = 0;
-    
+
     for reloc in relocations {
         // Only handle R_X86_64_RELATIVE for now (most critical for PIE)
         if reloc.r_type != R_X86_64_RELATIVE {
             continue;
         }
-        
+
         let target_addr = reloc.offset;
-        
+
         // Find which segment contains the target address
         for segment in segments.iter_mut() {
             let seg_start = segment.virtual_addr;
             let seg_end = seg_start + segment.data.len() as u64;
-            
+
             if target_addr >= seg_start && target_addr + 8 <= seg_end {
                 let offset_in_seg = (target_addr - seg_start) as usize;
-                
+
                 if offset_in_seg + 8 <= segment.data.len() {
                     // Check if we're modifying executable segment (should not happen!)
                     if segment.flags.executable {
@@ -821,16 +833,16 @@ pub fn apply_relocations(
                             target_addr, seg_start, seg_end);
                         code_segment_modified += 1;
                     }
-                    
+
                     // For RELR (addend=0), read the current value at target as the addend
                     let addend = if reloc.addend == 0 {
                         read_u64(&segment.data, offset_in_seg) as i64
                     } else {
                         reloc.addend
                     };
-                    
+
                     let new_value = (load_bias as i64 + addend) as u64;
-                    
+
                     // Write the relocated value as little-endian u64
                     segment.data[offset_in_seg..offset_in_seg + 8]
                         .copy_from_slice(&new_value.to_le_bytes());
@@ -840,12 +852,18 @@ pub fn apply_relocations(
             }
         }
     }
-    
+
     if code_segment_modified > 0 {
-        log::error!("elf: WARNING - {} relocations modified code segment!", code_segment_modified);
+        log::error!(
+            "elf: WARNING - {} relocations modified code segment!",
+            code_segment_modified
+        );
     }
-    
-    log::trace!("elf: applied {} R_X86_64_RELATIVE relocations", applied_count);
+
+    log::trace!(
+        "elf: applied {} R_X86_64_RELATIVE relocations",
+        applied_count
+    );
 }
 
 fn normalize_alignment(value: u64) -> Result<u64, ElfError> {

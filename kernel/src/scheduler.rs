@@ -697,7 +697,7 @@ impl Scheduler {
                     inner.need_resched = true;
                     return Some(info.entry);
                 }
-                
+
                 info.vruntime = info.vruntime.saturating_add(info.priority.weight());
                 if running.slice_remaining > 1 {
                     running.slice_remaining -= 1;

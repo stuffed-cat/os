@@ -48,7 +48,7 @@ impl Shell {
     /// Runs the shell interactively using stdin/stdout.
     pub fn run_interactive(&mut self) -> i32 {
         let stdin = io::stdin();
-        let interactive = stdin.is_terminal();
+        let show_prompt = should_render_prompt(&stdin);
         let mut handle = stdin.lock();
         let mut buffer = String::new();
 
@@ -56,7 +56,7 @@ impl Shell {
             buffer.clear();
 
             // Print prompt when stdin is a terminal (best effort—ignore errors).
-            if interactive {
+            if show_prompt {
                 print!("{}", self.prompt);
                 let _ = io::stdout().flush();
             }
@@ -227,6 +227,42 @@ impl Shell {
                 source: err,
             }),
         }
+    }
+}
+
+fn should_render_prompt(stdin: &io::Stdin) -> bool {
+    if let Some(force) = env_flag("NEXA_FORCE_PROMPT") {
+        return force;
+    }
+
+    if env_flag("NEXA_DISABLE_PROMPT").unwrap_or(false) {
+        return false;
+    }
+
+    if stdin.is_terminal() || io::stdout().is_terminal() || io::stderr().is_terminal() {
+        return true;
+    }
+
+    if let Some(noninteractive) = env_flag("NEXA_ASSUME_NONINTERACTIVE") {
+        return !noninteractive;
+    }
+
+    // Fallback for environments where tty detection is not yet supported.
+    true
+}
+
+fn env_flag(name: &str) -> Option<bool> {
+    env::var_os(name).map(|value| {
+        let owned = value.to_string_lossy();
+        parse_boolish(owned.trim())
+    })
+}
+
+fn parse_boolish(raw: &str) -> bool {
+    let normalized = raw.to_ascii_lowercase();
+    match normalized.as_str() {
+        "0" | "false" | "no" | "off" => false,
+        _ => !normalized.is_empty(),
     }
 }
 
@@ -419,5 +455,14 @@ mod tests {
     fn detect_dangling_escape() {
         let err = parse_tokens("echo foo\\").unwrap_err();
         assert!(matches!(err, ShellError::Parse(ParseError::DanglingEscape)));
+    }
+
+    #[test]
+    fn parse_boolish_variants() {
+        assert!(parse_boolish("1"));
+        assert!(parse_boolish("true"));
+        assert!(!parse_boolish("0"));
+        assert!(!parse_boolish("off"));
+        assert!(parse_boolish("maybe"));
     }
 }

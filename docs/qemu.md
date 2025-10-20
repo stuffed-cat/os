@@ -42,8 +42,7 @@
 ```bash
 qemu-system-x86_64 \
    -drive format=raw,file=target/x86_64-unknown-none/debug/bootimage-bios.img \
-  -serial stdio \
-  -display none
+  -serial stdio
 ```
 
 - `-serial stdio` 将串口输出重定向到当前终端，便于查看 `kernel` 打印的日志。
@@ -68,5 +67,6 @@ qemu-system-x86_64 \
 | `serde_core` 缺少 `Result`/`Option` 等符号 | 未使用 nightly 或缺失 `llvm-tools-preview` | 重新执行前置安装命令，确保 `cargo +nightly` 在使用 |
 | `bootimage` 命令不存在 | 未安装或 PATH 未更新 | 重新运行 `cargo +nightly install bootimage` 并重新打开终端 |
 | QEMU 启动后黑屏无输出 | 未启用串口 / 内核未打印 | 加上 `-serial stdio` 参数，或检查 `kernel` 日志初始化 |
+| `failed to create FAT filesystem` 报错 | 旧版镜像生成流程受 FAT16 容量限制 | 当前版本已自动切换 FAT32；若仍失败，请确认磁盘镜像未超过 2 GiB |
 
 目前 `kernel` 裸机模式功能有限，将在 roadmap 中持续扩展。欢迎在体验过程中记录问题并更新 [`docs/troubleshooting.md`](troubleshooting.md)。

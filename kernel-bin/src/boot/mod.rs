@@ -104,7 +104,7 @@ fn collect_frame_ranges(regions: &MemoryRegions) -> ArrayVec<FrameRange, 256> {
 /// Required for modern glibc which uses SSE instructions like movq %rsi,%xmm2
 fn enable_sse() {
     use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
-    
+
     unsafe {
         // Clear CR0.EM (bit 2) - Enable FPU emulation = disabled
         // Set CR0.MP (bit 1) - Monitor coprocessor = enabled
@@ -112,7 +112,7 @@ fn enable_sse() {
         cr0.remove(Cr0Flags::EMULATE_COPROCESSOR);
         cr0.insert(Cr0Flags::MONITOR_COPROCESSOR);
         Cr0::write(cr0);
-        
+
         // Set CR4.OSFXSR (bit 9) - Enable FXSAVE/FXRSTOR
         // Set CR4.OSXMMEXCPT (bit 10) - Enable SSE exceptions
         let mut cr4 = Cr4::read();

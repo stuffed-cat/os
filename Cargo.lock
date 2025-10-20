@@ -1001,3 +1001,7 @@ dependencies = [
  "cargo_metadata",
  "clap",
 ]
+
+[[patch.unused]]
+name = "bootloader-x86_64-bios-stage-2"
+version = "0.11.12"

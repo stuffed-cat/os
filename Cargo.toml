@@ -26,3 +26,4 @@ default-members = [
 
 [patch.crates-io]
 bootloader = { path = "third_party/bootloader" }
+bootloader-x86_64-bios-stage-2 = { path = "third_party/bootloader/stage-2" }

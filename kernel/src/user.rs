@@ -256,20 +256,20 @@ fn create_tls_segment(tls: &crate::elf::TlsTemplate, base_addr: u64) -> SegmentM
     // Calculate total TLS size with proper alignment
     let align = tls.align.max(16); // At least 16-byte alignment
     let aligned_base = (base_addr + align - 1) & !(align - 1);
-    
+
     // TLS layout: [initialized data] [zero-filled bss (memsz - data.len())]
     let total_size = tls.mem_size;
-    
+
     // Round up to page boundary
     let segment_size = ((total_size as u64 + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
-    
+
     // Prepare payload: copy initial data and zero-extend to mem_size
     let mut payload = tls.data.clone();
     payload.resize(total_size, 0);
-    
+
     // TLS is read-write, not executable
     let flags = MemoryFlags::READ | MemoryFlags::WRITE | MemoryFlags::USER;
-    
+
     SegmentMapping {
         base: aligned_base,
         length: segment_size as usize,
@@ -369,7 +369,7 @@ impl AddressSpace {
                 let interpreter_entry = interpreter_placement.entry;
                 let mut segments = program_segments.clone();
                 segments.extend(interpreter_placement.segments.clone());
-                
+
                 // Add TLS segment if present
                 let tls_base = if let Some(tls) = tls_image {
                     let tls_base = interpreter_placement.end.saturating_add(PAGE_SIZE);
@@ -379,7 +379,7 @@ impl AddressSpace {
                 } else {
                     None
                 };
-                
+
                 segments.sort_by_key(|segment| segment.base());
                 let mut space = Self::finish_address_space(
                     interpreter_entry,
@@ -387,12 +387,12 @@ impl AddressSpace {
                     combined_flags,
                     stack_config,
                 );
-                
+
                 // Set TLS information
                 if let (Some(tls), Some(base)) = (tls_image, tls_base) {
                     space.set_tls(tls.clone(), base);
                 }
-                
+
                 AddressSpaceBuild {
                     space,
                     program: program_layout,
@@ -401,7 +401,7 @@ impl AddressSpace {
             }
             None => {
                 let mut segments = program_segments;
-                
+
                 // Add TLS segment if present
                 let tls_base = if let Some(tls) = tls_image {
                     let tls_base = program_end.saturating_add(PAGE_SIZE);
@@ -411,7 +411,7 @@ impl AddressSpace {
                 } else {
                     None
                 };
-                
+
                 segments.sort_by_key(|segment| segment.base());
                 let mut space = Self::finish_address_space(
                     program_entry,
@@ -419,12 +419,12 @@ impl AddressSpace {
                     program.stack_flags(),
                     stack_config,
                 );
-                
+
                 // Set TLS information
                 if let (Some(tls), Some(base)) = (tls_image, tls_base) {
                     space.set_tls(tls.clone(), base);
                 }
-                
+
                 AddressSpaceBuild {
                     space,
                     program: program_layout,
@@ -616,7 +616,7 @@ pub fn prepare_initial_stack(
     // Total = (N+1)*8 bytes
     // If (N+1) is odd, we need padding to make RSP%16==0 after all pushes
     builder.align_down(16).map_err(SubsystemError::from)?;
-    
+
     let argv_count = argv_pointers.len() + 1; // +1 for NULL terminator
     let total_pushes = argv_count + 1; // +1 for argc
     if total_pushes % 2 != 0 {
@@ -633,16 +633,28 @@ pub fn prepare_initial_stack(
         log::info!("Pushed argv entry {:#x} at SP={:#x}", ptr, pushed_at);
     }
     let argv_sp_after = builder.current_sp();
-    log::info!("argv array spans [{:#x}, {:#x}), size={} bytes", 
-        argv_sp_after, argv_sp_before, argv_sp_before - argv_sp_after);
+    log::info!(
+        "argv array spans [{:#x}, {:#x}), size={} bytes",
+        argv_sp_after,
+        argv_sp_before,
+        argv_sp_before - argv_sp_after
+    );
 
     let argc = (argv_entries.len() - 1) as u64;
-    log::info!("Stack layout: argc={} argv_entry_count={}", argc, argv_entries.len());
+    log::info!(
+        "Stack layout: argc={} argv_entry_count={}",
+        argc,
+        argv_entries.len()
+    );
     builder.push_u64(argc).map_err(SubsystemError::from)?;
 
     let final_sp = builder.current_sp();
     debug_assert_eq!(final_sp & 0xF, 0, "Stack pointer must be 16-byte aligned");
-    log::info!("Final stack pointer: {:#x}, argc at {:#x}", final_sp, final_sp);
+    log::info!(
+        "Final stack pointer: {:#x}, argc at {:#x}",
+        final_sp,
+        final_sp
+    );
 
     let result = builder.finalize().map_err(SubsystemError::from)?;
     Ok(StackInitialization {
@@ -829,15 +841,18 @@ fn layout_image(image: &ExecutableImage, preferred_start: u64) -> ImagePlacement
 
     // Create a mutable copy of segments for relocation
     let mut exec_segments: Vec<ExecutableSegment> = image.segments().to_vec();
-    
+
     // Apply relocations if the image has dynamic info
     if image.is_position_independent() && bias != 0 {
         log::trace!("user: applying relocations with bias=0x{:x}", bias);
         crate::elf::apply_relocations(&mut exec_segments, image.dynamic_info(), bias);
         log::trace!("user: relocations applied");
     } else {
-        log::trace!("user: no relocations needed (PIE={} bias=0x{:x})", 
-            image.is_position_independent(), bias);
+        log::trace!(
+            "user: no relocations needed (PIE={} bias=0x{:x})",
+            image.is_position_independent(),
+            bias
+        );
     }
 
     let mut segments: Vec<SegmentMapping> = exec_segments
@@ -954,14 +969,14 @@ impl UserContext {
         frame.rip = entry_point;
         frame.rsp = stack_top;
         frame.rflags = USER_RFLAGS;
-        
+
         // On x86_64, set FS_BASE MSR for TLS pointer
         #[cfg(target_arch = "x86_64")]
         if let Some(tls) = tls_base {
             use x86_64::registers::model_specific::FsBase;
             FsBase::write(x86_64::VirtAddr::new(tls));
         }
-        
+
         Self { frame }
     }
 

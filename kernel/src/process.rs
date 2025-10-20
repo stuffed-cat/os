@@ -121,8 +121,8 @@ pub struct Process {
     gid: AtomicU32,
     groups: RwLock<Vec<u32>>,
     next_tid: AtomicU64,
-    program_break: AtomicU64,  // Heap break for brk/sbrk syscalls
-    mmap_next: AtomicU64,  // Next address for mmap allocations
+    program_break: AtomicU64, // Heap break for brk/sbrk syscalls
+    mmap_next: AtomicU64,     // Next address for mmap allocations
 }
 
 impl Process {
@@ -151,8 +151,8 @@ impl Process {
             gid: AtomicU32::new(0),
             groups: RwLock::new(vec![0]),
             next_tid: AtomicU64::new(1),
-            program_break: AtomicU64::new(0x10000000),  // Initial brk at 256MB
-            mmap_next: AtomicU64::new(0x40000000),  // Start mmap at 1GB
+            program_break: AtomicU64::new(0x10000000), // Initial brk at 256MB
+            mmap_next: AtomicU64::new(0x40000000),     // Start mmap at 1GB
         });
 
         process.set_fd(0, String::from("tty:stdin"));
@@ -220,7 +220,7 @@ impl Process {
         let aligned_length = (length + 0xfff) & !0xfff;
         // Atomically allocate and advance
         let addr = self.mmap_next.fetch_add(aligned_length, Ordering::SeqCst);
-        // TODO: Actually map pages  
+        // TODO: Actually map pages
         addr
     }
 
@@ -336,7 +336,12 @@ impl Process {
 
         let argv = alloc::vec![program.clone()];
         let env_pairs: Vec<(String, String)> = self.env_snapshot().into_iter().collect();
-        log::info!("set_program_image: program='{}' argc={} argv={:?}", program, argv.len(), argv);
+        log::info!(
+            "set_program_image: program='{}' argc={} argv={:?}",
+            program,
+            argv.len(),
+            argv
+        );
         log::info!("set_program_image: env vars count={}", env_pairs.len());
         for (k, v) in &env_pairs {
             log::debug!("  env: {}={}", k, v);
@@ -363,11 +368,8 @@ impl Process {
         space
             .stack_mut()
             .set_initial_state(stack_pointer, stack_init.image);
-        let context = UserContext::for_entry_with_tls(
-            space.entry_point(), 
-            stack_pointer, 
-            space.tls_base()
-        );
+        let context =
+            UserContext::for_entry_with_tls(space.entry_point(), stack_pointer, space.tls_base());
 
         let handle = if let Some(manager) = memory {
             Some(manager.map_address_space(&space)?)
@@ -400,24 +402,24 @@ impl Process {
                 // Pre-map heap region (16MB) for brk/mmap
                 if let Some(manager) = memory {
                     let heap_size = 16 * 1024 * 1024; // 16MB
-                    log::info!("Pre-mapping heap region: {} bytes at 0x{:x}", heap_size, brk_start);
-                    
-                    use x86_64::structures::paging::PageTableFlags;
-                    let flags = PageTableFlags::PRESENT 
-                        | PageTableFlags::WRITABLE 
-                        | PageTableFlags::USER_ACCESSIBLE 
-                        | PageTableFlags::NO_EXECUTE;
-                    
-                    use x86_64::VirtAddr;
-                    if let Err(e) = manager.map_region(
-                        VirtAddr::new(brk_start),
+                    log::info!(
+                        "Pre-mapping heap region: {} bytes at 0x{:x}",
                         heap_size,
-                        flags,
-                    ) {
+                        brk_start
+                    );
+
+                    use x86_64::structures::paging::PageTableFlags;
+                    let flags = PageTableFlags::PRESENT
+                        | PageTableFlags::WRITABLE
+                        | PageTableFlags::USER_ACCESSIBLE
+                        | PageTableFlags::NO_EXECUTE;
+
+                    use x86_64::VirtAddr;
+                    if let Err(e) = manager.map_region(VirtAddr::new(brk_start), heap_size, flags) {
                         log::warn!("Failed to pre-map heap: {:?}", e);
                     }
                 }
-                
+
                 let root = handle.root();
                 *self.page_table.write() = Some(handle);
                 let tid = self.allocate_tid();

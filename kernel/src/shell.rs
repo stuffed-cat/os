@@ -584,14 +584,20 @@ impl ShellSubsystem {
 
         let profile = users::root_profile();
         serial::write_str("shell: got root profile\r\n");
-        serial::write_fmt(format_args!("shell: profile.shell = '{}'\r\n", profile.shell));
+        serial::write_fmt(format_args!(
+            "shell: profile.shell = '{}'\r\n",
+            profile.shell
+        ));
 
         let shell_path = if profile.shell.is_empty() {
             // Use bash directly - real bash is in /bin/bash in rootfs
             serial::write_str("shell: using default /bin/bash\r\n");
             String::from("/bin/bash")
         } else {
-            serial::write_fmt(format_args!("shell: using profile shell: '{}'\r\n", profile.shell));
+            serial::write_fmt(format_args!(
+                "shell: using profile shell: '{}'\r\n",
+                profile.shell
+            ));
             profile.shell.clone()
         };
 
@@ -628,8 +634,11 @@ impl ShellSubsystem {
         let (tid, _) = process
             .main_thread()
             .ok_or(SubsystemError::Runtime("exec produced no runnable thread"))?;
-        serial::write_fmt(format_args!("shell: got main thread tid={}\r\n", tid.as_u64()));
-        
+        serial::write_fmt(format_args!(
+            "shell: got main thread tid={}\r\n",
+            tid.as_u64()
+        ));
+
         let user_context = process.user_context();
         trace!("shell: user context present? {}", user_context.is_some());
         match user_context {
@@ -637,8 +646,7 @@ impl ShellSubsystem {
                 let frame = context.frame();
                 serial::write_fmt(format_args!(
                     "shell: initial user context rip={:#x} rsp={:#x}\r\n",
-                    frame.rip,
-                    frame.rsp
+                    frame.rip, frame.rsp
                 ));
                 trace!(
                     "shell: initial user context rip={:#x} rsp={:#x}",
@@ -651,7 +659,7 @@ impl ShellSubsystem {
                 trace!("shell: initial user context missing");
             }
         }
-        
+
         let addr_space = process.address_space();
         if let Some(space) = addr_space {
             serial::write_fmt(format_args!(
@@ -660,7 +668,7 @@ impl ShellSubsystem {
                 space.stack().base(),
                 space.stack().top()
             ));
-            
+
             // Display TLS information
             if let Some(tls_base) = space.tls_base() {
                 serial::write_fmt(format_args!("shell: TLS base address={:#x}\r\n", tls_base));
@@ -675,8 +683,11 @@ impl ShellSubsystem {
             } else {
                 serial::write_str("shell: TLS not configured\r\n");
             }
-            
-            serial::write_fmt(format_args!("shell: segments count={}\r\n", space.segments().len()));
+
+            serial::write_fmt(format_args!(
+                "shell: segments count={}\r\n",
+                space.segments().len()
+            ));
             for (i, seg) in space.segments().iter().enumerate().take(10) {
                 serial::write_fmt(format_args!(
                     "shell: seg[{}] base={:#x} len={:#x} perms={:?}\r\n",
@@ -689,7 +700,7 @@ impl ShellSubsystem {
         } else {
             serial::write_str("shell: ERROR - address space missing!\r\n");
         }
-        
+
         process.set_thread_status(tid, ThreadStatus::Ready);
         let priority = process
             .thread_state(tid)
@@ -797,7 +808,10 @@ impl Subsystem for ShellSubsystem {
                     serial::write_str("shell: initial user spawned successfully\r\n");
                 }
                 Err(e) => {
-                    serial::write_fmt(format_args!("shell: failed to launch initial user: {:?}\r\n", e));
+                    serial::write_fmt(format_args!(
+                        "shell: failed to launch initial user: {:?}\r\n",
+                        e
+                    ));
                     if interrupts_were_enabled {
                         x86_64::instructions::interrupts::enable();
                     }
