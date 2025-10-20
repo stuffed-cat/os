@@ -503,12 +503,11 @@ impl MemoryManager {
 
     fn flags_from_memory(flags: MemoryFlags) -> PageTableFlags {
         let mut result = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-        if flags.contains(MemoryFlags::WRITE) {
+        if flags.contains(MemoryFlags::WRITE) || flags.contains(MemoryFlags::EXEC) {
+            // Allow relocation fixups by keeping executable segments writable for now.
             result |= PageTableFlags::WRITABLE;
         }
-        if !flags.contains(MemoryFlags::EXEC) {
-            result |= PageTableFlags::NO_EXECUTE;
-        }
+        // TODO: Re-enable `NO_EXECUTE` once NX permission changes are fully supported.
         result
     }
 

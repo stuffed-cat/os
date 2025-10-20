@@ -17,7 +17,7 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 #[cfg(all(not(feature = "std"), not(feature = "hardware")))]
 use log::{error, warn};
-use log::{info, trace};
+use log::trace;
 use pc_keyboard::layouts::Us104Key;
 use pc_keyboard::{DecodedKey, HandleControl, Keyboard, ScancodeSet1};
 use spin::{Lazy, Mutex};
@@ -128,6 +128,46 @@ static CURRENT_THREAD: Lazy<Mutex<Option<RunQueueEntry>>> = Lazy::new(|| Mutex::
 /// Records the most recent user thread that faulted so the scheduler can log it.
 static FAILED_THREAD: Lazy<Mutex<Option<RunQueueEntry>>> = Lazy::new(|| Mutex::new(None));
 
+/// Records details about the most recent user space fault.
+static LAST_USER_FAULT: Lazy<Mutex<Option<UserFaultRecord>>> =
+    Lazy::new(|| Mutex::new(None));
+
+/// User space fault classification for diagnostics.
+#[derive(Clone, Copy, Debug)]
+pub enum UserFaultKind {
+    /// Page fault triggered from user mode.
+    PageFault,
+    /// General protection fault triggered from user mode.
+    GeneralProtection,
+    /// Invalid opcode fault triggered from user mode.
+    InvalidOpcode,
+    /// Double fault triggered from user mode.
+    DoubleFault,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UserFaultRecord {
+    kind: UserFaultKind,
+    rip: u64,
+    address: u64,
+    code: u64,
+}
+
+/// Stores information about the most recent user fault for later diagnostics.
+pub fn record_user_fault(kind: UserFaultKind, rip: u64, address: u64, code: u64) {
+    let mut guard = LAST_USER_FAULT.lock();
+    *guard = Some(UserFaultRecord {
+        kind,
+        rip,
+        address,
+        code,
+    });
+}
+
+fn take_user_fault() -> Option<UserFaultRecord> {
+    LAST_USER_FAULT.lock().take()
+}
+
 #[cfg(all(not(feature = "std"), not(feature = "hardware")))]
 fn set_current_thread(entry: RunQueueEntry) {
     let mut current = CURRENT_THREAD.lock();
@@ -159,6 +199,44 @@ pub fn mark_current_process_failed() {
     };
 
     if let Some(entry) = current.or(fallback) {
+        let fault = take_user_fault();
+
+        if let Some(info) = fault {
+            #[cfg(feature = "hardware")]
+            serial::write_fmt(format_args!(
+                "user fault: kind={:?} pid={} tid={} rip={:#x} addr={:#x} code={:#x}\r\n",
+                info.kind,
+                entry.pid.as_u64(),
+                entry.tid.as_u64(),
+                info.rip,
+                info.address,
+                info.code
+            ));
+
+            log::error!(
+                "user fault: kind={:?} pid={} tid={} rip={:#x} addr={:#x} code={:#x}",
+                info.kind,
+                entry.pid.as_u64(),
+                entry.tid.as_u64(),
+                info.rip,
+                info.address,
+                info.code
+            );
+        } else {
+            #[cfg(feature = "hardware")]
+            serial::write_fmt(format_args!(
+                "user fault: pid={} tid={} (details unavailable)\r\n",
+                entry.pid.as_u64(),
+                entry.tid.as_u64()
+            ));
+
+            log::error!(
+                "user fault: pid={} tid={} (details unavailable)",
+                entry.pid.as_u64(),
+                entry.tid.as_u64()
+            );
+        }
+
         if let Some(table) = ProcessTable::global() {
             if let Some(process) = table.lookup(entry.pid) {
                 process.set_thread_status(entry.tid, ThreadStatus::Dead);
@@ -216,17 +294,26 @@ impl ShellSubsystem {
     }
 
     fn launch_initial_user(&self) -> Result<(), SubsystemError> {
+        serial::write_str("shell: launch_initial_user starting\r\n");
+        
         session::reset_to_root();
+        serial::write_str("shell: session reset\r\n");
+        
         let profile = users::root_profile();
+        serial::write_str("shell: got root profile\r\n");
+        
         let shell_path = if profile.shell.is_empty() {
             String::from("/bin/sh")
         } else {
             profile.shell.clone()
         };
 
+        serial::write_fmt(format_args!("shell: spawning process for {}\r\n", shell_path));
         trace!("shell: spawning initial user process");
         let process = self.process_table.spawn();
+        serial::write_fmt(format_args!("shell: spawn completed pid={}\r\n", process.pid().as_u64()));
         trace!("shell: spawn completed with pid={}", process.pid().as_u64());
+        serial::write_str("shell: setting credentials and env\r\n");
         process.set_credentials(profile.uid, profile.gid, profile.groups.clone());
         process.set_cwd(profile.home.clone());
         process.set_env(String::from("HOME"), profile.home.clone());
@@ -239,8 +326,10 @@ impl ShellSubsystem {
         );
         process.set_env(String::from("TERM"), String::from("nexa-console"));
 
+        serial::write_fmt(format_args!("shell: executing {}\r\n", shell_path));
         trace!("shell: executing {}", shell_path);
         self.process_table.exec(process.pid(), shell_path)?;
+        serial::write_str("shell: exec completed\r\n");
         trace!("shell: exec completed");
 
         let (tid, _) = process
@@ -349,26 +438,41 @@ impl Subsystem for ShellSubsystem {
             self.process_table.bind_memory_manager(manager);
         }
 
+        // Disable interrupts before enabling timer to avoid deadlock with serial/scheduler locks
+        let interrupts_were_enabled = x86_64::instructions::interrupts::are_enabled();
+        x86_64::instructions::interrupts::disable();
+
         // NOW enable timer after all initialization is done
         Scheduler::enable_timer_global();
+        serial::write_str("shell: timer enabled in init\r\n");
 
         if !self.init_spawned {
-            // Disable interrupts during initial user launch to avoid deadlock with scheduler lock
-            x86_64::instructions::interrupts::disable();
+            serial::write_str("shell: launching initial user\r\n");
+            
             let result = self.launch_initial_user();
-            x86_64::instructions::interrupts::enable();
+            serial::write_str("shell: launch_initial_user returned\r\n");
 
             match result {
                 Ok(()) => {
                     self.init_spawned = true;
-                    info!("initial user shell spawned");
+                    serial::write_str("shell: initial user spawned successfully\r\n");
                 }
                 Err(e) => {
-                    log::error!("failed to launch initial user: {:?}", e);
+                    serial::write_fmt(format_args!("shell: failed to launch initial user: {:?}\r\n", e));
+                    // Re-enable interrupts if they were enabled before
+                    if interrupts_were_enabled {
+                        x86_64::instructions::interrupts::enable();
+                    }
                     return Err(e);
                 }
             }
         }
+
+        // Always re-enable interrupts if they were enabled before
+        if interrupts_were_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+        serial::write_str("shell: init complete\r\n");
 
         Ok(())
     }

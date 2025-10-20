@@ -682,7 +682,8 @@ impl ProcessTable {
         *self.memory.write() = Some(NonNull::from(manager));
     }
 
-    fn memory_manager(&self) -> Option<&'static MemoryManager> {
+    /// Returns the kernel memory manager bound to the process table, if available.
+    pub fn memory_manager(&self) -> Option<&'static MemoryManager> {
         self.memory
             .read()
             .as_ref()

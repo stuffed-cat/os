@@ -20,7 +20,7 @@ use x86_64::registers::rflags::RFlags;
 #[cfg(feature = "hardware")]
 use x86_64::structures::idt::InterruptStackFrameValue;
 #[cfg(feature = "hardware")]
-use x86_64::structures::paging::PhysFrame;
+use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame};
 #[cfg(feature = "hardware")]
 use x86_64::PrivilegeLevel;
 #[cfg(feature = "hardware")]
@@ -32,7 +32,9 @@ use super::{
     keyboard,
 };
 use crate::scheduler::Scheduler;
-use crate::shell;
+use crate::shell::{self, UserFaultKind};
+#[cfg(feature = "hardware")]
+use crate::arch::x86_64::serial;
 #[cfg(feature = "hardware")]
 use crate::{
     error::KernelError,
@@ -44,6 +46,58 @@ use crate::{
 
 #[cfg(feature = "hardware")]
 static LOGGED_USER_ENTRY: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "hardware")]
+fn dump_user_page_entry(addr: u64) {
+    use x86_64::registers::control::Cr3;
+
+    let Some(table) = ProcessTable::global() else {
+        return;
+    };
+    let Some(manager) = table.memory_manager() else {
+        return;
+    };
+
+    let phys_offset = manager.physical_memory_offset();
+
+    unsafe {
+        let (root, _) = Cr3::read();
+        let mut frame = root;
+        let indices = [
+            ((addr >> 39) & 0x1ff) as usize,
+            ((addr >> 30) & 0x1ff) as usize,
+            ((addr >> 21) & 0x1ff) as usize,
+            ((addr >> 12) & 0x1ff) as usize,
+        ];
+
+        for (level, &index) in indices.iter().enumerate() {
+            let table_ptr =
+                (phys_offset + frame.start_address().as_u64()).as_u64() as *const PageTable;
+            let table_ref = &*table_ptr;
+            let entry = &table_ref[index];
+            serial::write_fmt(format_args!(
+                "pte L{} idx={} flags={:?} addr={:#x}\r\n",
+                4 - level,
+                index,
+                entry.flags(),
+                entry.addr().as_u64()
+            ));
+
+            if !entry.flags().contains(PageTableFlags::PRESENT) {
+                break;
+            }
+
+            if level == 3 {
+                break;
+            }
+
+            let Ok(next_frame) = PhysFrame::from_start_address(entry.addr()) else {
+                break;
+            };
+            frame = next_frame;
+        }
+    }
+}
 
 static IDT: Once<InterruptDescriptorTable> = Once::new();
 
@@ -277,6 +331,34 @@ extern "x86-interrupt" fn page_fault_handler(
         // User mode page fault - handle gracefully
         let fault_address = Cr2::read().map(|addr| addr.as_u64()).unwrap_or(0);
 
+        shell::record_user_fault(
+            UserFaultKind::PageFault,
+            stack_frame.instruction_pointer.as_u64(),
+            fault_address,
+            error_code.bits() as u64,
+        );
+
+        #[cfg(feature = "hardware")]
+        serial::write_fmt(format_args!(
+            "\r\n=== USER PAGE FAULT ===\r\n",
+        ));
+
+        #[cfg(feature = "hardware")]
+        serial::write_fmt(format_args!(
+            "RIP: {:#x}\r\nFault Address: {:#x}\r\nError Code: {:?}\r\n",
+            stack_frame.instruction_pointer.as_u64(),
+            fault_address,
+            error_code
+        ));
+
+        #[cfg(feature = "hardware")]
+        dump_user_page_entry(fault_address);
+
+        #[cfg(feature = "hardware")]
+        serial::write_fmt(format_args!(
+            "=== END PAGE FAULT INFO ===\r\n",
+        ));
+
         error!(
             "User mode PAGE FAULT\nRIP: {:#x}\nFaulted Address: {:#x}\nError Code: {:?}",
             stack_frame.instruction_pointer.as_u64(),
@@ -285,8 +367,14 @@ extern "x86-interrupt" fn page_fault_handler(
         );
 
         crate::shell::mark_current_process_failed();
+        
+        // Enable interrupts and wait for timer to schedule next process
         x86_64::instructions::interrupts::enable();
-        return;
+        
+        // Yield CPU - next timer interrupt will pick up another process (if any)
+        loop {
+            x86_64::instructions::hlt();
+        }
     }
 
     // Kernel mode page fault - this is fatal
@@ -308,6 +396,20 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 ) {
     if is_user_mode_exception(&stack_frame) {
         // User mode exception - handle gracefully
+        shell::record_user_fault(
+            UserFaultKind::GeneralProtection,
+            stack_frame.instruction_pointer.as_u64(),
+            0,
+            error_code,
+        );
+
+        #[cfg(feature = "hardware")]
+        serial::write_fmt(format_args!(
+            "\r\n=== USER GP FAULT ===\r\nRIP: {:#x}\r\nError Code: {:#x}\r\n",
+            stack_frame.instruction_pointer.as_u64(),
+            error_code
+        ));
+
         error!(
             "User mode GENERAL PROTECTION FAULT\nRIP: {:#x}\nError Code: {:#x}",
             stack_frame.instruction_pointer.as_u64(),
@@ -317,9 +419,11 @@ extern "x86-interrupt" fn general_protection_fault_handler(
         // Signal to shell to skip this process
         crate::shell::mark_current_process_failed();
 
-        // Re-enable interrupts and return to kernel
+        // Halt and wait for timer interrupt to schedule next process
         x86_64::instructions::interrupts::enable();
-        return;
+        loop {
+            x86_64::instructions::hlt();
+        }
     }
 
     // Kernel mode exception - this is fatal
@@ -333,13 +437,30 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
     if is_user_mode_exception(&stack_frame) {
         // User mode exception
+        shell::record_user_fault(
+            UserFaultKind::InvalidOpcode,
+            stack_frame.instruction_pointer.as_u64(),
+            0,
+            0,
+        );
+
+        #[cfg(feature = "hardware")]
+        serial::write_fmt(format_args!(
+            "\r\n=== USER INVALID OPCODE ===\r\nRIP: {:#x}\r\n",
+            stack_frame.instruction_pointer.as_u64()
+        ));
+
         error!(
             "User mode INVALID OPCODE\nRIP: {:#x}",
             stack_frame.instruction_pointer.as_u64()
         );
         crate::shell::mark_current_process_failed();
+        
+        // Halt and wait for timer interrupt to schedule next process
         x86_64::instructions::interrupts::enable();
-        return;
+        loop {
+            x86_64::instructions::hlt();
+        }
     }
 
     panic!("INVALID OPCODE (KERNEL): {:?}", stack_frame);
@@ -354,7 +475,11 @@ unsafe extern "C" fn timer_interrupt_handler(
     let frame = &mut *frame;
 
     // Timer interrupt - schedule next runnable thread
-    // trace!("timer interrupt");
+    static TIMER_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let count = TIMER_COUNT.fetch_add(1, Ordering::Relaxed);
+    if count < 5 || count % 100 == 0 {
+        log::trace!("timer interrupt #{}", count);
+    }
 
     if let Some(table) = ProcessTable::global() {
         if let Some(root) = table.kernel_root_frame() {
@@ -384,6 +509,13 @@ unsafe extern "C" fn timer_interrupt_handler(
         // Try to get the next thread to schedule (either from evaluate_timer_tick or pick_next)
         let next_entry = next.or_else(|| scheduler.pick_next());
 
+        if count < 10 {
+            match &next_entry {
+                Some(e) => log::info!("timer #{}: got next entry pid={} tid={}", count, e.pid.as_u64(), e.tid.as_u64()),
+                None => log::info!("timer #{}: no next entry", count),
+            }
+        }
+
         if let Some(entry) = next_entry {
             match entry.class {
                 SchedulingClass::User => {
@@ -391,24 +523,25 @@ unsafe extern "C" fn timer_interrupt_handler(
                         if let Some(proc) = table.lookup(entry.pid) {
                             if let Some((context, root)) = proc.take_thread_runtime(entry.tid) {
                                 static ENTRY_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+                                static LAST_RIP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
                                 let count = ENTRY_COUNT.fetch_add(1, Ordering::Relaxed);
-                                if count < 10 || count % 50 == 0 {
-                                    let frame = context.frame();
-                                    log::trace!(
-                                        "timer: resuming user #{} pid={} tid={} rip={:#x}",
+                                let trap = context.frame();
+                                let last_rip = LAST_RIP.swap(trap.rip, Ordering::Relaxed);
+                                
+                                if count < 10 || count % 50 == 0 || (count < 100 && last_rip == trap.rip) {
+                                    let status = if last_rip == trap.rip { "STUCK" } else { "ok" };
+                                    log::info!(
+                                        "timer: resuming user #{} pid={} tid={} rip={:#x} [{}]",
                                         count,
                                         entry.pid.as_u64(),
                                         entry.tid.as_u64(),
-                                        frame.rip
+                                        trap.rip,
+                                        status
                                     );
                                 }
-                                log::trace!("timer: before apply_user_context");
                                 regs.apply_user_context(&context);
-                                log::trace!("timer: before write_user_frame");
                                 write_user_frame(frame, &context);
-                                log::trace!("timer: before switch_address_space cr3={:#x}", root.start_address().as_u64());
                                 switch_address_space(root);
-                                log::trace!("timer: after switch_address_space");
                             } else if LOGGED_USER_ENTRY
                                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
                                 .is_ok()
