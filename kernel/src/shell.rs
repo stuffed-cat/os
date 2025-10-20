@@ -656,6 +656,22 @@ impl ShellSubsystem {
                 space.stack().base(),
                 space.stack().top()
             ));
+            
+            // Display TLS information
+            if let Some(tls_base) = space.tls_base() {
+                serial::write_fmt(format_args!("shell: TLS base address={:#x}\r\n", tls_base));
+                if let Some(tls_template) = space.tls_template() {
+                    serial::write_fmt(format_args!(
+                        "shell: TLS template: mem_size={} align={} data_len={}\r\n",
+                        tls_template.mem_size,
+                        tls_template.align,
+                        tls_template.data.len()
+                    ));
+                }
+            } else {
+                serial::write_str("shell: TLS not configured\r\n");
+            }
+            
             serial::write_fmt(format_args!("shell: segments count={}\r\n", space.segments().len()));
             for (i, seg) in space.segments().iter().enumerate().take(10) {
                 serial::write_fmt(format_args!(

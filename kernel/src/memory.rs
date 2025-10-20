@@ -409,15 +409,23 @@ impl MemoryManager {
         let end = VirtAddr::new(end_addr);
         let start_page = Page::containing_address(start);
         let end_page = Page::containing_address(end);
-        let flags = Self::flags_from_memory(segment.permissions());
+        let mut flags = Self::flags_from_memory(segment.permissions());
 
         trace!(
-            "memory: map segment [{:#x}, {:#x}) perms={:?} -> flags={:?}",
+            "memory: map segment [{:#x}, {:#x}) perms={:?} -> computed_flags={:?}",
             segment.base(),
             segment.base() + segment.length() as u64,
             segment.permissions(),
             flags
         );
+        
+        // x86_64 crate requires WRITABLE for initial page table setup
+        // We'll use set_flags to fix permissions after mapping
+        let needs_write_for_setup = !flags.contains(PageTableFlags::WRITABLE);
+        if needs_write_for_setup {
+            flags |= PageTableFlags::WRITABLE;
+            trace!("memory: temporarily adding WRITABLE for setup");
+        }
 
         for page in Page::range_inclusive(start_page, end_page) {
             let frame = self
@@ -432,6 +440,23 @@ impl MemoryManager {
             }
             self.copy_segment_into_frame(frame, segment, page);
         }
+        
+        // Fix permissions for read-only segments
+        if needs_write_for_setup {
+            let correct_flags = Self::flags_from_memory(segment.permissions());
+            trace!("memory: fixing permissions to {:?}", correct_flags);
+            for page in Page::range_inclusive(start_page, end_page) {
+                unsafe {
+                    if mapper.translate_page(page).is_ok() {
+                        mapper
+                            .update_flags(page, correct_flags)
+                            .map_err(|_| SubsystemError::Runtime("failed to update page flags"))?
+                            .flush();
+                    }
+                }
+            }
+        }
+        
         Ok(())
     }
 
@@ -491,12 +516,18 @@ impl MemoryManager {
         let copy_len = (copy_end - copy_start) as usize;
         let dest_offset = (copy_start - page_start) as usize;
 
-        let phys = frame.start_address().as_u64();
-        let virt = self.phys_offset + phys;
-        unsafe {
-            let dest = virt.as_mut_ptr::<u8>().add(dest_offset);
-            let src = segment.payload()[payload_offset..payload_offset + copy_len].as_ptr();
-            ptr::copy_nonoverlapping(src, dest, copy_len);
+        // Only copy what's actually in the payload (rest is already zeroed)
+        let available_payload = segment.payload().len().saturating_sub(payload_offset);
+        let actual_copy_len = core::cmp::min(copy_len, available_payload);
+
+        if actual_copy_len > 0 {
+            let phys = frame.start_address().as_u64();
+            let virt = self.phys_offset + phys;
+            unsafe {
+                let dest = virt.as_mut_ptr::<u8>().add(dest_offset);
+                let src = segment.payload()[payload_offset..payload_offset + actual_copy_len].as_ptr();
+                ptr::copy_nonoverlapping(src, dest, actual_copy_len);
+            }
         }
     }
 
@@ -595,19 +626,14 @@ impl MemoryManager {
                     let is_kernel_mapping = flags.contains(PageTableFlags::PRESENT)
                         && !flags.contains(PageTableFlags::USER_ACCESSIBLE);
                     if is_kernel_mapping {
-                        // Clone the entry but clear NO_EXECUTE to allow user code execution
-                        let mut cloned_flags = flags;
-                        cloned_flags.remove(PageTableFlags::NO_EXECUTE);
+                        // Clone the entry as-is for kernel mappings
+                        // NX bit handling is done at the leaf PTE level for user pages
                         log::trace!(
-                            "memory: cloning kernel pml4 entry {} -> original={:?} cleared_nx={:?}",
+                            "memory: cloning kernel pml4 entry {} flags={:?}",
                             index,
-                            flags,
-                            cloned_flags
+                            flags
                         );
-
-                        // Rebuild the entry with cleared NX flag
-                        let addr = entry.addr();
-                        new_root[index].set_addr(addr, cloned_flags);
+                        new_root[index].set_addr(entry.addr(), flags);
                     }
                 }
             });

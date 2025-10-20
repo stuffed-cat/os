@@ -251,12 +251,41 @@ impl Default for StackConfig {
     }
 }
 
+/// Creates a TLS segment mapping from a TLS template.
+fn create_tls_segment(tls: &crate::elf::TlsTemplate, base_addr: u64) -> SegmentMapping {
+    // Calculate total TLS size with proper alignment
+    let align = tls.align.max(16); // At least 16-byte alignment
+    let aligned_base = (base_addr + align - 1) & !(align - 1);
+    
+    // TLS layout: [initialized data] [zero-filled bss (memsz - data.len())]
+    let total_size = tls.mem_size;
+    
+    // Round up to page boundary
+    let segment_size = ((total_size as u64 + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+    
+    // Prepare payload: copy initial data and zero-extend to mem_size
+    let mut payload = tls.data.clone();
+    payload.resize(total_size, 0);
+    
+    // TLS is read-write, not executable
+    let flags = MemoryFlags::READ | MemoryFlags::WRITE | MemoryFlags::USER;
+    
+    SegmentMapping {
+        base: aligned_base,
+        length: segment_size as usize,
+        permissions: flags,
+        payload,
+    }
+}
+
 /// Address space description built from an executable image.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AddressSpace {
     entry_point: u64,
     segments: Vec<SegmentMapping>,
     stack: Stack,
+    tls_template: Option<crate::elf::TlsTemplate>,
+    tls_base: Option<u64>,
 }
 
 impl AddressSpace {
@@ -294,6 +323,22 @@ impl AddressSpace {
         &self.segments
     }
 
+    /// Returns the TLS template if present.
+    pub fn tls_template(&self) -> Option<&crate::elf::TlsTemplate> {
+        self.tls_template.as_ref()
+    }
+
+    /// Returns the TLS base address if allocated.
+    pub fn tls_base(&self) -> Option<u64> {
+        self.tls_base
+    }
+
+    /// Sets TLS information for this address space.
+    pub fn set_tls(&mut self, template: crate::elf::TlsTemplate, base: u64) {
+        self.tls_template = Some(template);
+        self.tls_base = Some(base);
+    }
+
     /// Builds an address space and returns both the mapping and layout metadata.
     pub fn build(
         program: &ExecutableImage,
@@ -307,6 +352,11 @@ impl AddressSpace {
         let program_end = program_placement.end;
         let program_segments = program_placement.segments.clone();
 
+        // Choose TLS from interpreter if present, otherwise from program
+        let tls_image = interpreter
+            .and_then(|i| i.tls_template())
+            .or_else(|| program.tls_template());
+
         match interpreter {
             Some(interp) => {
                 let combined_flags =
@@ -319,13 +369,30 @@ impl AddressSpace {
                 let interpreter_entry = interpreter_placement.entry;
                 let mut segments = program_segments.clone();
                 segments.extend(interpreter_placement.segments.clone());
+                
+                // Add TLS segment if present
+                let tls_base = if let Some(tls) = tls_image {
+                    let tls_base = interpreter_placement.end.saturating_add(PAGE_SIZE);
+                    let tls_segment = create_tls_segment(tls, tls_base);
+                    segments.push(tls_segment);
+                    Some(tls_base)
+                } else {
+                    None
+                };
+                
                 segments.sort_by_key(|segment| segment.base());
-                let space = Self::finish_address_space(
+                let mut space = Self::finish_address_space(
                     interpreter_entry,
                     segments,
                     combined_flags,
                     stack_config,
                 );
+                
+                // Set TLS information
+                if let (Some(tls), Some(base)) = (tls_image, tls_base) {
+                    space.set_tls(tls.clone(), base);
+                }
+                
                 AddressSpaceBuild {
                     space,
                     program: program_layout,
@@ -333,12 +400,31 @@ impl AddressSpace {
                 }
             }
             None => {
-                let space = Self::finish_address_space(
+                let mut segments = program_segments;
+                
+                // Add TLS segment if present
+                let tls_base = if let Some(tls) = tls_image {
+                    let tls_base = program_end.saturating_add(PAGE_SIZE);
+                    let tls_segment = create_tls_segment(tls, tls_base);
+                    segments.push(tls_segment);
+                    Some(tls_base)
+                } else {
+                    None
+                };
+                
+                segments.sort_by_key(|segment| segment.base());
+                let mut space = Self::finish_address_space(
                     program_entry,
-                    program_segments,
+                    segments,
                     program.stack_flags(),
                     stack_config,
                 );
+                
+                // Set TLS information
+                if let (Some(tls), Some(base)) = (tls_image, tls_base) {
+                    space.set_tls(tls.clone(), base);
+                }
+                
                 AddressSpaceBuild {
                     space,
                     program: program_layout,
@@ -696,6 +782,8 @@ impl AddressSpace {
             entry_point,
             segments,
             stack,
+            tls_template: None,
+            tls_base: None,
         }
     }
 }
@@ -826,10 +914,23 @@ pub struct UserContext {
 impl UserContext {
     /// Creates a fresh context for a new process pointing at the entry point and stack top.
     pub fn for_entry(entry_point: u64, stack_top: u64) -> Self {
+        Self::for_entry_with_tls(entry_point, stack_top, None)
+    }
+
+    /// Creates a fresh context with optional TLS base address.
+    pub fn for_entry_with_tls(entry_point: u64, stack_top: u64, tls_base: Option<u64>) -> Self {
         let mut frame = TrapFrame::default();
         frame.rip = entry_point;
         frame.rsp = stack_top;
         frame.rflags = USER_RFLAGS;
+        
+        // On x86_64, set FS_BASE MSR for TLS pointer
+        #[cfg(target_arch = "x86_64")]
+        if let Some(tls) = tls_base {
+            use x86_64::registers::model_specific::FsBase;
+            FsBase::write(x86_64::VirtAddr::new(tls));
+        }
+        
         Self { frame }
     }
 

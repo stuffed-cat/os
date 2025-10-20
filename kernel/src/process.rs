@@ -322,7 +322,11 @@ impl Process {
         space
             .stack_mut()
             .set_initial_state(stack_pointer, stack_init.image);
-        let context = UserContext::for_entry(space.entry_point(), stack_pointer);
+        let context = UserContext::for_entry_with_tls(
+            space.entry_point(), 
+            stack_pointer, 
+            space.tls_base()
+        );
 
         let handle = if let Some(manager) = memory {
             Some(manager.map_address_space(&space)?)
