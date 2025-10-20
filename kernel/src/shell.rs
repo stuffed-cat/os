@@ -584,10 +584,14 @@ impl ShellSubsystem {
 
         let profile = users::root_profile();
         serial::write_str("shell: got root profile\r\n");
+        serial::write_fmt(format_args!("shell: profile.shell = '{}'\r\n", profile.shell));
 
         let shell_path = if profile.shell.is_empty() {
-            String::from("/bin/sh")
+            // Use bash directly - real bash is in /bin/bash in rootfs
+            serial::write_str("shell: using default /bin/bash\r\n");
+            String::from("/bin/bash")
         } else {
+            serial::write_fmt(format_args!("shell: using profile shell: '{}'\r\n", profile.shell));
             profile.shell.clone()
         };
 

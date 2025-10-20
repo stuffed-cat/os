@@ -176,6 +176,42 @@ impl<'a> PosixLayer<'a> {
                 let iovcnt = args.get(2).copied().unwrap_or_default();
                 self.writev(pid, fd, iov, iovcnt)
             }
+            SyscallId::ArchPrctl => {
+                let code = args.get(0).copied().unwrap_or_default();
+                let addr = args.get(1).copied().unwrap_or_default();
+                log::info!("arch_prctl: pid={} code={} addr={:#x} -> OK (stub)", pid.as_u64(), code, addr);
+                Ok(0)
+            }
+            SyscallId::SetTidAddress => {
+                let tidptr = args.get(0).copied().unwrap_or_default();
+                log::info!("set_tid_address: pid={} tidptr={:#x} -> {}", pid.as_u64(), tidptr, pid.as_u64());
+                Ok(pid.as_u64())
+            }
+            SyscallId::SetRobustList => {
+                let head = args.get(0).copied().unwrap_or_default();
+                let len = args.get(1).copied().unwrap_or_default();
+                log::info!("set_robust_list: pid={} head={:#x} len={} -> OK (stub)", pid.as_u64(), head, len);
+                Ok(0)
+            }
+            SyscallId::RtSigaction => {
+                let signum = args.get(0).copied().unwrap_or_default();
+                log::info!("rt_sigaction: pid={} signum={} -> OK (stub)", pid.as_u64(), signum);
+                Ok(0)
+            }
+            SyscallId::RtSigprocmask => {
+                let how = args.get(0).copied().unwrap_or_default();
+                log::info!("rt_sigprocmask: pid={} how={} -> OK (stub)", pid.as_u64(), how);
+                Ok(0)
+            }
+            SyscallId::Prlimit64 => {
+                let resource = args.get(1).copied().unwrap_or_default();
+                log::info!("prlimit64: pid={} resource={} -> OK (stub)", pid.as_u64(), resource);
+                Ok(0)
+            }
+            SyscallId::GetUid => Ok(1000),  // Return uid 1000
+            SyscallId::GetEuid => Ok(1000),
+            SyscallId::GetGid => Ok(1000),  // Return gid 1000
+            SyscallId::GetEgid => Ok(1000),
             SyscallId::ExitGroup => {
                 log::info!("exit_group: pid={} terminating", pid.as_u64());
                 self.exit(pid, args.get(0).copied().unwrap_or_default() as i32);
@@ -603,19 +639,115 @@ impl<'a> PosixLayer<'a> {
     }
 
     fn writev(&self, pid: Pid, fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
-        // writev writes from multiple buffers
-        // For simplicity, treat it like multiple write() calls
+        use core::ptr;
+        use x86_64::registers::control::Cr3;
+        use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame, Size4KiB};
+        
         let mut total = 0u64;
-        for i in 0..iovcnt {
-            // Each iovec is: struct { void *iov_base; size_t iov_len; }
-            // On x86-64, that's 16 bytes (8+8)
-            let _iovec_ptr = iov + i * 16;
-            // Read iovec structure from user memory - would need to be safe
-            // For now, just pretend we wrote something
-            total += 1;
+        let mut output = alloc::string::String::new();
+        
+        if let Some(manager) = self.process_table.memory_manager() {
+            let phys_offset = manager.physical_memory_offset();
+            let (root_frame, _) = Cr3::read();
+            
+            for i in 0..iovcnt.min(16) {
+                let iovec_ptr = iov + i * 16;
+                
+                // Translate iovec_ptr to physical and read iovec struct
+                if let Some((iov_base, mut iov_len)) = (|| unsafe {
+                    let l4_table_ptr = (phys_offset + root_frame.start_address().as_u64()).as_u64() as *const PageTable;
+                    
+                    // Read iov_base (first u64 of iovec)
+                    let base_phys = Self::translate_virt(iovec_ptr, l4_table_ptr, phys_offset)?;
+                    let iov_base = ptr::read((phys_offset + base_phys).as_u64() as *const u64);
+                    
+                    // Read iov_len (second u64 of iovec)
+                    let len_phys = Self::translate_virt(iovec_ptr + 8, l4_table_ptr, phys_offset)?;
+                    let iov_len = ptr::read((phys_offset + len_phys).as_u64() as *const u64);
+                    
+                    Some((iov_base, iov_len))
+                })() {
+                    // Clamp to reasonable size
+                    if iov_len > 4096 {
+                        iov_len = 4096;
+                    }
+                    
+                    // Read buffer content byte by byte
+                    for offset in 0..iov_len {
+                        if let Some(byte_phys) = (|| unsafe {
+                            let l4_table_ptr = (phys_offset + root_frame.start_address().as_u64()).as_u64() as *const PageTable;
+                            Self::translate_virt(iov_base + offset, l4_table_ptr, phys_offset)
+                        })() {
+                            unsafe {
+                                let byte = ptr::read((phys_offset + byte_phys).as_u64() as *const u8);
+                                if byte != 0 {
+                                    output.push(byte as char);
+                                }
+                            }
+                        }
+                    }
+                    total += iov_len;
+                }
+            }
         }
-        log::info!("writev: pid={} fd={} iovcnt={} -> {}", pid.as_u64(), fd, iovcnt, total);
+        
+        if !output.is_empty() {
+            if fd == 2 {
+                log::error!("stderr[pid={}]: {}", pid.as_u64(), output);
+            } else if fd == 1 {
+                log::info!("stdout[pid={}]: {}", pid.as_u64(), output);
+            } else {
+                log::info!("fd{}[pid={}]: {}", fd, pid.as_u64(), output);
+            }
+        }
+        
+        log::debug!("writev: pid={} fd={} iovcnt={} -> {} bytes", pid.as_u64(), fd, iovcnt, total);
         Ok(total)
+    }
+    
+    // Helper function to translate virtual address to physical using page tables
+    unsafe fn translate_virt(virt: u64, l4_table_ptr: *const x86_64::structures::paging::PageTable, phys_offset: x86_64::VirtAddr) -> Option<u64> {
+        use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame, Size4KiB};
+        
+        let l4_idx = ((virt >> 39) & 0x1ff) as usize;
+        let l3_idx = ((virt >> 30) & 0x1ff) as usize;
+        let l2_idx = ((virt >> 21) & 0x1ff) as usize;
+        let l1_idx = ((virt >> 12) & 0x1ff) as usize;
+        let page_offset = (virt & 0xfff) as usize;
+        
+        let l4_table = &*l4_table_ptr;
+        let l4_entry = &l4_table[l4_idx];
+        if !l4_entry.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        
+        let l3_frame = PhysFrame::<Size4KiB>::from_start_address(l4_entry.addr()).ok()?;
+        let l3_table_ptr = (phys_offset + l3_frame.start_address().as_u64()).as_u64() as *const PageTable;
+        let l3_table = &*l3_table_ptr;
+        let l3_entry = &l3_table[l3_idx];
+        if !l3_entry.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        
+        let l2_frame = PhysFrame::<Size4KiB>::from_start_address(l3_entry.addr()).ok()?;
+        let l2_table_ptr = (phys_offset + l2_frame.start_address().as_u64()).as_u64() as *const PageTable;
+        let l2_table = &*l2_table_ptr;
+        let l2_entry = &l2_table[l2_idx];
+        if !l2_entry.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        
+        let l1_frame = PhysFrame::<Size4KiB>::from_start_address(l2_entry.addr()).ok()?;
+        let l1_table_ptr = (phys_offset + l1_frame.start_address().as_u64()).as_u64() as *const PageTable;
+        let l1_table = &*l1_table_ptr;
+        let l1_entry = &l1_table[l1_idx];
+        if !l1_entry.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        
+        let phys_frame = PhysFrame::<Size4KiB>::from_start_address(l1_entry.addr()).ok()?;
+        let phys_addr = phys_frame.start_address().as_u64() + page_offset as u64;
+        Some(phys_addr)
     }
 
     /// Normalizes POSIX path.

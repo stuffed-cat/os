@@ -546,8 +546,9 @@ pub fn prepare_initial_stack(
     let mut builder = StackInitializer::new(stack);
 
     let mut argv_pointers = Vec::with_capacity(argv.len());
-    for arg in argv {
+    for (i, arg) in argv.iter().enumerate() {
         let ptr = builder.push_cstring(arg).map_err(SubsystemError::from)?;
+        log::debug!("argv[{}] = '{}' pushed at {:#x}", i, arg, ptr);
         argv_pointers.push(ptr);
     }
 
@@ -610,28 +611,38 @@ pub fn prepare_initial_stack(
         builder.push_u64(*ptr).map_err(SubsystemError::from)?;
     }
 
-    let mut argv_entries = argv_pointers;
-    argv_entries.push(0);
-    for ptr in argv_entries.iter().rev() {
-        builder.push_u64(*ptr).map_err(SubsystemError::from)?;
-    }
-
-    // x86-64 ABI requires RSP to be 16-byte aligned at process entry (_start)
-    // After pushing argc, RSP should be misaligned by 8 (as if a call just happened)
-    // But we need to account for the fact that we're entering _start directly
-    // without a call, so we need RSP%16==0 BEFORE push argc
+    // x86-64 ABI: RSP must be 16-byte aligned at process entry (_start)
+    // We'll push argv array (N pointers) + argc (1 u64)
+    // Total = (N+1)*8 bytes
+    // If (N+1) is odd, we need padding to make RSP%16==0 after all pushes
     builder.align_down(16).map_err(SubsystemError::from)?;
     
-    // Push a dummy return address to simulate a call to _start
-    // This makes RSP%16==8, which is what we want before push argc
-    builder.push_u64(0).map_err(SubsystemError::from)?;
+    let argv_count = argv_pointers.len() + 1; // +1 for NULL terminator
+    let total_pushes = argv_count + 1; // +1 for argc
+    if total_pushes % 2 != 0 {
+        // Odd number of u64 pushes, need 8-byte padding
+        builder.push_u64(0).map_err(SubsystemError::from)?;
+    }
 
-    debug_assert_eq!(builder.current_sp() & 0xF, 8);
+    let mut argv_entries = argv_pointers;
+    argv_entries.push(0);
+    log::info!("argv_entries before push: {:x?}", argv_entries);
+    let argv_sp_before = builder.current_sp();
+    for ptr in argv_entries.iter().rev() {
+        let pushed_at = builder.push_u64(*ptr).map_err(SubsystemError::from)?;
+        log::info!("Pushed argv entry {:#x} at SP={:#x}", ptr, pushed_at);
+    }
+    let argv_sp_after = builder.current_sp();
+    log::info!("argv array spans [{:#x}, {:#x}), size={} bytes", 
+        argv_sp_after, argv_sp_before, argv_sp_before - argv_sp_after);
 
     let argc = (argv_entries.len() - 1) as u64;
+    log::info!("Stack layout: argc={} argv_entry_count={}", argc, argv_entries.len());
     builder.push_u64(argc).map_err(SubsystemError::from)?;
 
-    debug_assert_eq!(builder.current_sp() & 0xF, 0);
+    let final_sp = builder.current_sp();
+    debug_assert_eq!(final_sp & 0xF, 0, "Stack pointer must be 16-byte aligned");
+    log::info!("Final stack pointer: {:#x}, argc at {:#x}", final_sp, final_sp);
 
     let result = builder.finalize().map_err(SubsystemError::from)?;
     Ok(StackInitialization {

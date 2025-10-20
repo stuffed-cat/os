@@ -51,6 +51,26 @@ pub enum SyscallId {
     Writev,
     /// Exit all threads `exit_group` syscall.
     ExitGroup,
+    /// Architecture-specific control `arch_prctl` syscall.
+    ArchPrctl,
+    /// Set thread ID address `set_tid_address` syscall.
+    SetTidAddress,
+    /// Set robust futex list `set_robust_list` syscall.
+    SetRobustList,
+    /// Real-time signal action `rt_sigaction` syscall.
+    RtSigaction,
+    /// Real-time signal mask `rt_sigprocmask` syscall.
+    RtSigprocmask,
+    /// Get/set resource limits `prlimit64` syscall.
+    Prlimit64,
+    /// Get user ID `getuid` syscall.
+    GetUid,
+    /// Get effective user ID `geteuid` syscall.
+    GetEuid,
+    /// Get group ID `getgid` syscall.
+    GetGid,
+    /// Get effective group ID `getegid` syscall.
+    GetEgid,
     /// Placeholder for future syscalls.
     Unknown(u64),
 }
@@ -77,6 +97,16 @@ impl From<u64> for SyscallId {
             9 => SyscallId::Mmap,
             20 => SyscallId::Writev,
             231 => SyscallId::ExitGroup,
+            158 => SyscallId::ArchPrctl,
+            218 => SyscallId::SetTidAddress,
+            273 => SyscallId::SetRobustList,
+            13 => SyscallId::RtSigaction,
+            14 => SyscallId::RtSigprocmask,
+            302 => SyscallId::Prlimit64,
+            102 => SyscallId::GetUid,
+            107 => SyscallId::GetEuid,
+            104 => SyscallId::GetGid,
+            108 => SyscallId::GetEgid,
             other => SyscallId::Unknown(other),
         }
     }

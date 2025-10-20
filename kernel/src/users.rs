@@ -93,7 +93,7 @@ impl UserDatabase {
             gid: 0,
             groups: vec![0],
             home: String::from("/root"),
-            shell: String::from("/bin/sh"),
+            shell: String::from("/bin/bash"),  // Real bash in rootfs
         };
         let record = UserRecord::new(profile.clone(), "root");
         self.by_uid.insert(profile.uid, profile.username.clone());

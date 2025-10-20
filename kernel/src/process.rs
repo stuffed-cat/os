@@ -336,6 +336,11 @@ impl Process {
 
         let argv = alloc::vec![program.clone()];
         let env_pairs: Vec<(String, String)> = self.env_snapshot().into_iter().collect();
+        log::info!("set_program_image: program='{}' argc={} argv={:?}", program, argv.len(), argv);
+        log::info!("set_program_image: env vars count={}", env_pairs.len());
+        for (k, v) in &env_pairs {
+            log::debug!("  env: {}={}", k, v);
+        }
         let ids = StackUserIds {
             uid: self.uid(),
             gid: self.gid(),
