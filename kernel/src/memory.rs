@@ -435,6 +435,11 @@ impl MemoryManager {
             self.copy_segment_into_frame(frame, segment, page);
         }
         
+        // CRITICAL FIX: Ensure parent page tables have USER_ACCESSIBLE bit set!
+        // The map_to() call only sets flags on the L1 PTE, but user access requires
+        // US=1 on ALL levels (L4, L3, L2, L1). We must manually fix parent tables.
+        self.fix_parent_table_permissions(mapper, start_page, end_page)?;
+        
         Ok(())
     }
 
@@ -470,6 +475,9 @@ impl MemoryManager {
                 self.copy_stack_image_into_frame(frame, stack, image, page);
             }
         }
+        
+        // CRITICAL FIX: Ensure parent page tables have USER_ACCESSIBLE bit!
+        self.fix_parent_table_permissions(mapper, start_page, end_page)?;
         Ok(())
     }
 
@@ -532,6 +540,62 @@ impl MemoryManager {
             | PageTableFlags::WRITABLE
             | PageTableFlags::NO_EXECUTE
     }
+    
+    /// Fix parent page table permissions to allow user access.
+    /// 
+    /// x86-64 requires the US (User/Supervisor) bit to be set in ALL levels
+    /// of the page table hierarchy (L4/PML4, L3/PDP, L2/PD, L1/PT) for user
+    /// mode access. The map_to() call only sets the L1 PTE flags, so we must
+    /// manually set US=1 on L4, L3, and L2 entries.
+    fn fix_parent_table_permissions(
+        &self,
+        _mapper: &mut OffsetPageTable<'static>,
+        start_page: Page<Size4KiB>,
+        end_page: Page<Size4KiB>,
+    ) -> Result<(), SubsystemError> {
+        use x86_64::registers::control::Cr3;
+        
+        let phys_offset = self.physical_memory_offset();
+        let (root_frame, _) = Cr3::read();
+        
+        unsafe {
+            for page in Page::range_inclusive(start_page, end_page) {
+                let addr = page.start_address().as_u64();
+                let mut current_frame = root_frame;
+                
+                // Traverse L4, L3, L2 (but not L1, which is already correct)
+                let indices = [
+                    ((addr >> 39) & 0x1ff) as usize,  // L4 index
+                    ((addr >> 30) & 0x1ff) as usize,  // L3 index
+                    ((addr >> 21) & 0x1ff) as usize,  // L2 index
+                ];
+                
+                for &index in &indices {
+                    let table_ptr = (phys_offset + current_frame.start_address().as_u64())
+                        .as_u64() as *mut PageTable;
+                    let table = &mut *table_ptr;
+                    let entry = &mut table[index];
+                    
+                    // Add USER_ACCESSIBLE if not present
+                    let mut entry_flags = entry.flags();
+                    if !entry_flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+                        entry_flags |= PageTableFlags::USER_ACCESSIBLE;
+                        entry.set_flags(entry_flags);
+                    }
+                    
+                    // Move to next level
+                    if let Ok(next_frame) = PhysFrame::from_start_address(entry.addr()) {
+                        current_frame = next_frame;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
     /// Maps a single page to the given frame.
     pub fn map_to(
         &self,

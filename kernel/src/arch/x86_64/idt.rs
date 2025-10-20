@@ -251,6 +251,9 @@ fn switch_address_space(root: PhysFrame) {
         let (current, _) = Cr3::read();
         if current != root {
             Cr3::write(root, Cr3Flags::empty());
+        } else {
+            // Force TLB flush even if same CR3 (important for first user entry)
+            x86_64::instructions::tlb::flush_all();
         }
     }
 }
@@ -364,6 +367,14 @@ extern "x86-interrupt" fn page_fault_handler(
             error_code.contains(PageFaultErrorCode::USER_MODE),
             error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH)
         ));
+        
+        #[cfg(feature = "hardware")]
+        serial::write_fmt(format_args!(
+            "CS: {:#x} (CPL={}), SS: {:#x}\r\n",
+            stack_frame.code_segment.0,
+            stack_frame.code_segment.0 & 3,
+            stack_frame.stack_segment.0
+        ));
 
         #[cfg(feature = "hardware")]
         {
@@ -371,6 +382,20 @@ extern "x86-interrupt" fn page_fault_handler(
             dump_user_page_entry(fault_address);
             serial::write_str("RIP page table:\r\n");
             dump_user_page_entry(stack_frame.instruction_pointer.as_u64());
+            
+            // Try to read the instruction bytes at RIP via physical address
+            let Some(table) = ProcessTable::global() else { return; };
+            let Some(manager) = table.memory_manager() else { return; };
+            let phys_offset = manager.physical_memory_offset();
+            let rip_phys_addr = 0x4e3000u64 + (stack_frame.instruction_pointer.as_u64() & 0xfff);
+            let inst_ptr = (phys_offset + rip_phys_addr).as_u64() as *const u8;
+            unsafe {
+                serial::write_str("Instruction bytes at RIP (via physical): ");
+                for i in 0..16 {
+                    serial::write_fmt(format_args!("{:02x} ", *inst_ptr.add(i)));
+                }
+                serial::write_str("\r\n");
+            }
         }
 
         #[cfg(feature = "hardware")]

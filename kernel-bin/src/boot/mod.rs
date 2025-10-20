@@ -60,6 +60,11 @@ pub fn start(boot_info: &'static mut BootInfo, allocator: &'static LockedHeap) -
         serial::write_str("kernel: no ramdisk provided\r\n");
     }
 
+    // CRITICAL: Enable SSE before user mode!
+    // Modern glibc and dynamic linker use SSE instructions (movq xmm, etc.)
+    enable_sse();
+    serial::write_str("kernel: SSE enabled\r\n");
+
     hal.enable_interrupts();
     serial::write_str("kernel: interrupts enabled\r\n");
 
@@ -93,6 +98,28 @@ fn collect_frame_ranges(regions: &MemoryRegions) -> ArrayVec<FrameRange, 256> {
         }
     }
     ranges
+}
+
+/// Enable SSE (Streaming SIMD Extensions) support.
+/// Required for modern glibc which uses SSE instructions like movq %rsi,%xmm2
+fn enable_sse() {
+    use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
+    
+    unsafe {
+        // Clear CR0.EM (bit 2) - Enable FPU emulation = disabled
+        // Set CR0.MP (bit 1) - Monitor coprocessor = enabled
+        let mut cr0 = Cr0::read();
+        cr0.remove(Cr0Flags::EMULATE_COPROCESSOR);
+        cr0.insert(Cr0Flags::MONITOR_COPROCESSOR);
+        Cr0::write(cr0);
+        
+        // Set CR4.OSFXSR (bit 9) - Enable FXSAVE/FXRSTOR
+        // Set CR4.OSXMMEXCPT (bit 10) - Enable SSE exceptions
+        let mut cr4 = Cr4::read();
+        cr4.insert(Cr4Flags::OSFXSR);
+        cr4.insert(Cr4Flags::OSXMMEXCPT_ENABLE);
+        Cr4::write(cr4);
+    }
 }
 
 fn halt_loop() -> ! {
