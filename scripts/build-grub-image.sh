@@ -52,7 +52,7 @@ cat > "$BUILD_DIR/boot/grub/grub.cfg" << 'EOF'
 set timeout=3
 set default=0
 
-menuentry "Hanxi Cat OS" {
+menuentry "NexaOS" {
     multiboot /boot/kernel.bin
     module /boot/initrd.img
     boot

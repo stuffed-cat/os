@@ -23,10 +23,10 @@ pub mod keyboard;
 #[cfg(not(feature = "hardware"))]
 pub mod framebuffer {
     //! Stub framebuffer interface for host-side testing when hardware support is disabled.
-    use bootloader_api::info::FrameBuffer;
+    use crate::boot_info::Framebuffer;
 
     /// Stub framebuffer init for host testing.
-    pub fn init(_: &'static mut FrameBuffer) {}
+    pub fn init(_: &mut Framebuffer) {}
 
     /// Stub framebuffer writer for host testing.
     pub fn write_str(_: &str) {}

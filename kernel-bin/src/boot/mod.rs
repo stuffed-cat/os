@@ -1,9 +1,10 @@
 #![cfg(feature = "boot")]
 
+mod multiboot;
+
 use arrayvec::ArrayVec;
-use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
-use bootloader_api::BootInfo;
 use kernel::{
+    boot_info::{BootInfo, MemoryRegionKind, MemoryRegions},
     arch::x86_64::{framebuffer, serial},
     fs,
     hal::HalConfig,
@@ -21,7 +22,6 @@ const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4 MiB heap for early allocations
 pub fn start(boot_info: &'static mut BootInfo, allocator: &'static LockedHeap) -> ! {
     let phys_offset = boot_info
         .physical_memory_offset
-        .into_option()
         .expect("physical memory offset provided");
 
     if let Some(framebuffer) = boot_info.framebuffer.as_mut() {
@@ -47,7 +47,7 @@ pub fn start(boot_info: &'static mut BootInfo, allocator: &'static LockedHeap) -
         allocator.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
     }
 
-    if let Some(addr) = boot_info.ramdisk_addr.as_ref().copied() {
+    if let Some(addr) = boot_info.ramdisk_addr {
         if boot_info.ramdisk_len > 0 {
             match fs::init_from_ramdisk(addr, boot_info.ramdisk_len) {
                 Ok(_) => serial::write_str("kernel: filesystem initialized\r\n"),

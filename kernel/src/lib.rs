@@ -13,6 +13,8 @@ extern crate alloc;
 
 mod core;
 mod error;
+/// Bootloader-provided information passed to the kernel entry point.
+pub mod boot_info;
 
 pub mod arch;
 pub mod elf;

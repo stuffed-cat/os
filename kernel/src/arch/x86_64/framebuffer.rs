@@ -3,9 +3,9 @@
 
 //! Minimal text console renderer that mirrors serial output onto the bootloader framebuffer.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::{slice, sync::atomic::{AtomicBool, Ordering}};
 
-use bootloader_api::info::{FrameBuffer, FrameBufferInfo, PixelFormat};
+use crate::boot_info::{Framebuffer, FramebufferInfo, PixelFormat};
 use font8x8::UnicodeFonts;
 use spin::Mutex;
 
@@ -65,7 +65,7 @@ const ANSI_BRIGHT_COLORS: [RgbColor; 8] = [
 ];
 
 /// Installs the framebuffer writer using the bootloader-provided framebuffer.
-pub fn init(framebuffer: &'static mut FrameBuffer) {
+pub fn init(framebuffer: &mut Framebuffer) {
     let mut guard = FRAMEBUFFER.lock();
     if guard.is_none() {
         let writer = FrameBufferWriter::new(framebuffer);
@@ -85,8 +85,9 @@ pub fn write_str(s: &str) {
 }
 
 struct FrameBufferWriter {
-    framebuffer: *mut FrameBuffer,
-    info: FrameBufferInfo,
+    buffer_ptr: *mut u8,
+    buffer_len: usize,
+    info: FramebufferInfo,
     cursor_x: usize,
     cursor_y: usize,
     fg_color: RgbColor,
@@ -100,10 +101,12 @@ struct FrameBufferWriter {
 unsafe impl Send for FrameBufferWriter {}
 
 impl FrameBufferWriter {
-    fn new(framebuffer: &'static mut FrameBuffer) -> Self {
+    fn new(framebuffer: &mut Framebuffer) -> Self {
         let info = framebuffer.info();
+        let buffer = unsafe { framebuffer.buffer_mut() };
         let mut writer = Self {
-            framebuffer,
+            buffer_ptr: buffer.as_mut_ptr(),
+            buffer_len: buffer.len(),
             info,
             cursor_x: 0,
             cursor_y: 0,
@@ -358,14 +361,15 @@ impl FrameBufferWriter {
 
     fn with_buffer<F>(&mut self, mut f: F)
     where
-        F: FnMut(&FrameBufferInfo, &mut [u8]),
+        F: FnMut(&FramebufferInfo, &mut [u8]),
     {
-        let framebuffer = unsafe { &mut *self.framebuffer };
-        let buffer = framebuffer.buffer_mut();
-        f(&self.info, buffer);
+        unsafe {
+            let buffer = slice::from_raw_parts_mut(self.buffer_ptr, self.buffer_len);
+            f(&self.info, buffer);
+        }
     }
 
-    fn fill_with_color(info: &FrameBufferInfo, slice: &mut [u8], color: RgbColor) {
+    fn fill_with_color(info: &FramebufferInfo, slice: &mut [u8], color: RgbColor) {
         let bytes_per_pixel = info.bytes_per_pixel as usize;
         if bytes_per_pixel == 0 {
             return;

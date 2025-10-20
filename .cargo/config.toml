@@ -1,6 +1,9 @@
 [target.x86_64-unknown-none]
-rustflags = ["-Z", "unstable-options", "-C", "panic=abort"]
+rustflags = ["-Z", "unstable-options", "-C", "panic=abort", "-C", "relocation-model=static", "-C", "link-arg=-z", "-C", "link-arg=notext", "-C", "link-arg=-no-pie"]
 
 [alias]
 xtask = "run --package xtask --"
 bootimage = "run --package xtask -- bootimage"
+
+[net]
+git-fetch-with-cli = true

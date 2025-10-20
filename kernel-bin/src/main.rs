@@ -1,18 +1,12 @@
 #![cfg_attr(feature = "boot", no_std)]
 #![cfg_attr(feature = "boot", no_main)]
-#![cfg_attr(feature = "boot", feature(lang_items))]
+#![cfg_attr(feature = "boot", feature(lang_items, global_asm))]
 
 #[cfg(feature = "boot")]
 mod boot;
 
 #[cfg(feature = "boot")]
 extern crate alloc;
-
-#[cfg(feature = "boot")]
-use bootloader_api::BootInfo;
-
-#[cfg(feature = "boot")]
-use bootloader_api::config::{BootloaderConfig, Mapping};
 
 #[cfg(feature = "boot")]
 use linked_list_allocator::LockedHeap;
@@ -23,22 +17,6 @@ static GLOBAL_ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 #[cfg(feature = "boot")]
 use kernel::arch::x86_64::serial;
-
-#[cfg(feature = "boot")]
-pub static BOOTLOADER_CONFIG: BootloaderConfig = {
-    let mut config = BootloaderConfig::new_default();
-    config.mappings.physical_memory = Some(Mapping::Dynamic);
-    config
-};
-
-#[cfg(feature = "boot")]
-bootloader_api::entry_point!(kernel_entry, config = &BOOTLOADER_CONFIG);
-
-#[cfg(feature = "boot")]
-fn kernel_entry(boot_info: &'static mut BootInfo) -> ! {
-    boot::start(boot_info, &GLOBAL_ALLOCATOR)
-}
-
 #[cfg(feature = "boot")]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
