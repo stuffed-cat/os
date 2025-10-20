@@ -30,12 +30,14 @@ pub fn init() {
         static mut DOUBLE_FAULT_STACK: [u8; KERNEL_STACK_BYTES] = [0; KERNEL_STACK_BYTES];
         static mut PRIVILEGE_STACK: [u8; KERNEL_STACK_BYTES] = [0; KERNEL_STACK_BYTES];
 
-        let df_stack_start = VirtAddr::from_ptr(core::ptr::addr_of!(DOUBLE_FAULT_STACK) as *const u8);
-    let df_stack_end = df_stack_start + KERNEL_STACK_BYTES as u64;
-    tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX] = df_stack_end;
+        let df_stack_start =
+            VirtAddr::from_ptr(core::ptr::addr_of!(DOUBLE_FAULT_STACK) as *const u8);
+        let df_stack_end = df_stack_start + KERNEL_STACK_BYTES as u64;
+        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX] = df_stack_end;
 
-        let priv_stack_start = VirtAddr::from_ptr(core::ptr::addr_of!(PRIVILEGE_STACK) as *const u8);
-    let priv_stack_end = priv_stack_start + KERNEL_STACK_BYTES as u64;
+        let priv_stack_start =
+            VirtAddr::from_ptr(core::ptr::addr_of!(PRIVILEGE_STACK) as *const u8);
+        let priv_stack_end = priv_stack_start + KERNEL_STACK_BYTES as u64;
         tss.privilege_stack_table[RING0_STACK_INDEX] = priv_stack_end;
 
         trace!(

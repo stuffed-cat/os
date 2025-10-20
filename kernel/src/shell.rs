@@ -17,9 +17,9 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
+use log::trace;
 #[cfg(all(not(feature = "std"), not(feature = "hardware")))]
 use log::{error, warn};
-use log::trace;
 use pc_keyboard::layouts::Us104Key;
 use pc_keyboard::{DecodedKey, HandleControl, Keyboard, ScancodeSet1};
 use spin::{Lazy, Mutex};
@@ -32,7 +32,7 @@ use userland::bare_shell::{
 
 const SCANCODE_QUEUE_CAPACITY: usize = 256;
 const CONSOLE_BUFFER_CAPACITY: usize = 4096;
-const ENABLE_USER_PROCESSES: bool = false;
+const ENABLE_USER_PROCESSES: bool = true;
 const DEFAULT_HOSTNAME: &str = "nexaos";
 
 type KernelBareShell = BareShell<KernelShellIo, KernelShellFs, KernelShellSystem>;
@@ -143,8 +143,7 @@ static CURRENT_THREAD: Lazy<Mutex<Option<RunQueueEntry>>> = Lazy::new(|| Mutex::
 static FAILED_THREAD: Lazy<Mutex<Option<RunQueueEntry>>> = Lazy::new(|| Mutex::new(None));
 
 /// Records details about the most recent user space fault.
-static LAST_USER_FAULT: Lazy<Mutex<Option<UserFaultRecord>>> =
-    Lazy::new(|| Mutex::new(None));
+static LAST_USER_FAULT: Lazy<Mutex<Option<UserFaultRecord>>> = Lazy::new(|| Mutex::new(None));
 
 fn push_bare_shell_scancode(scancode: u8) {
     let mut queue = BARE_SHELL_SCANCODES.lock();
@@ -579,23 +578,29 @@ impl ShellSubsystem {
 
     fn launch_initial_user(&self) -> Result<(), SubsystemError> {
         serial::write_str("shell: launch_initial_user starting\r\n");
-        
+
         session::reset_to_root();
         serial::write_str("shell: session reset\r\n");
-        
+
         let profile = users::root_profile();
         serial::write_str("shell: got root profile\r\n");
-        
+
         let shell_path = if profile.shell.is_empty() {
             String::from("/bin/sh")
         } else {
             profile.shell.clone()
         };
 
-        serial::write_fmt(format_args!("shell: spawning process for {}\r\n", shell_path));
+        serial::write_fmt(format_args!(
+            "shell: spawning process for {}\r\n",
+            shell_path
+        ));
         trace!("shell: spawning initial user process");
         let process = self.process_table.spawn();
-        serial::write_fmt(format_args!("shell: spawn completed pid={}\r\n", process.pid().as_u64()));
+        serial::write_fmt(format_args!(
+            "shell: spawn completed pid={}\r\n",
+            process.pid().as_u64()
+        ));
         trace!("shell: spawn completed with pid={}", process.pid().as_u64());
         serial::write_str("shell: setting credentials and env\r\n");
         process.set_credentials(profile.uid, profile.gid, profile.groups.clone());
@@ -612,21 +617,25 @@ impl ShellSubsystem {
 
         serial::write_fmt(format_args!("shell: executing {}\r\n", shell_path));
         trace!("shell: executing {}", shell_path);
-        self.process_table.exec(process.pid(), shell_path)?;
+        self.process_table.exec(process.pid(), shell_path.clone())?;
         serial::write_str("shell: exec completed\r\n");
         trace!("shell: exec completed");
 
         let (tid, _) = process
             .main_thread()
             .ok_or(SubsystemError::Runtime("exec produced no runnable thread"))?;
+        serial::write_fmt(format_args!("shell: got main thread tid={}\r\n", tid.as_u64()));
+        
         let user_context = process.user_context();
-        trace!(
-            "shell: user context present? {}",
-            user_context.is_some()
-        );
+        trace!("shell: user context present? {}", user_context.is_some());
         match user_context {
             Some(context) => {
                 let frame = context.frame();
+                serial::write_fmt(format_args!(
+                    "shell: initial user context rip={:#x} rsp={:#x}\r\n",
+                    frame.rip,
+                    frame.rsp
+                ));
                 trace!(
                     "shell: initial user context rip={:#x} rsp={:#x}",
                     frame.rip,
@@ -634,9 +643,33 @@ impl ShellSubsystem {
                 );
             }
             None => {
+                serial::write_str("shell: ERROR - user context missing!\r\n");
                 trace!("shell: initial user context missing");
             }
         }
+        
+        let addr_space = process.address_space();
+        if let Some(space) = addr_space {
+            serial::write_fmt(format_args!(
+                "shell: address space entry={:#x} stack_base={:#x} stack_top={:#x}\r\n",
+                space.entry_point(),
+                space.stack().base(),
+                space.stack().top()
+            ));
+            serial::write_fmt(format_args!("shell: segments count={}\r\n", space.segments().len()));
+            for (i, seg) in space.segments().iter().enumerate().take(10) {
+                serial::write_fmt(format_args!(
+                    "shell: seg[{}] base={:#x} len={:#x} perms={:?}\r\n",
+                    i,
+                    seg.base(),
+                    seg.length(),
+                    seg.permissions()
+                ));
+            }
+        } else {
+            serial::write_str("shell: ERROR - address space missing!\r\n");
+        }
+        
         process.set_thread_status(tid, ThreadStatus::Ready);
         let priority = process
             .thread_state(tid)
@@ -647,7 +680,6 @@ impl ShellSubsystem {
             .enqueue(RunQueueEntry::user(process.pid(), tid, priority));
         Ok(())
     }
-
     fn poll_bare_shell(&mut self) {
         self.bare_shell.poll();
     }
@@ -734,12 +766,11 @@ impl Subsystem for ShellSubsystem {
         Scheduler::enable_timer_global();
         serial::write_str("shell: timer enabled in init\r\n");
 
+        // 启动用户 shell 进程
         if ENABLE_USER_PROCESSES && !self.init_spawned {
             serial::write_str("shell: launching initial user\r\n");
-            
             let result = self.launch_initial_user();
             serial::write_str("shell: launch_initial_user returned\r\n");
-
             match result {
                 Ok(()) => {
                     self.init_spawned = true;
@@ -747,7 +778,6 @@ impl Subsystem for ShellSubsystem {
                 }
                 Err(e) => {
                     serial::write_fmt(format_args!("shell: failed to launch initial user: {:?}\r\n", e));
-                    // Re-enable interrupts if they were enabled before
                     if interrupts_were_enabled {
                         x86_64::instructions::interrupts::enable();
                     }
@@ -758,13 +788,11 @@ impl Subsystem for ShellSubsystem {
             serial::write_str("shell: userspace launch disabled; running bare shell only\r\n");
             self.init_spawned = true;
         }
-
-        // Always re-enable interrupts if they were enabled before
+        // 重新启用中断并完成初始化
         if interrupts_were_enabled {
             x86_64::instructions::interrupts::enable();
         }
         serial::write_str("shell: init complete\r\n");
-
         Ok(())
     }
 

@@ -45,6 +45,11 @@ const S_IFDIR: u16 = 0o040000;
 const MODE_PERMS_MASK: u16 = 0o7777;
 
 static FILESYSTEM: Mutex<Option<Ext2Fs<'static>>> = Mutex::new(None);
+
+/// Returns whether the backing filesystem image has been initialized.
+pub fn is_initialized() -> bool {
+    FILESYSTEM.lock().is_some()
+}
 static FILE_OVERLAY: Mutex<BTreeMap<String, OverlayEntry>> = Mutex::new(BTreeMap::new());
 const JOURNAL_CAPACITY: usize = 256;
 static FILESYSTEM_JOURNAL: Mutex<VecDeque<JournalEntry>> = Mutex::new(VecDeque::new());

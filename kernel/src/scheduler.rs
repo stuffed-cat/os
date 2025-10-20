@@ -379,7 +379,11 @@ impl SchedulerInner {
                     vruntime: info.vruntime,
                     priority: info.priority,
                 }));
-                log::info!("scheduler: re-queued pid={} tid={}", key.pid.as_u64(), key.tid.as_u64());
+                log::info!(
+                    "scheduler: re-queued pid={} tid={}",
+                    key.pid.as_u64(),
+                    key.tid.as_u64()
+                );
             }
         }
     }

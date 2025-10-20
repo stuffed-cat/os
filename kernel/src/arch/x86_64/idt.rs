@@ -31,10 +31,10 @@ use super::{
     interrupts::{self, InterruptIndex},
     keyboard,
 };
-use crate::scheduler::Scheduler;
-use crate::shell::{self, UserFaultKind};
 #[cfg(feature = "hardware")]
 use crate::arch::x86_64::serial;
+use crate::scheduler::Scheduler;
+use crate::shell::{self, UserFaultKind};
 #[cfg(feature = "hardware")]
 use crate::{
     error::KernelError,
@@ -339,9 +339,7 @@ extern "x86-interrupt" fn page_fault_handler(
         );
 
         #[cfg(feature = "hardware")]
-        serial::write_fmt(format_args!(
-            "\r\n=== USER PAGE FAULT ===\r\n",
-        ));
+        serial::write_fmt(format_args!("\r\n=== USER PAGE FAULT ===\r\n"));
 
         #[cfg(feature = "hardware")]
         serial::write_fmt(format_args!(
@@ -352,12 +350,24 @@ extern "x86-interrupt" fn page_fault_handler(
         ));
 
         #[cfg(feature = "hardware")]
-        dump_user_page_entry(fault_address);
+        serial::write_fmt(format_args!(
+            "Present: {}, Write: {}, User: {}, InstFetch: {}\r\n",
+            !error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION),
+            error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE),
+            error_code.contains(PageFaultErrorCode::USER_MODE),
+            error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH)
+        ));
 
         #[cfg(feature = "hardware")]
-        serial::write_fmt(format_args!(
-            "=== END PAGE FAULT INFO ===\r\n",
-        ));
+        {
+            serial::write_str("Fault address page table:\r\n");
+            dump_user_page_entry(fault_address);
+            serial::write_str("RIP page table:\r\n");
+            dump_user_page_entry(stack_frame.instruction_pointer.as_u64());
+        }
+
+        #[cfg(feature = "hardware")]
+        serial::write_fmt(format_args!("=== END PAGE FAULT INFO ===\r\n"));
 
         error!(
             "User mode PAGE FAULT\nRIP: {:#x}\nFaulted Address: {:#x}\nError Code: {:?}",
@@ -367,11 +377,9 @@ extern "x86-interrupt" fn page_fault_handler(
         );
 
         crate::shell::mark_current_process_failed();
-        
-        // Enable interrupts and wait for timer to schedule next process
+
+        // Enable interrupts and enter debug halt loop
         x86_64::instructions::interrupts::enable();
-        
-        // Yield CPU - next timer interrupt will pick up another process (if any)
         loop {
             x86_64::instructions::hlt();
         }
@@ -455,7 +463,7 @@ extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFram
             stack_frame.instruction_pointer.as_u64()
         );
         crate::shell::mark_current_process_failed();
-        
+
         // Halt and wait for timer interrupt to schedule next process
         x86_64::instructions::interrupts::enable();
         loop {
@@ -511,7 +519,12 @@ unsafe extern "C" fn timer_interrupt_handler(
 
         if count < 10 {
             match &next_entry {
-                Some(e) => log::info!("timer #{}: got next entry pid={} tid={}", count, e.pid.as_u64(), e.tid.as_u64()),
+                Some(e) => log::info!(
+                    "timer #{}: got next entry pid={} tid={}",
+                    count,
+                    e.pid.as_u64(),
+                    e.tid.as_u64()
+                ),
                 None => log::info!("timer #{}: no next entry", count),
             }
         }
@@ -522,13 +535,18 @@ unsafe extern "C" fn timer_interrupt_handler(
                     if let Some(table) = ProcessTable::global() {
                         if let Some(proc) = table.lookup(entry.pid) {
                             if let Some((context, root)) = proc.take_thread_runtime(entry.tid) {
-                                static ENTRY_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-                                static LAST_RIP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+                                static ENTRY_COUNT: core::sync::atomic::AtomicU64 =
+                                    core::sync::atomic::AtomicU64::new(0);
+                                static LAST_RIP: core::sync::atomic::AtomicU64 =
+                                    core::sync::atomic::AtomicU64::new(0);
                                 let count = ENTRY_COUNT.fetch_add(1, Ordering::Relaxed);
                                 let trap = context.frame();
                                 let last_rip = LAST_RIP.swap(trap.rip, Ordering::Relaxed);
-                                
-                                if count < 10 || count % 50 == 0 || (count < 100 && last_rip == trap.rip) {
+
+                                if count < 10
+                                    || count % 50 == 0
+                                    || (count < 100 && last_rip == trap.rip)
+                                {
                                     let status = if last_rip == trap.rip { "STUCK" } else { "ok" };
                                     log::info!(
                                         "timer: resuming user #{} pid={} tid={} rip={:#x} [{}]",
