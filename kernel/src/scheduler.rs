@@ -687,6 +687,17 @@ impl Scheduler {
         if let Some(mut running) = inner.current.take() {
             let mut requeue_entry = None;
             if let Some(info) = inner.threads.get_mut(&running.key) {
+                // If thread is already Dead, don't reschedule it
+                if info.status == ThreadStatus::Dead {
+                    log::info!(
+                        "scheduler: thread pid={} tid={} is Dead, not rescheduling",
+                        running.key.pid.as_u64(),
+                        running.key.tid.as_u64()
+                    );
+                    inner.need_resched = true;
+                    return Some(info.entry);
+                }
+                
                 info.vruntime = info.vruntime.saturating_add(info.priority.weight());
                 if running.slice_remaining > 1 {
                     running.slice_remaining -= 1;

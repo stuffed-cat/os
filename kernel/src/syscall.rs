@@ -47,6 +47,10 @@ pub enum SyscallId {
     Brk,
     /// Memory mapping `mmap` syscall (stub).
     Mmap,
+    /// Vectored write `writev` syscall.
+    Writev,
+    /// Exit all threads `exit_group` syscall.
+    ExitGroup,
     /// Placeholder for future syscalls.
     Unknown(u64),
 }
@@ -71,6 +75,8 @@ impl From<u64> for SyscallId {
             35 => SyscallId::Sleep,
             12 => SyscallId::Brk,
             9 => SyscallId::Mmap,
+            20 => SyscallId::Writev,
+            231 => SyscallId::ExitGroup,
             other => SyscallId::Unknown(other),
         }
     }

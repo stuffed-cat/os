@@ -208,6 +208,11 @@ impl Process {
         }
     }
 
+    /// Returns the current program break (heap end address).
+    pub fn program_break(&self) -> u64 {
+        self.program_break.load(Ordering::SeqCst)
+    }
+
     /// Allocates a memory region via mmap (simplified, no actual mapping).
     /// Returns the virtual address for the requested length.
     pub fn allocate_mmap(&self, length: u64) -> u64 {

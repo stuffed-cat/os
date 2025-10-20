@@ -20,7 +20,7 @@ use x86_64::registers::rflags::RFlags;
 #[cfg(feature = "hardware")]
 use x86_64::structures::idt::InterruptStackFrameValue;
 #[cfg(feature = "hardware")]
-use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame};
+use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame, Size4KiB};
 #[cfg(feature = "hardware")]
 use x86_64::PrivilegeLevel;
 #[cfg(feature = "hardware")]
@@ -285,6 +285,14 @@ pub fn init() {
             let handler: extern "C" fn() -> ! = invalid_opcode_trampoline;
             let converted: extern "x86-interrupt" fn(InterruptStackFrame) = transmute(handler);
             idt.invalid_opcode.set_handler_fn(converted);
+
+            // For hardware builds, use a trampoline for GP faults so we can
+            // inspect/modify the saved user context (e.g. skip a user-mode
+            // HLT instruction). The regular handler is still present for
+            // non-hardware builds.
+            let gp_handler: extern "C" fn() -> ! = general_protection_trampoline;
+            let gp_converted: extern "x86-interrupt" fn(InterruptStackFrame, u64) = transmute(gp_handler);
+            idt.general_protection_fault.set_handler_fn(gp_converted);
         }
         #[cfg(not(any(feature = "hardware", feature = "boot")))]
         idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
@@ -338,8 +346,55 @@ extern "x86-interrupt" fn page_fault_handler(
     error_code: PageFaultErrorCode,
 ) {
     if is_user_mode_exception(&stack_frame) {
-        // User mode page fault - handle gracefully
+        // User mode page fault - try demand paging first
         let fault_address = Cr2::read().map(|addr| addr.as_u64()).unwrap_or(0);
+        
+        // Try demand paging for heap/mmap regions
+        if let Some(table) = ProcessTable::global() {
+            if let Some(entry) = crate::scheduler::Scheduler::global()
+                .and_then(|s| s.current_thread())
+            {
+                let pid = entry.pid;
+                if let Some(proc) = table.lookup(pid) {
+                    // Check if fault is in heap region (brk to brk+64MB) or mmap region (0x40000000 to 0x80000000)
+                    let brk = proc.program_break();
+                    let in_heap = fault_address >= brk && fault_address < brk + 64 * 1024 * 1024;
+                    let in_mmap = fault_address >= 0x40000000 && fault_address < 0x80000000;
+                    let is_null_page = fault_address < 4096; // First page (NULL pointer page)
+                    
+                    if (in_heap || in_mmap || is_null_page) && !error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
+                    {
+                        // Demand page: allocate and map the faulting page
+                        if let Some(manager) = table.memory_manager() {
+                            use x86_64::structures::paging::PageTableFlags;
+                            use x86_64::VirtAddr;
+                            
+                            let page_addr = fault_address & !0xfff; // Align to page boundary
+                            let flags = if is_null_page {
+                                // NULL page: map as read-only to catch writes
+                                PageTableFlags::PRESENT 
+                                    | PageTableFlags::USER_ACCESSIBLE 
+                                    | PageTableFlags::NO_EXECUTE
+                            } else {
+                                // Heap/mmap: writable
+                                PageTableFlags::PRESENT 
+                                    | PageTableFlags::WRITABLE 
+                                    | PageTableFlags::USER_ACCESSIBLE 
+                                    | PageTableFlags::NO_EXECUTE
+                            };
+                            
+                            if manager.map_region(VirtAddr::new(page_addr), 4096, flags).is_ok() {
+                                log::info!("Demand paged: allocated {} page at {:#x} for pid={}", 
+                                    if is_null_page { "NULL" } else { "heap" },
+                                    page_addr, pid.as_u64());
+                                // Successfully mapped, return to retry the instruction
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         shell::record_user_fault(
             UserFaultKind::PageFault,
@@ -932,4 +987,209 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     let scancode = keyboard::read_scancode();
     shell::enqueue_scancode(scancode);
     interrupts::notify_end_of_interrupt(InterruptIndex::Keyboard);
+}
+
+// Hardware trampoline and handler to give low-level access to the saved registers
+// for general protection faults. We use this to inspect the user instruction and
+// optionally adjust RIP to skip a privileged HLT (0xF4) executed in user mode.
+//
+// Stack layout when handler is called:
+// [high] ss, rsp, rflags, cs, rip, error_code, r15...rax (15 regs), ret_addr, align [low] <- actual rsp
+// frame_ptr (rsi) = rsp + 15*8, points to error_code
+#[cfg(feature = "hardware")]
+#[unsafe(naked)]
+extern "C" fn general_protection_trampoline() -> ! {
+    naked_asm!(
+        "push rbp",
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
+        "push rbx",
+        "push rax",
+        "mov rdi, rsp",               // regs_ptr
+        "lea rsi, [rsp + {frame_offset}]",  // frame_ptr points to error_code
+        "sub rsp, 8",                 // align stack for call
+        "call {handler}",
+        "add rsp, 8",                 // undo alignment
+        "pop rax",
+        "pop rbx",
+        "pop rcx",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        "pop rbp",
+        "add rsp, 8",                 // skip error code
+        "iretq",
+        frame_offset = const 15 * 8,
+        handler = sym general_protection_trampoline_handler
+    );
+}
+
+#[cfg(feature = "hardware")]
+extern "C" fn general_protection_trampoline_handler(_regs_ptr: *const u8, frame_ptr: *const u8) {
+    use core::ptr;
+
+    // frame_ptr points to error_code on stack
+    // Layout: error_code(0), rip(8), cs(16), rflags(24), rsp(32), ss(40)
+    unsafe {
+        let error_code = ptr::read(frame_ptr as *const u64);
+        let rip_ptr = (frame_ptr as *const u64).add(1);
+        let rip = ptr::read(rip_ptr);
+        let rflags = ptr::read((frame_ptr as *const u64).add(3));
+        let rsp = ptr::read((frame_ptr as *const u64).add(4));
+
+        serial::write_fmt(format_args!(
+            "\r\n=== USER GP FAULT (trampoline detail) ===\r\n"
+        ));
+        serial::write_fmt(format_args!("RIP: {:#x}\r\n", rip));
+        serial::write_fmt(format_args!("RSP: {:#x}\r\n", rsp));
+        serial::write_fmt(format_args!("RFLAGS: {:#x}\r\n", rflags));
+        serial::write_fmt(format_args!("Error code: {:#x}\r\n", error_code));
+
+        // Try to read instruction bytes at RIP
+        if let Some(table) = ProcessTable::global() {
+            if let Some(manager) = table.memory_manager() {
+                // Check if RIP looks like it's in a mapped user region
+                if rip >= 0x400000 && rip < 0x80000000 {
+                    let phys_offset = manager.physical_memory_offset();
+                    
+                    // Walk the page table to translate RIP to physical address
+                    use x86_64::registers::control::Cr3;
+                    let (root_frame, _) = Cr3::read();
+                    
+                    // Calculate page table indices
+                    let l4_idx = ((rip >> 39) & 0x1ff) as usize;
+                    let l3_idx = ((rip >> 30) & 0x1ff) as usize;
+                    let l2_idx = ((rip >> 21) & 0x1ff) as usize;
+                    let l1_idx = ((rip >> 12) & 0x1ff) as usize;
+                    let page_offset = (rip & 0xfff) as usize;
+                    
+                    // Walk L4 -> L3 -> L2 -> L1
+                    let l4_table_ptr = (phys_offset + root_frame.start_address().as_u64()).as_u64() as *const PageTable;
+                    let l4_table = &*l4_table_ptr;
+                    let l4_entry = &l4_table[l4_idx];
+                    
+                    if !l4_entry.flags().contains(PageTableFlags::PRESENT) {
+                        serial::write_str("L4 entry not present\r\n");
+                    } else {
+                        let l3_frame = PhysFrame::<Size4KiB>::from_start_address(l4_entry.addr()).ok();
+                        if let Some(l3_frame) = l3_frame {
+                            let l3_table_ptr = (phys_offset + l3_frame.start_address().as_u64()).as_u64() as *const PageTable;
+                            let l3_table = &*l3_table_ptr;
+                            let l3_entry = &l3_table[l3_idx];
+                            
+                            if !l3_entry.flags().contains(PageTableFlags::PRESENT) {
+                                serial::write_str("L3 entry not present\r\n");
+                            } else {
+                                let l2_frame = PhysFrame::<Size4KiB>::from_start_address(l3_entry.addr()).ok();
+                                if let Some(l2_frame) = l2_frame {
+                                    let l2_table_ptr = (phys_offset + l2_frame.start_address().as_u64()).as_u64() as *const PageTable;
+                                    let l2_table = &*l2_table_ptr;
+                                    let l2_entry = &l2_table[l2_idx];
+                                    
+                                    if !l2_entry.flags().contains(PageTableFlags::PRESENT) {
+                                        serial::write_str("L2 entry not present\r\n");
+                                    } else {
+                                        let l1_frame = PhysFrame::<Size4KiB>::from_start_address(l2_entry.addr()).ok();
+                                        if let Some(l1_frame) = l1_frame {
+                                            let l1_table_ptr = (phys_offset + l1_frame.start_address().as_u64()).as_u64() as *const PageTable;
+                                            let l1_table = &*l1_table_ptr;
+                                            let l1_entry = &l1_table[l1_idx];
+                                            
+                                            if !l1_entry.flags().contains(PageTableFlags::PRESENT) {
+                                                serial::write_str("L1 entry not present\r\n");
+                                            } else {
+                                                // Got the physical frame!
+                                                let phys_frame = PhysFrame::<Size4KiB>::from_start_address(l1_entry.addr()).ok();
+                                                if let Some(phys_frame) = phys_frame {
+                                                    let phys_addr = phys_frame.start_address().as_u64() + page_offset as u64;
+                                                    let virt_addr = phys_offset + phys_addr;
+                                                    let byte_ptr = virt_addr.as_u64() as *const u8;
+                                                    let instruction_byte = ptr::read(byte_ptr);
+                                                    
+                                                    serial::write_fmt(format_args!(
+                                                        "Translated RIP {:#x} -> phys {:#x}, byte = {:#x}\r\n",
+                                                        rip, phys_addr, instruction_byte
+                                                    ));
+                                                    
+                                                    if instruction_byte == 0xf4 {
+                                                        // It's HLT! Skip it
+                                                        let new_rip = rip.wrapping_add(1);
+                                                        ptr::write(rip_ptr as *mut u64, new_rip);
+                                                        log::warn!("GP trampoline: skipped HLT at {:#x} -> {:#x}", rip, new_rip);
+                                                        
+                                                        // Also update the saved UserContext RIP so syscalls don't revert to old RIP
+                                                        if let Some(table) = ProcessTable::global() {
+                                                            if let Some(scheduler) = Scheduler::global() {
+                                                                if let Some(entry) = scheduler.current_thread() {
+                                                                    if let Some(proc) = table.lookup(entry.pid) {
+                                                                        // Read current context, update RIP, store it back
+                                                                        if let Some((mut context, _root)) = proc.take_thread_runtime(entry.tid) {
+                                                                            context.frame_mut().rip = new_rip;
+                                                                            proc.store_thread_context(entry.tid, context);
+                                                                            serial::write_fmt(format_args!(
+                                                                                "Updated saved context RIP to {:#x}\r\n", new_rip
+                                                                            ));
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        
+                                                        return;
+                                                    } else {
+                                                        serial::write_fmt(format_args!(
+                                                            "Instruction at RIP is not HLT (got {:#x})\r\n", instruction_byte
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Default: record the fault and mark the process failed, matching the
+        // behavior of the regular GP handler.
+        crate::shell::record_user_fault(
+            crate::shell::UserFaultKind::GeneralProtection,
+            rip,
+            0,
+            error_code,
+        );
+
+        #[cfg(feature = "hardware")]
+        crate::arch::x86_64::serial::write_fmt(format_args!(
+            "\r\n=== USER GP FAULT (trampoline) ===\r\nRIP: {:#x}\r\n",
+            rip
+        ));
+
+        crate::shell::mark_current_process_failed();
+        x86_64::instructions::interrupts::enable();
+        loop {
+            x86_64::instructions::hlt();
+        }
+    }
 }

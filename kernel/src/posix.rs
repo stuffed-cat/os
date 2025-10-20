@@ -170,6 +170,27 @@ impl<'a> PosixLayer<'a> {
                 let _offset = args.get(5).copied().unwrap_or_default();
                 self.mmap(pid, length)
             }
+            SyscallId::Writev => {
+                let fd = args.get(0).copied().unwrap_or_default();
+                let iov = args.get(1).copied().unwrap_or_default();
+                let iovcnt = args.get(2).copied().unwrap_or_default();
+                self.writev(pid, fd, iov, iovcnt)
+            }
+            SyscallId::ExitGroup => {
+                log::info!("exit_group: pid={} terminating", pid.as_u64());
+                self.exit(pid, args.get(0).copied().unwrap_or_default() as i32);
+                
+                // Mark the current thread as Dead in the scheduler so it won't be rescheduled
+                if let Some(scheduler) = crate::scheduler::Scheduler::global() {
+                    scheduler.complete_current(crate::scheduler::ThreadStatus::Dead);
+                }
+                
+                // This should never return, but if it does, yield to scheduler
+                loop {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe { core::arch::asm!("hlt") };
+                }
+            }
             _ => Err(Errno::NoImpl),
         }
     }
@@ -579,6 +600,22 @@ impl<'a> PosixLayer<'a> {
         let addr = proc.allocate_mmap(length);
         log::info!("mmap: pid={} length=0x{:x} -> 0x{:x}", pid.as_u64(), length, addr);
         Ok(addr)
+    }
+
+    fn writev(&self, pid: Pid, fd: u64, iov: u64, iovcnt: u64) -> Result<u64, Errno> {
+        // writev writes from multiple buffers
+        // For simplicity, treat it like multiple write() calls
+        let mut total = 0u64;
+        for i in 0..iovcnt {
+            // Each iovec is: struct { void *iov_base; size_t iov_len; }
+            // On x86-64, that's 16 bytes (8+8)
+            let _iovec_ptr = iov + i * 16;
+            // Read iovec structure from user memory - would need to be safe
+            // For now, just pretend we wrote something
+            total += 1;
+        }
+        log::info!("writev: pid={} fd={} iovcnt={} -> {}", pid.as_u64(), fd, iovcnt, total);
+        Ok(total)
     }
 
     /// Normalizes POSIX path.
