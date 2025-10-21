@@ -52,9 +52,14 @@ cat > "$BUILD_DIR/boot/grub/grub.cfg" << 'EOF'
 set timeout=3
 set default=0
 
+echo "GRUB is loading..."
+
 menuentry "NexaOS" {
-    multiboot /boot/kernel.bin
-    module /boot/initrd.img
+    echo "Loading NexaOS kernel..."
+    multiboot2 /boot/kernel.bin
+    echo "Loading initrd..."
+    module2 /boot/initrd.img
+    echo "Booting..."
     boot
 }
 EOF
@@ -89,7 +94,7 @@ echo "==> 复制文件..."
 sudo cp -r "$BUILD_DIR/boot" "$BUILD_DIR/mnt/"
 
 echo "==> 安装GRUB..."
-sudo grub-install --target=i386-pc --boot-directory="$BUILD_DIR/mnt/boot" --modules="biosdisk part_msdos ext2 multiboot" "$LOOP_DEV"
+sudo grub-install --target=i386-pc --boot-directory="$BUILD_DIR/mnt/boot" --modules="biosdisk part_msdos ext2 multiboot2" "$LOOP_DEV"
 
 echo "==> 清理..."
 sudo umount "$BUILD_DIR/mnt"

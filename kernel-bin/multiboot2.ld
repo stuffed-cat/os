@@ -8,8 +8,8 @@ SECTIONS
         KEEP(*(.multiboot2))
     }
 
-    .boot ALIGN(4K) : {
-        KEEP(*(.boot))
+    .text.boot ALIGN(8) : {
+        *(.text.boot .text.boot.*)
     }
 
     .text ALIGN(4K) : {
@@ -25,6 +25,7 @@ SECTIONS
     }
 
     .bss ALIGN(4K) : {
+        *(.bss.boot)
         *(COMMON)
         *(.bss .bss.*)
     }

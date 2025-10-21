@@ -1,5 +1,5 @@
 [target.x86_64-unknown-none]
-rustflags = ["-Z", "unstable-options", "-C", "panic=abort", "-C", "relocation-model=static", "-C", "link-arg=-z", "-C", "link-arg=notext", "-C", "link-arg=-no-pie"]
+rustflags = ["-Z", "unstable-options", "-C", "panic=abort", "-C", "relocation-model=static", "-C", "link-arg=-z", "-C", "link-arg=notext", "-C", "link-arg=-no-pie", "-C", "link-arg=-T/home/hanxi-cat/dev/os/kernel-bin/multiboot2.ld"]
 
 [alias]
 xtask = "run --package xtask --"
