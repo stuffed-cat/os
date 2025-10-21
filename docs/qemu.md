@@ -28,7 +28,7 @@
    cd /path/to/os
    ```
 
-2. **编译并生成镜像**
+2.1. **编译并生成镜像**
    ```bash
    cargo run -p xtask --features bootimage -- bootimage
    ```
@@ -36,6 +36,11 @@
    - `xtask` 会调用仓库中 vendored 的 `bootloader` 生成 BIOS 镜像，输出路径为 `target/x86_64-unknown-none/debug/bootimage-bios.img`。
    - 若出现 “failed to get llvm tools” 或 “the option `Z` is only accepted on the nightly compiler” 等报错，请确认已按前置条件安装 nightly toolchain 及 `llvm-tools-preview` 组件。
    - 如需使用原生 `cargo bootimage` 工作流，可参考 `bootloader` 官方文档；此处推荐的 `xtask` 已封装正确的参数与路径。
+
+2.2. ** 使用Grub 生成镜像（推荐）**
+   ```bash
+   scripts/build-grub-image.sh
+   ```
 
 ## 使用 QEMU 启动
 

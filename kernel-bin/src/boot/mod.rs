@@ -20,6 +20,8 @@ const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4 MiB heap for early allocations
 
 /// Boot-time coordinator converting bootloader metadata into kernel bootstrap state.
 pub fn start(boot_info: &'static mut BootInfo, allocator: &'static LockedHeap) -> ! {
+    serial::write_str("kernel: start function called\r\n");
+    
     let phys_offset = boot_info
         .physical_memory_offset
         .expect("physical memory offset provided");
