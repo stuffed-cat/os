@@ -1,5 +1,7 @@
 # NexaOS – Hybrid Kernel Architecture (x86-64, POSIX-oriented)
 
+The new repo for this project is https://github.com/nexa-sys/nexa-os 
+
 This repository documents and prototypes a Rust-based hybrid kernel for x86-64 that aims to blend microkernel isolation with monolithic fast-path services while offering a POSIX-friendly, Unix-like surface to userland. The current code focuses on architectural scaffolding, subsystem contracts, and developer documentation.
 
 ## 🎯 Project Goals
